@@ -17,25 +17,22 @@ pub async fn scan_directory(
 
     match scan::scan_directory(path, force_refresh).await {
         Ok(mut result) => {
-            // 只在非缓存命中时添加到历史记录
-            if result.scan_time > 0.0 {
-                // 添加到历史记录
-                let history_item = HistoryItem {
-                    path: path.to_string(),
-                    scan_time: Utc::now(),
-                    total_size: result.total_size,
-                    size_format: result.total_size_formatted.clone(),
-                    items: result.items.clone(),
-                };
+            // 添加到历史记录（包括缓存命中）
+            let history_item = HistoryItem {
+                path: path.to_string(),
+                scan_time: Utc::now(),
+                total_size: result.total_size,
+                size_format: result.total_size_formatted.clone(),
+                items: result.items.clone(),
+            };
 
-                // 保存到历史记录
-                let mut history = state.history.lock().unwrap();
-                history.push(history_item);
+            // 保存到历史记录
+            let mut history = state.history.lock().unwrap();
+            history.push(history_item);
 
-                // 保持历史记录在合理范围内（最多保存20条，减少内存占用）
-                if history.len() > 20 {
-                    history.remove(0);
-                }
+            // 保持历史记录在合理范围内（最多保存20条，减少内存占用）
+            if history.len() > 20 {
+                history.remove(0);
             }
 
             // 更新结果中的路径为规范路径

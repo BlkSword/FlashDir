@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [build-dependencies]
-tauri-build = { version = "1.5", features = [] }
+tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "1.8", features = ["fs-read-dir", "fs-read-file", "fs-write-file", "path-all", "shell-open", "dialog-open"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
@@ -17,17 +20,5 @@ rayon = "1.10"
 anyhow = "1.0"
 lazy_static = "1.4"
 dashmap = "6.1"
-
-[features]
-default = ["custom-protocol"]
-custom-protocol = ["tauri/custom-protocol"]
-
-[package.metadata.tauri.bundle]
-bundle_id = "com.searchtool.scanner"
-bundle_name = "Directory Size Scanner"
-version = "0.1.0"
-identifier = "com.searchtool.scanner"
-icon = ["icons/icon.ico"]
-
-[package.metadata.tauri.bundle.windows]
-active = true
+walkdir = "2.5"
+same-file = "1.0"

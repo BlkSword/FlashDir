@@ -1,8 +1,5 @@
 use anyhow;
-use dashmap::DashMap;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -12,7 +9,9 @@ pub struct Item {
     pub path: String,
     pub name: String,
     pub size: i64,
+    #[serde(rename = "sizeFormatted")]
     pub size_formatted: String,
+    #[serde(rename = "isDir")]
     pub is_dir: bool,
 }
 
@@ -38,24 +37,24 @@ pub struct HistoryItem {
 
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
-    result: ScanResult,
-    dir_mtime: chrono::DateTime<chrono::Local>,
+    pub result: ScanResult,
+    pub dir_mtime: chrono::DateTime<chrono::Local>,
 }
 
 pub struct ScanCache {
-    cache: DashMap<String, CacheEntry>,
+    cache: dashmap::DashMap<String, CacheEntry>,
     max_entries: usize,
     max_size_bytes: usize,
-    current_size: DashMap<String, usize>,
+    current_size: dashmap::DashMap<String, usize>,
 }
 
 impl ScanCache {
     pub fn new(max_entries: usize, max_size_mb: usize) -> Self {
         ScanCache {
-            cache: DashMap::new(),
+            cache: dashmap::DashMap::new(),
             max_entries,
             max_size_bytes: max_size_mb * 1024 * 1024,
-            current_size: DashMap::new(),
+            current_size: dashmap::DashMap::new(),
         }
     }
 
@@ -64,10 +63,8 @@ impl ScanCache {
     }
 
     pub fn insert(&self, path: String, result: ScanResult) {
-        // 估算当前条目大小
         let entry_size = self.estimate_size(&result);
 
-        // 检查是否超过最大条目数或总大小限制
         if self.cache.len() >= self.max_entries
             || self.get_total_size() + entry_size > self.max_size_bytes
         {
@@ -85,7 +82,6 @@ impl ScanCache {
     }
 
     fn estimate_size(&self, result: &ScanResult) -> usize {
-        // 估算每个条目占用的内存（粗略估计）
         result.items.len() * (100 + std::mem::size_of::<Item>())
     }
 
@@ -124,8 +120,7 @@ impl ScanCache {
 }
 
 lazy_static::lazy_static! {
-    // 减少缓存条目数量，限制总内存使用为 100MB
-    static ref SCAN_CACHE: ScanCache = ScanCache::new(50, 100);
+    static ref SCAN_CACHE: ScanCache = ScanCache::new(30, 200);
 }
 
 pub fn format_size(bytes: i64) -> String {
@@ -155,9 +150,7 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
 
     let metadata = match fs::metadata(&path_buf).await {
         Ok(m) => m,
-        Err(e) => {
-            return Err(anyhow::anyhow!("无法访问路径: {}", e));
-        }
+        Err(e) => return Err(anyhow::anyhow!("无法访问路径: {}", e)),
     };
 
     if !metadata.is_dir() {
@@ -166,9 +159,7 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
 
     let canonical_path = match fs::canonicalize(&path_buf).await {
         Ok(p) => p,
-        Err(e) => {
-            return Err(anyhow::anyhow!("路径规范化失败: {}", e));
-        }
+        Err(e) => return Err(anyhow::anyhow!("路径规范化失败: {}", e)),
     };
 
     let root_dir = canonical_path.to_string_lossy().replace('\\', "/");
@@ -191,65 +182,14 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
 
     SCAN_CACHE.invalidate(&root_dir);
 
-    let root_dir_for_processing = root_dir.clone();
+    let canonical_path_clone = canonical_path.clone();
 
-    let (dir_sizes, file_sizes) = tokio::task::spawn_blocking(move || {
-        scan_directory_blocking(&canonical_path, &root_dir_for_processing)
+    let items = tokio::task::spawn_blocking(move || {
+        scan_directory_fast(&canonical_path_clone)
     })
     .await??;
 
-    // 预分配容量以减少重新分配
-    let mut items = Vec::with_capacity(dir_sizes.len() + file_sizes.len());
-    let mut total_size = 0i64;
-
-    for (dir, size) in dir_sizes.iter() {
-        if dir == &root_dir {
-            continue;
-        }
-
-        if let Ok(rel_path) = Path::new(dir).strip_prefix(&root_dir) {
-            let rel_path_str = rel_path.to_string_lossy().to_string();
-            if !rel_path_str.is_empty() {
-                let name = Path::new(&rel_path_str)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&rel_path_str)
-                    .to_string();
-                items.push(Item {
-                    path: rel_path_str,
-                    name,
-                    size: *size,
-                    size_formatted: format_size(*size),
-                    is_dir: true,
-                });
-                total_size += size;
-            }
-        }
-    }
-
-    for (file, size) in file_sizes.iter() {
-        if let Ok(rel_path) = Path::new(file).strip_prefix(&root_dir) {
-            let rel_path_str = rel_path.to_string_lossy().to_string();
-            if !rel_path_str.is_empty() {
-                let name = Path::new(&rel_path_str)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&rel_path_str)
-                    .to_string();
-                items.push(Item {
-                    path: rel_path_str,
-                    name,
-                    size: *size,
-                    size_formatted: format_size(*size),
-                    is_dir: false,
-                });
-                total_size += size;
-            }
-        }
-    }
-
-    items.sort_by(|a, b| b.size.cmp(&a.size));
-
+    let total_size: i64 = items.iter().map(|item| item.size).sum();
     let scan_time = start_time.elapsed().as_secs_f64();
 
     let result = ScanResult {
@@ -265,93 +205,58 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
     Ok(result)
 }
 
-fn scan_directory_blocking(
-    path: &Path,
-    root_dir: &str,
-) -> Result<(HashMap<String, i64>, HashMap<String, i64>), anyhow::Error> {
-    // 使用流式处理，避免一次性收集所有文件
-    let dir_sizes = DashMap::new();
-    let file_sizes = DashMap::new();
-    let root_path = Path::new(root_dir).to_path_buf();
+// 简化、可靠的扫描函数
+fn scan_directory_fast(root_path: &Path) -> Result<Vec<Item>, anyhow::Error> {
+    use std::fs;
 
-    // 分批处理文件以减少内存压力
-    let batch_size = 10000;
-    let mut batch: Vec<(PathBuf, i64)> = Vec::with_capacity(batch_size);
+    let mut items = Vec::new();
+    let mut dirs_to_scan = vec![root_path.to_path_buf()];
 
-    // 使用优化的文件收集方法
-    for entry in collect_files_optimized(path)? {
-        let (file_path, size) = entry;
+    // 使用 BFS 遍历目录
+    while let Some(current_dir) = dirs_to_scan.pop() {
+        let entries = match fs::read_dir(&current_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
 
-        // 添加到文件大小映射
-        if let Some(path_str) = file_path.to_str() {
-            let normalized_path = path_str.replace('\\', "/");
-            file_sizes.insert(normalized_path, size);
-        }
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let metadata = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
 
-        // 添加到批次
-        batch.push((file_path, size));
+            let is_dir = metadata.is_dir();
+            let size = metadata.len() as i64;
 
-        // 批次满了就处理
-        if batch.len() >= batch_size {
-            process_batch(&batch, &dir_sizes, &root_path);
-            batch.clear();
-        }
-    }
+            // 计算相对路径
+            let rel_path = path.strip_prefix(root_path)
+                .unwrap_or(&path);
+            let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
 
-    // 处理剩余的文件
-    if !batch.is_empty() {
-        process_batch(&batch, &dir_sizes, &root_path);
-    }
+            // 获取名称
+            let name = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+                .to_string();
 
-    // 转换为普通 HashMap
-    let mut dir_sizes_map = HashMap::with_capacity(dir_sizes.len());
-    for (key, value) in dir_sizes.into_iter() {
-        dir_sizes_map.insert(key, value);
-    }
+            items.push(Item {
+                path: rel_path_str.clone(),
+                name: name.clone(),
+                size,
+                size_formatted: format_size(size),
+                is_dir,
+            });
 
-    let mut file_sizes_map = HashMap::with_capacity(file_sizes.len());
-    for (key, value) in file_sizes.into_iter() {
-        file_sizes_map.insert(key, value);
-    }
-
-    Ok((dir_sizes_map, file_sizes_map))
-}
-
-fn process_batch(batch: &[(PathBuf, i64)], dir_sizes: &DashMap<String, i64>, root_path: &Path) {
-    batch.par_iter().for_each(|(file_path, size)| {
-        if let Some(parent) = file_path.parent() {
-            for ancestor in parent.ancestors() {
-                if ancestor == root_path || ancestor == Path::new("") {
-                    break;
-                }
-                if let Some(dir_path) = ancestor.to_str() {
-                    let mut sizes = dir_sizes.entry(dir_path.to_string()).or_default();
-                    *sizes += size;
-                }
-            }
-        }
-    });
-}
-
-// 备用方案：使用更高效的文件收集方法
-fn collect_files_optimized(path: &Path) -> Result<Vec<(PathBuf, i64)>, anyhow::Error> {
-    let mut files = Vec::new();
-    let mut stack = vec![path.to_path_buf()];
-
-    while let Some(current_path) = stack.pop() {
-        if let Ok(entries) = std::fs::read_dir(&current_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Ok(metadata) = path.metadata() {
-                    if metadata.is_dir() {
-                        stack.push(path);
-                    } else if metadata.is_file() {
-                        files.push((path, metadata.len() as i64));
-                    }
-                }
+            // 如果是目录，添加到待扫描列表
+            if is_dir {
+                dirs_to_scan.push(path);
             }
         }
     }
 
-    Ok(files)
+    // 按大小排序
+    items.sort_by(|a, b| b.size.cmp(&a.size));
+
+    Ok(items)
 }
