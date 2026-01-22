@@ -111,12 +111,6 @@ impl ScanCache {
             self.cache.remove(&key);
         }
     }
-
-    #[allow(dead_code)]
-    pub fn clear(&self) {
-        self.cache.clear();
-        self.current_size.clear();
-    }
 }
 
 lazy_static::lazy_static! {
@@ -209,8 +203,10 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
 fn scan_directory_fast(root_path: &Path) -> Result<Vec<Item>, anyhow::Error> {
     use std::fs;
 
-    let mut items = Vec::new();
-    let mut dirs_to_scan = vec![root_path.to_path_buf()];
+    // 预分配容量以减少重新分配（根据目录大小预估）
+    let mut items = Vec::with_capacity(1024);
+    let mut dirs_to_scan = Vec::with_capacity(256);
+    dirs_to_scan.push(root_path.to_path_buf());
 
     // 使用 BFS 遍历目录
     while let Some(current_dir) = dirs_to_scan.pop() {
@@ -234,15 +230,15 @@ fn scan_directory_fast(root_path: &Path) -> Result<Vec<Item>, anyhow::Error> {
                 .unwrap_or(&path);
             let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
 
-            // 获取名称
+            // 获取名称（直接使用 &str 避免克隆）
             let name = path.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("?")
                 .to_string();
 
             items.push(Item {
-                path: rel_path_str.clone(),
-                name: name.clone(),
+                path: rel_path_str,
+                name,
                 size,
                 size_formatted: format_size(size),
                 is_dir,
@@ -255,7 +251,7 @@ fn scan_directory_fast(root_path: &Path) -> Result<Vec<Item>, anyhow::Error> {
         }
     }
 
-    // 按大小排序
+    // 按大小排序（稳定的排序）
     items.sort_by(|a, b| b.size.cmp(&a.size));
 
     Ok(items)

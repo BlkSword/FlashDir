@@ -1,10 +1,10 @@
 {
-  "name": "search-tool-root",
+  "name": "flashdir-root",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "cd src-tauri/app && npm run build && cd ../.. && powershell -Command \"if (!(Test-Path 'src-tauri/app/dist/lib')) { Copy-Item -Path 'src-tauri/app/lib' -Destination 'src-tauri/app/dist/lib' -Recurse -Force }\"",
+    "build": "cd src-tauri/app && npm run build",
     "tauri": "tauri",
     "dev": "npm run tauri:dev",
     "tauri:dev": "tauri dev",

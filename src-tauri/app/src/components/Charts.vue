@@ -5,7 +5,7 @@
       <div class="chart-section">
         <h6>文件类型分布 (按大小)</h6>
         <a-card :bordered="true" size="small">
-          <a-empty v-if="typeStats.length === 0" description="暂无数据" :image="Empty.PRESENTED_IMAGE_SIMPLE" />
+          <div v-if="typeStats.length === 0" class="chart-placeholder"></div>
           <div v-else class="chart-container">
             <canvas ref="doughnutChart"></canvas>
           </div>
@@ -15,7 +15,7 @@
       <div class="chart-section">
         <h6>Top 5 大文件/文件夹</h6>
         <a-card :bordered="true" size="small">
-          <a-empty v-if="topItems.length === 0" description="暂无数据" :image="Empty.PRESENTED_IMAGE_SIMPLE" />
+          <div v-if="topItems.length === 0" class="chart-placeholder"></div>
           <div v-else class="chart-container">
             <canvas ref="barChart"></canvas>
           </div>
@@ -27,7 +27,6 @@
 
 <script setup>
 import { ref, watch, onMounted, nextTick, onBeforeUnmount } from 'vue'
-import { Empty } from 'ant-design-vue'
 import { Chart, registerables } from 'chart.js'
 
 Chart.register(...registerables)
@@ -302,6 +301,15 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.chart-placeholder {
+  height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #bfbfbf;
+  font-size: 12px;
 }
 
 :deep(.ant-card-body) {

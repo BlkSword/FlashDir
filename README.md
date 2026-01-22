@@ -1,76 +1,80 @@
-# Directory
+# FlashDir
 
-一个基于 Rust + Tauri 的桌面应用程序，用于可视化扫描和分析目录与文件的占用情况。
+一个基于Rust开发的极速系统占用查看工具，用于分析目录与文件的占用情况和可视化占用情况。
 
 ## 主要特点
 
-- 便携版本：单个 EXE 文件，双击即可运行，无需安装
-- 极速扫描：并行处理优化，1GB 文件仅需约 0.06 秒
-- 智能缓存：基于目录修改时间自动更新缓存
-- 可视化图表：使用 Chart.js 展示目录占用分布
-- 目录树导航：支持文件夹层级浏览和前进返回功能
-- 跨平台支持：Windows、macOS、Linux
-
-## 解决的问题
-
-当磁盘空间突然爆满时，快速定位占用大量空间的目录和文件。
+- **便携版本**：单个 EXE 文件，双击即可运行，无需安装
+- **极速扫描**：BFS 遍历优化 + 智能缓存，大目录秒级响应
+- **智能缓存**：基于目录修改时间自动失效，最多缓存 30 个目录（200MB）
+- **持久化历史**：历史记录自动保存到本地文件，重启不丢失
+- **可视化图表**：使用 Chart.js 展示文件类型分布和 Top 5 大文件
+- **目录树导航**：支持文件夹层级浏览和前进返回功能
 
 ## 使用说明
 
 ### 快速上手
 
-1. 双击 `search-tool.exe` 启动应用
-2. 点击浏览按钮选择要扫描的目录，或直接输入路径
+1. 双击 `FlashDir.exe` 启动应用
+2. 点击「浏览」按钮选择要扫描的目录，或直接输入路径
 3. 点击「扫描」按钮开始分析
 
 ### 开发模式运行
 
 ```bash
-# 安装 Tauri CLI（如未安装）
-cargo install tauri-cli
+# 安装依赖
+cd src-tauri/app && npm install
 
-# 启动开发模式
-cargo tauri dev
+# 启动开发模式（热重载）
+npm run dev
 ```
 
-### 构建便携版
+### 构建生产版本
 
 ```bash
-# Windows
-.\build.bat
+# 构建前端资源
+npm run build
 
-# Linux/macOS
-chmod +x build.sh
-./build.sh
+# 构建安装包
+npm run tauri:build
 ```
 
-构建完成后，可执行文件位于 `src-tauri/target/release/bundle/msi/` 目录（Windows）或相应平台的输出目录。
+构建产物位于 `src-tauri/target/release/bundle/` 目录。
 
 ## 技术栈
 
-- **后端**：Rust + Tauri + Rayon（并行计算） + DashMap（并发缓存）
-- **前端**：HTML5 + Bootstrap 5 + JavaScript + Chart.js
-- **架构**：桌面应用程序，通过 Tauri API 实现前后端通信
+| 层级 | 技术 |
+|------|------|
+| **后端** | Rust + Tauri 2.0 + Tokio + DashMap |
+| **前端** | Vue 3 + Vite + Ant Design Vue + Chart.js |
+| **架构** | 桌面应用，通过 Tauri invoke API 通信 |
 
 ## 项目结构
 
 ```
-Search-tool/
+FlashDir/
 ├── src-tauri/              # Rust 后端代码
-│   ├── app/                # 前端资源
-│   │   ├── index.html      # 主页面
-│   │   └── src/            # 前端脚本和样式
-│   │       ├── main.js     # 主逻辑脚本
-│   │       └── style.css   # 样式文件
+│   ├── app/                # Vue 3 前端应用
+│   │   ├── src/
+│   │   │   ├── App.vue              # 主组件
+│   │   │   ├── components/          # UI 组件
+│   │   │   │   ├── Toolbar.vue      # 工具栏
+│   │   │   │   ├── Sidebar.vue      # 目录树
+│   │   │   │   ├── FileList.vue     # 文件列表
+│   │   │   │   ├── Charts.vue       # 统计图表
+│   │   │   │   ├── StatusBar.vue    # 状态栏
+│   │   │   │   └── HistoryList.vue  # 历史记录
+│   │   │   ├── composables/
+│   │   │   │   └── useTauri.js      # Tauri API 封装
+│   │   │   └── main.js              # 应用入口
+│   │   ├── package.json             # 前端依赖
+│   │   └── vite.config.js           # Vite 配置
 │   ├── src/                # Rust 源码
 │   │   ├── main.rs         # Tauri 入口
 │   │   ├── commands.rs     # 命令处理器
 │   │   └── scan.rs         # 扫描核心逻辑
 │   ├── Cargo.toml          # Rust 依赖配置
-│   ├── tauri.conf.json     # Tauri 配置
-│   └── icons/              # 应用图标
-├── build.sh                # Linux/macOS 构建脚本
-├── build.bat               # Windows 构建脚本
+│   └── tauri.conf.json     # Tauri 配置
 └── README.md               # 项目说明文档
 ```
 
@@ -78,66 +82,72 @@ Search-tool/
 
 ### 目录扫描
 
-扫描指定目录，递归分析所有子目录和文件的大小，支持按名称、大小、类型排序显示。
+扫描指定目录，递归分析所有子目录和文件的大小，支持按名称、大小、类型排序显示，分页浏览（50/100/200/500/1000 条/页）。
 
 ### 智能缓存机制
 
-首次扫描后，系统会自动缓存目录结构。当用户再次扫描同一目录时，系统会检查目录的修改时间：
+首次扫描后，系统会自动缓存目录结构到内存（DashMap 并发安全缓存）。当用户再次扫描同一目录时：
 
-- 若目录无变化：直接使用缓存数据，秒级响应
-- 若目录有变化：增量更新缓存，确保数据准确
+- 若目录无变化（修改时间未变）：直接使用缓存，秒级响应
+- 若目录有变化：重新扫描并更新缓存
+- 缓存限制：最多 30 个目录，总大小不超过 200MB
+- 缓存淘汰：基于 LRU 策略自动清理最旧的缓存
+
+### 持久化历史记录
+
+- 自动保存最近 20 条扫描记录到 `~/.flashdir/history.json`
+- 应用重启后历史记录自动恢复
+- 支持一键清空历史记录
+- 打开历史面板时自动刷新最新状态
 
 ### 可视化图表
 
-使用 Chart.js 绘制目录占用分布图，直观展示哪些子目录占用空间最大。
+使用 Chart.js 绘制：
+
+- **文件类型分布**：按大小显示各文件类型占比（环形图）
+- **Top 5 大文件**：展示占用空间最大的 5 个文件/文件夹（柱状图）
 
 ### 目录树导航
 
 左侧显示可展开的目录树，支持：
 
-- 点击文件夹展开子目录
-- 点击文件显示详细信息
-- 前进和返回按钮切换浏览历史
+- 点击文件夹进入子目录
+- 前进/返回/上级目录导航
+- 高亮当前选中路径
 
-### 历史记录
+## Tauri 命令 API
 
-自动保存最近 50 条扫描记录，方便快速访问常用目录。
-
-## 开发指南
-
-### 前端开发
-
-前端代码位于 `src-tauri/app/` 目录，使用原生 JavaScript 和 Bootstrap 5。通过 Tauri 的 `invoke` API 与 Rust 后端通信：
-
-```javascript
-// 调用 Rust 扫描函数
-const result = await invoke('scan_directory', { path: '/some/path' });
-```
-
-### 后端开发
-
-后端代码位于 `src-tauri/src/` 目录：
-
-- `main.rs`：Tauri 应用入口，负责注册命令处理器
-- `commands.rs`：实现 Tauri 命令，处理前端请求并返回结果
-- `scan.rs`：目录扫描核心逻辑，包含并行计算和缓存管理
-
-### 添加新功能
-
-1. 在 `src-tauri/src/scan.rs` 中实现核心逻辑
-2. 在 `src-tauri/src/commands.rs` 中添加命令接口
-3. 在 `src-tauri/src/main.rs` 中注册新命令
-4. 在 `src-tauri/app/index.html` 和对应脚本中调用命令
+| 命令 | 参数 | 返回值 | 说明 |
+|------|------|--------|------|
+| `scan_directory` | `path`, `force_refresh` | `ScanResult` | 扫描目录 |
+| `get_history` | - | `HistoryItem[]` | 获取历史记录 |
+| `clear_history` | - | - | 清空历史记录 |
 
 ## 性能优化
 
-本项目采用以下优化策略：
+### 已实施的优化
 
-- **并行计算**：使用 Rayon 库实现多线程并行扫描
-- **并发缓存**：使用 DashMap 替代 Mutex，减少锁竞争
-- **字符串优化**：减少不必要的路径字符串分配
-- **增量更新**：基于修改时间检查，避免重复扫描
+| 优化项 | 实现方式 | 效果 |
+|--------|----------|------|
+| BFS 遍历 | 队列方式扫描子目录 | 减少递归栈开销 |
+| 阻塞 I/O 隔离 | `spawn_blocking` | 不阻塞异步运行时 |
+| Vec 预分配 | `with_capacity(1024)` | 减少内存重新分配 |
+| 并发缓存 | DashMap 替代 Mutex | 多线程安全访问 |
+| 历史异步保存 | `tokio::spawn_blocking` | 不阻塞扫描响应 |
+| 前端分页 | 虚拟列表 + 分页 | 大量数据流畅渲染 |
 
-## 许可证
+### 缓存策略
 
-MIT License
+```rust
+// 缓存配置
+const MAX_CACHE_ENTRIES: usize = 30;    // 最多 30 个目录
+const MAX_CACHE_SIZE_MB: usize = 200;   // 最多 200MB
+
+// 缓存失效条件
+1. 目录修改时间（mtime）变化时自动失效
+2. 手动强制刷新（force_refresh = true）
+3. LRU 淘汰最旧条目
+```
+
+
+

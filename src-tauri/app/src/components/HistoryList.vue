@@ -65,7 +65,21 @@ const handleSelect = (path) => {
 const formatTime = (timestamp) => {
   if (!timestamp) return '未知时间'
 
-  const date = new Date(timestamp * 1000)
+  // 处理多种时间格式：数字时间戳（秒或毫秒）或 ISO 字符串
+  let date
+  if (typeof timestamp === 'number') {
+    // 判断是秒级还是毫秒级时间戳
+    // 小于 10000000000 的认为是秒级时间戳（2001 年之前）
+    const isSeconds = timestamp < 10000000000
+    date = new Date(isSeconds ? timestamp * 1000 : timestamp)
+  } else {
+    // 字符串格式，直接解析
+    date = new Date(timestamp)
+  }
+
+  // 检查日期是否有效
+  if (isNaN(date.getTime())) return '未知时间'
+
   const now = new Date()
   const diff = now - date
 

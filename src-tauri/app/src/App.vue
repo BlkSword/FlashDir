@@ -341,6 +341,13 @@ onMounted(() => {
   loadHistory()
 })
 
+// 监听历史记录模态框打开，重新加载最新数据
+watch(historyVisible, (isOpen) => {
+  if (isOpen) {
+    loadHistory()
+  }
+})
+
 // 监听分页变化，重置到第一页
 watch(() => allItems.value, () => {
   currentPage.value = 1
