@@ -119,24 +119,15 @@ const canGoUp = computed(() => {
 
 const totalItems = computed(() => allItems.value.length)
 
-// 关键修复：只计算文件的大小，不重复计算目录
-// 后端的 total_size 已经是所有文件的总大小
 const totalSize = computed(() => {
-  // 只累加文件的大小，目录的大小已经被包含在 total_size 中了
-  // 这里我们直接使用后端计算的 total_size
-  // 但由于 totalSize 是基于 allItems 计算的，我们需要确保不重复计算
-
-  // 方案：只累加文件（!isDir）的大小
   return allItems.value
     .filter(item => !item.isDir)
     .reduce((sum, item) => sum + (item.size || 0), 0)
 })
 
-// 优化：使用缓存避免重复计算和排序
 const displayItems = ref([])
 const filteredItems = ref([])
 
-// 当数据变化时，使用 requestIdleCallback 或 setTimeout 延迟处理
 const updateDisplayItems = () => {
   // 先过滤
   let items = allItems.value
@@ -192,10 +183,8 @@ const updateDisplayItems = () => {
   displayItems.value = sorted.slice(start, end)
 }
 
-// 使用防抖和批量更新
 const debouncedUpdate = debounce(updateDisplayItems, 10)
 
-// 监听变化并更新
 watch([allItems, searchKeyword, sortConfig, currentPage, pageSize], debouncedUpdate)
 
 const filteredTotalItems = computed(() => filteredItems.value.length)
@@ -210,7 +199,6 @@ const handleScan = async (path, addToHistory = true) => {
   scanTime.value = 0
   backendTime.value = 0
 
-  // 记录完整的开始时间（包含前端和后端）
   const fullStartTime = performance.now()
 
   try {
@@ -220,16 +208,13 @@ const handleScan = async (path, addToHistory = true) => {
     })
 
     const backendEndTime = performance.now()
-    // 确保 scanTime 是数字
     backendTime.value = typeof result.scanTime === 'number' ? result.scanTime : 0
 
-    // 使用 requestAnimationFrame 避免 UI 阻塞
     await new Promise(resolve => {
       requestAnimationFrame(() => {
         allItems.value = result.items || []
         currentPath.value = path
 
-        // 延迟构建树数据，避免阻塞 UI
         setTimeout(() => {
           buildTreeData()
         }, 50)
@@ -245,10 +230,8 @@ const handleScan = async (path, addToHistory = true) => {
     }
 
     const fullEndTime = performance.now()
-    // scanTime 是用户感受到的总时间（从前端点击到显示完成）
     scanTime.value = parseFloat(((fullEndTime - fullStartTime) / 1000).toFixed(2))
 
-    // 如果有详细的 timing 信息，显示各阶段耗时（安全地处理 undefined）
     const timingInfo = result.timing
     if (timingInfo) {
       const safeNum = (n) => typeof n === 'number' ? n.toFixed(2) + 's' : 'N/A'
@@ -344,7 +327,6 @@ const handleClearHistory = async () => {
   }
 }
 
-// 优化：使用更高效的算法构建树数据
 const buildTreeData = () => {
   const dirs = allItems.value.filter(item => item.isDir)
   if (dirs.length === 0) {

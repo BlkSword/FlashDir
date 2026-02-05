@@ -6,17 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 
-/// 详细的时间统计信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimingInfo {
-    /// 扫描阶段耗时（秒）
     pub scan_phase: f64,
-    /// 统计计算阶段耗时（秒）
     pub compute_phase: f64,
-    /// 格式化和排序阶段耗时（秒）
     pub format_phase: f64,
-    /// 总耗时（秒）
     pub total: f64,
 }
 
@@ -40,7 +35,6 @@ pub struct ScanResult {
     pub total_size_formatted: String,
     pub scan_time: f64,
     pub path: String,
-    /// 详细时间统计（可选，用于调试）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<TimingInfo>,
 }
@@ -204,13 +198,11 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
 
     let canonical_path_clone = canonical_path.clone();
 
-    // 使用并行扫描充分利用多核 CPU
     let output = tokio::task::spawn_blocking(move || {
         scan_directory_parallel_v3(&canonical_path_clone)
     })
     .await??;
 
-    // scan_time 是整个后端处理时间（从调用到返回）
     let scan_time = start_time.elapsed().as_secs_f64();
 
     let result = ScanResult {
@@ -234,35 +226,27 @@ struct ScanOutput {
     timing: TimingInfo,
 }
 
-/// 超高效并行扫描 V3 - 使用无锁队列和并行统计，带详细时间统计
-/// 修复：total_size 只计算文件大小，不重复计算目录
 fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Error> {
     use rayon::prelude::*;
     use std::fs;
 
     let total_start = std::time::Instant::now();
 
-    // 使用无锁队列避免 Mutex 竞争
     let dirs_to_scan = Arc::new(SegQueue::new());
     let items = Arc::new(SegQueue::new());
     let file_entries = Arc::new(dashmap::DashMap::with_capacity(4096));
 
-    // 添加根目录
     dirs_to_scan.push(root_path.to_path_buf());
 
-    // 全局线程池配置 - 使用更多线程
     let num_threads = rayon::current_num_threads().max(8);
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build_global()
         .ok();
 
-    // ========== 扫描阶段 ==========
     let scan_start = std::time::Instant::now();
 
-    // 并行扫描所有目录
     rayon::scope(|s| {
-        // 启动多个工作线程
         for _ in 0..num_threads {
             let dirs_to_scan = Arc::clone(&dirs_to_scan);
             let items = Arc::clone(&items);
@@ -270,20 +254,16 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
             let root_path = root_path.to_path_buf();
 
             s.spawn(move |_| {
-                // 工作线程：持续从队列中取出目录进行扫描
                 loop {
-                    // 尝试从队列中取出一个目录
                     let dir_path = match dirs_to_scan.pop() {
                         Some(d) => d,
-                        None => break, // 队列为空，退出
+                        None => break,
                     };
 
-                    // 扫描目录
                     if let Ok(entries) = fs::read_dir(&dir_path) {
                         for entry in entries.filter_map(Result::ok) {
                             let entry_path = entry.path();
 
-                            // 跳过符号链接
                             let ft = match entry.file_type() {
                                 Ok(ft) => ft,
                                 Err(_) => continue,
@@ -295,7 +275,6 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
 
                             let is_dir = ft.is_dir();
 
-                            // 构建相对路径
                             let rel_path = match entry_path.strip_prefix(&root_path) {
                                 Ok(p) => p.to_string_lossy().replace('\\', "/"),
                                 Err(_) => continue,
@@ -315,15 +294,12 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
                                     .unwrap_or(0)
                             };
 
-                            // 收集文件信息
                             if !is_dir {
                                 file_entries.insert(rel_path.clone(), size);
                             } else {
-                                // 将子目录加入队列
                                 dirs_to_scan.push(entry_path);
                             }
 
-                            // 添加到结果
                             items.push(Item {
                                 path: rel_path,
                                 name,
@@ -340,10 +316,8 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
 
     let scan_phase = scan_start.elapsed().as_secs_f64();
 
-    // ========== 统计计算阶段 ==========
     let compute_start = std::time::Instant::now();
 
-    // 收集所有结果
     let mut items_vec: Vec<Item> = Vec::new();
     while let Some(item) = items.pop() {
         items_vec.push(item);
@@ -355,10 +329,8 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
         .map(|entry| (entry.key().clone(), *entry.value()))
         .collect();
 
-    // 计算实际的总大小（只计算文件，不重复计算目录）
     let actual_total_size: i64 = file_entries_vec.iter().map(|(_, size)| *size).sum();
 
-    // 使用并行迭代器计算目录大小
     let dir_sizes: HashMap<String, i64> = file_entries_vec
         .par_iter()
         .fold(
@@ -387,10 +359,8 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
 
     let compute_phase = compute_start.elapsed().as_secs_f64();
 
-    // ========== 格式化和排序阶段 ==========
     let format_start = std::time::Instant::now();
 
-    // 并行更新大小和格式化
     items_vec.par_iter_mut().for_each(|item| {
         if item.is_dir {
             item.size = dir_sizes.get(&item.path).copied().unwrap_or(0);
@@ -398,7 +368,6 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
         item.size_formatted = format_size(item.size);
     });
 
-    // 排序
     items_vec.sort_unstable_by(|a, b| b.size.cmp(&a.size));
 
     let format_phase = format_start.elapsed().as_secs_f64();
@@ -406,7 +375,7 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
 
     Ok(ScanOutput {
         items: items_vec,
-        total_size: actual_total_size,  // 修复：使用实际文件总大小
+        total_size: actual_total_size,
         timing: TimingInfo {
             scan_phase,
             compute_phase,
