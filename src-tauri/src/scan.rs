@@ -50,6 +50,30 @@ pub struct HistoryItem {
     pub items: Vec<Item>,
 }
 
+/// 轻量级历史记录摘要，用于前端列表展示
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryItemSummary {
+    pub path: String,
+    #[serde(with = "chrono::serde::ts_seconds")]
+    pub scan_time: chrono::DateTime<chrono::Utc>,
+    pub total_size: i64,
+    pub size_format: String,
+    pub item_count: usize,
+}
+
+impl From<&HistoryItem> for HistoryItemSummary {
+    fn from(item: &HistoryItem) -> Self {
+        Self {
+            path: item.path.clone(),
+            scan_time: item.scan_time,
+            total_size: item.total_size,
+            size_format: item.size_format.clone(),
+            item_count: item.items.len(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
     pub result: ScanResult,

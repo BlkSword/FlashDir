@@ -1,4 +1,4 @@
-use crate::scan::{self, HistoryItem, ScanResult};
+use crate::scan::{self, HistoryItem, HistoryItemSummary, ScanResult};
 use crate::AppState;
 use chrono::Utc;
 use tauri::{command, State};
@@ -107,6 +107,14 @@ pub async fn scan_directory(
         }
         Err(e) => Err(e.to_string()),
     }
+}
+
+#[command]
+pub fn get_history_summary(state: State<'_, AppState>) -> Vec<HistoryItemSummary> {
+    let history = state.history.lock().unwrap();
+    // 只返回摘要，不包含完整的 items 列表
+    let summaries: Vec<HistoryItemSummary> = history.iter().map(|item| item.into()).collect();
+    summaries.into_iter().rev().collect()
 }
 
 #[command]

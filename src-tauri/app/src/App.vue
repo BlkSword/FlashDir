@@ -388,7 +388,8 @@ const buildTreeData = () => {
 
 const loadHistory = async () => {
   try {
-    const historyData = await invoke('get_history')
+    // 使用轻量级摘要，不加载完整的 items 列表
+    const historyData = await invoke('get_history_summary')
     history.value = historyData || []
   } catch (error) {
     console.error('加载历史记录失败:', error)

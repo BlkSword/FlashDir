@@ -24,6 +24,7 @@ async fn main() {
         .setup(|_app| Ok(()))
         .invoke_handler(tauri::generate_handler![
             commands::scan_directory,
+            commands::get_history_summary,
             commands::get_history,
             commands::clear_history,
         ])
