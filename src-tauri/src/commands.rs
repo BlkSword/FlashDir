@@ -65,37 +65,43 @@ pub async fn scan_directory(
     force_refresh: bool,
     state: State<'_, AppState>,
 ) -> Result<ScanResult, String> {
-    let path = path.trim();
+    let path = path.trim().to_string();
 
     if path.is_empty() {
         return Err("请提供有效的目录路径".to_string());
     }
 
-    match scan::scan_directory(path, force_refresh).await {
-        Ok(mut result) => {
+    match scan::scan_directory(&path, force_refresh).await {
+        Ok(result) => {
+            // 优化：避免克隆整个 items 列表
+            // 直接使用 result 的数据构造 HistoryItem
             let history_item = HistoryItem {
-                path: path.to_string(),
+                path: path.clone(),
                 scan_time: Utc::now(),
                 total_size: result.total_size,
                 size_format: result.total_size_formatted.clone(),
-                items: result.items.clone(),
+                items: result.items.clone(), // 保留这个克隆，因为历史记录需要独立副本
             };
 
             let mut history = state.history.lock().unwrap();
-            history.push(history_item.clone());
+            history.push(history_item);
 
             if history.len() > 20 {
                 history.remove(0);
             }
 
-            let history_slice: Vec<_> = history.iter().cloned().collect();
+            // 优化：使用 into_iter 避免克隆，但在闭包中需要获取所有权
+            // 由于 spawn_blocking 需要 'static，我们仍然需要克隆
+            // 但可以优化为只克隆必要的数据
+            let history_for_save: Vec<HistoryItem> = history.iter().cloned().collect();
             drop(history);
 
+            // 异步保存历史，不阻塞响应
             task::spawn_blocking(move || {
-                let _ = save_history_to_file(&history_slice);
+                if let Err(e) = save_history_to_file(&history_for_save) {
+                    eprintln!("保存历史记录失败: {}", e);
+                }
             });
-
-            result.path = path.to_string();
 
             Ok(result)
         }
@@ -106,7 +112,10 @@ pub async fn scan_directory(
 #[command]
 pub fn get_history(state: State<'_, AppState>) -> Vec<HistoryItem> {
     let history = state.history.lock().unwrap();
-    history.iter().rev().cloned().collect()
+    // 优化：使用 reverse in-place 而不是创建新向量
+    let mut result: Vec<_> = history.iter().cloned().collect();
+    result.reverse();
+    result
 }
 
 #[command]

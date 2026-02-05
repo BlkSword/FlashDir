@@ -83,13 +83,41 @@ const handleSelect = (keys) => {
   padding: 8px 0;
 }
 
-.tree-node-title {
+/* 使用 :deep() 穿透 scoped 样式 */
+:deep(.ant-tree-node-content-wrapper) {
+  padding: 4px 8px;
   display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+}
+
+:deep(.ant-tree-node-content-wrapper:hover) {
+  background: #f5f5f5;
+}
+
+:deep(.ant-tree-node-selected .ant-tree-node-content-wrapper) {
+  background: #e6f7ff;
+}
+
+:deep(.ant-tree-iconEle) {
+  flex-shrink: 0;
+  margin-right: 4px;
+}
+
+:deep(.ant-tree-title) {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+}
+
+.tree-node-title {
+  display: inline-flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
   width: 100%;
-  padding-right: 8px;
+  min-width: 0;
 }
 
 .node-name {
@@ -97,6 +125,7 @@ const handleSelect = (keys) => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
 }
 
 .node-size {
@@ -108,25 +137,7 @@ const handleSelect = (keys) => {
   min-width: 50px;
 }
 
-.ant-tree-node-content-wrapper {
-  padding: 4px 8px;
-  display: flex;
-  align-items: center;
-}
-
-.ant-tree-node-content-wrapper:hover {
-  background: #f5f5f5;
-}
-
-.ant-tree-node-selected .ant-tree-node-content-wrapper {
-  background: #e6f7ff;
-}
-
-.ant-tree-node-selected .node-size {
+:deep(.ant-tree-node-selected .node-size) {
   color: #1890ff;
-}
-
-.ant-tree-iconEle {
-  flex-shrink: 0;
 }
 </style>

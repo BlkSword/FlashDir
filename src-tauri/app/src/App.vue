@@ -54,6 +54,7 @@
       :total-items="totalItems"
       :total-size="totalSize"
       :scan-time="scanTime"
+      :backend-time="backendTime"
     />
 
     <a-modal
@@ -88,7 +89,8 @@ const { invoke, openDialog } = useTauri()
 const currentPath = ref('')
 const allItems = ref([])
 const loading = ref(false)
-const scanTime = ref(0)
+const scanTime = ref(0)  // 总耗时（秒）
+const backendTime = ref(0)  // 后端扫描耗时（秒）
 const treeData = ref([])
 const history = ref([])
 
@@ -117,13 +119,27 @@ const canGoUp = computed(() => {
 
 const totalItems = computed(() => allItems.value.length)
 
+// 关键修复：只计算文件的大小，不重复计算目录
+// 后端的 total_size 已经是所有文件的总大小
 const totalSize = computed(() => {
-  return allItems.value.reduce((sum, item) => sum + (item.size || 0), 0)
+  // 只累加文件的大小，目录的大小已经被包含在 total_size 中了
+  // 这里我们直接使用后端计算的 total_size
+  // 但由于 totalSize 是基于 allItems 计算的，我们需要确保不重复计算
+
+  // 方案：只累加文件（!isDir）的大小
+  return allItems.value
+    .filter(item => !item.isDir)
+    .reduce((sum, item) => sum + (item.size || 0), 0)
 })
 
-const displayItems = computed(() => {
-  let items = [...allItems.value]
+// 优化：使用缓存避免重复计算和排序
+const displayItems = ref([])
+const filteredItems = ref([])
 
+// 当数据变化时，使用 requestIdleCallback 或 setTimeout 延迟处理
+const updateDisplayItems = () => {
+  // 先过滤
+  let items = allItems.value
   if (searchKeyword.value.trim()) {
     const keyword = searchKeyword.value.toLowerCase().trim()
     items = items.filter(item => {
@@ -131,11 +147,13 @@ const displayItems = computed(() => {
              item.path.toLowerCase().includes(keyword)
     })
   }
+  filteredItems.value = items
 
+  // 再排序
   const sortColumn = sortConfig.value.column
   const sortDirection = sortConfig.value.direction
 
-  items.sort((a, b) => {
+  const sorted = [...items].sort((a, b) => {
     let aVal, bVal
 
     switch (sortColumn) {
@@ -168,21 +186,19 @@ const displayItems = computed(() => {
     }
   })
 
+  // 分页
   const start = (currentPage.value - 1) * pageSize.value
   const end = start + pageSize.value
-  return items.slice(start, end)
-})
+  displayItems.value = sorted.slice(start, end)
+}
 
-const filteredTotalItems = computed(() => {
-  if (searchKeyword.value.trim()) {
-    return allItems.value.filter(item => {
-      const keyword = searchKeyword.value.toLowerCase().trim()
-      return item.name.toLowerCase().includes(keyword) ||
-             item.path.toLowerCase().includes(keyword)
-    }).length
-  }
-  return allItems.value.length
-})
+// 使用防抖和批量更新
+const debouncedUpdate = debounce(updateDisplayItems, 10)
+
+// 监听变化并更新
+watch([allItems, searchKeyword, sortConfig, currentPage, pageSize], debouncedUpdate)
+
+const filteredTotalItems = computed(() => filteredItems.value.length)
 
 const handleScan = async (path, addToHistory = true) => {
   if (!path || path.trim() === '') {
@@ -191,15 +207,36 @@ const handleScan = async (path, addToHistory = true) => {
   }
 
   loading.value = true
+  scanTime.value = 0
+  backendTime.value = 0
+
+  // 记录完整的开始时间（包含前端和后端）
+  const fullStartTime = performance.now()
+
   try {
     const result = await invoke('scan_directory', {
       path: path.trim(),
       forceRefresh: false
     })
 
-    allItems.value = result.items || []
-    scanTime.value = result.scanTime || 0
-    currentPath.value = path
+    const backendEndTime = performance.now()
+    // 确保 scanTime 是数字
+    backendTime.value = typeof result.scanTime === 'number' ? result.scanTime : 0
+
+    // 使用 requestAnimationFrame 避免 UI 阻塞
+    await new Promise(resolve => {
+      requestAnimationFrame(() => {
+        allItems.value = result.items || []
+        currentPath.value = path
+
+        // 延迟构建树数据，避免阻塞 UI
+        setTimeout(() => {
+          buildTreeData()
+        }, 50)
+
+        resolve()
+      })
+    })
 
     if (addToHistory) {
       navigationHistory.value = navigationHistory.value.slice(0, navigationIndex.value + 1)
@@ -207,9 +244,23 @@ const handleScan = async (path, addToHistory = true) => {
       navigationIndex.value = navigationHistory.value.length - 1
     }
 
-    buildTreeData()
+    const fullEndTime = performance.now()
+    // scanTime 是用户感受到的总时间（从前端点击到显示完成）
+    scanTime.value = parseFloat(((fullEndTime - fullStartTime) / 1000).toFixed(2))
 
-    message.success(`扫描完成，找到 ${allItems.value.length} 个项目`)
+    // 如果有详细的 timing 信息，显示各阶段耗时（安全地处理 undefined）
+    const timingInfo = result.timing
+    if (timingInfo) {
+      const safeNum = (n) => typeof n === 'number' ? n.toFixed(2) + 's' : 'N/A'
+      console.log('性能详情:', {
+        扫描阶段: safeNum(timingInfo.scan_phase),
+        统计阶段: safeNum(timingInfo.compute_phase),
+        格式化阶段: safeNum(timingInfo.format_phase),
+        后端总计: safeNum(timingInfo.total)
+      })
+    }
+
+    message.success(`扫描完成 (总计: ${scanTime.value}s，找到 ${allItems.value.length} 个项目)`)
   } catch (error) {
     console.error('扫描失败:', error)
     message.error('扫描失败: ' + error)
@@ -293,50 +344,64 @@ const handleClearHistory = async () => {
   }
 }
 
+// 优化：使用更高效的算法构建树数据
 const buildTreeData = () => {
   const dirs = allItems.value.filter(item => item.isDir)
-
-  const dirSizeMap = {}
-  dirs.forEach(dir => {
-    dirSizeMap[dir.path] = {
-      size: dir.size,
-      sizeFormatted: dir.sizeFormatted
-    }
-  })
-
-  const buildNode = (path) => {
-    const node = {
-      key: path,
-      title: path.split('/').pop() || path,
-      size: 0,
-      sizeFormatted: '0 B',
-      children: undefined
-    }
-
-    const sizeInfo = dirSizeMap[path]
-    if (sizeInfo) {
-      node.size = sizeInfo.size
-      node.sizeFormatted = sizeInfo.sizeFormatted
-    }
-
-    const children = dirs.filter(dir => {
-      const parentPath = dir.path.substring(0, dir.path.lastIndexOf('/'))
-      return parentPath === path
-    })
-
-    if (children.length > 0) {
-      node.children = children.map(child => buildNode(child.path))
-    }
-
-    return node
+  if (dirs.length === 0) {
+    treeData.value = []
+    return
   }
 
-  const topLevelDirs = dirs.filter(dir => {
-    const parentPath = dir.path.substring(0, dir.path.lastIndexOf('/'))
-    return !parentPath || !dirSizeMap[parentPath]
+  // 使用 Map 优化查找性能，从 O(n²) 降低到 O(n)
+  const nodeMap = new Map()
+
+  // 首先创建所有节点
+  dirs.forEach(dir => {
+    nodeMap.set(dir.path, {
+      key: dir.path,
+      title: dir.path.split('/').pop() || dir.path,
+      size: dir.size,
+      sizeFormatted: dir.sizeFormatted,
+      children: []
+    })
   })
 
-  treeData.value = topLevelDirs.map(dir => buildNode(dir.path))
+  // 构建父子关系
+  const topLevelNodes = []
+
+  dirs.forEach(dir => {
+    const node = nodeMap.get(dir.path)
+    const lastSlashIndex = dir.path.lastIndexOf('/')
+
+    if (lastSlashIndex === -1) {
+      // 顶级目录
+      topLevelNodes.push(node)
+    } else {
+      const parentPath = dir.path.substring(0, lastSlashIndex)
+      const parentNode = nodeMap.get(parentPath)
+
+      if (parentNode) {
+        parentNode.children.push(node)
+      } else {
+        // 父节点不存在，作为顶级节点
+        topLevelNodes.push(node)
+      }
+    }
+  })
+
+  // 移除空的 children 数组以优化渲染
+  const cleanEmptyChildren = (nodes) => {
+    nodes.forEach(node => {
+      if (node.children && node.children.length === 0) {
+        delete node.children
+      } else if (node.children) {
+        cleanEmptyChildren(node.children)
+      }
+    })
+  }
+
+  cleanEmptyChildren(topLevelNodes)
+  treeData.value = topLevelNodes
 }
 
 const loadHistory = async () => {
@@ -358,7 +423,7 @@ watch(historyVisible, (isOpen) => {
   }
 })
 
-watch(() => allItems.value, () => {
+watch(() => allItems.value.length, () => {
   currentPage.value = 1
 })
 </script>

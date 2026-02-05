@@ -1,8 +1,24 @@
 use anyhow;
+use crossbeam::queue::SegQueue;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
+
+/// 详细的时间统计信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimingInfo {
+    /// 扫描阶段耗时（秒）
+    pub scan_phase: f64,
+    /// 统计计算阶段耗时（秒）
+    pub compute_phase: f64,
+    /// 格式化和排序阶段耗时（秒）
+    pub format_phase: f64,
+    /// 总耗时（秒）
+    pub total: f64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,6 +40,9 @@ pub struct ScanResult {
     pub total_size_formatted: String,
     pub scan_time: f64,
     pub path: String,
+    /// 详细时间统计（可选，用于调试）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<TimingInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,20 +204,22 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
 
     let canonical_path_clone = canonical_path.clone();
 
-    let items = tokio::task::spawn_blocking(move || {
-        scan_directory_fast(&canonical_path_clone)
+    // 使用并行扫描充分利用多核 CPU
+    let output = tokio::task::spawn_blocking(move || {
+        scan_directory_parallel_v3(&canonical_path_clone)
     })
     .await??;
 
-    let total_size: i64 = items.iter().map(|item| item.size).sum();
+    // scan_time 是整个后端处理时间（从调用到返回）
     let scan_time = start_time.elapsed().as_secs_f64();
 
     let result = ScanResult {
-        items,
-        total_size,
-        total_size_formatted: format_size(total_size),
+        items: output.items,
+        total_size: output.total_size,
+        total_size_formatted: format_size(output.total_size),
         scan_time,
         path: path.to_string(),
+        timing: Some(output.timing),
     };
 
     SCAN_CACHE.insert(root_dir.clone(), result.clone());
@@ -206,108 +227,191 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
     Ok(result)
 }
 
-fn scan_directory_fast(root_path: &Path) -> Result<Vec<Item>, anyhow::Error> {
+/// 扫描结果，包含详细时间信息
+struct ScanOutput {
+    items: Vec<Item>,
+    total_size: i64,
+    timing: TimingInfo,
+}
+
+/// 超高效并行扫描 V3 - 使用无锁队列和并行统计，带详细时间统计
+/// 修复：total_size 只计算文件大小，不重复计算目录
+fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Error> {
+    use rayon::prelude::*;
     use std::fs;
 
-    let mut items = Vec::with_capacity(1024);
-    let mut dirs_to_scan = VecDeque::with_capacity(256);
-    dirs_to_scan.push_back(root_path.to_path_buf());
+    let total_start = std::time::Instant::now();
 
-    while let Some(current_dir) = dirs_to_scan.pop_front() {
-        let entries = match fs::read_dir(&current_dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+    // 使用无锁队列避免 Mutex 竞争
+    let dirs_to_scan = Arc::new(SegQueue::new());
+    let items = Arc::new(SegQueue::new());
+    let file_entries = Arc::new(dashmap::DashMap::with_capacity(4096));
 
-        for entry in entries.flatten() {
-            let path = entry.path();
+    // 添加根目录
+    dirs_to_scan.push(root_path.to_path_buf());
 
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
+    // 全局线程池配置 - 使用更多线程
+    let num_threads = rayon::current_num_threads().max(8);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .ok();
 
-            let is_dir = file_type.is_dir();
+    // ========== 扫描阶段 ==========
+    let scan_start = std::time::Instant::now();
 
-            let size = if is_dir {
-                0
-            } else {
-                match entry.metadata() {
-                    Ok(m) => m.len() as i64,
-                    Err(_) => 0,
-                }
-            };
+    // 并行扫描所有目录
+    rayon::scope(|s| {
+        // 启动多个工作线程
+        for _ in 0..num_threads {
+            let dirs_to_scan = Arc::clone(&dirs_to_scan);
+            let items = Arc::clone(&items);
+            let file_entries = Arc::clone(&file_entries);
+            let root_path = root_path.to_path_buf();
 
-            let rel_path = match path.strip_prefix(root_path) {
-                Ok(p) => {
-                    let path_str = p.to_string_lossy();
-                    let estimated_len = path_str.len() + 10;
-                    let mut result = String::with_capacity(estimated_len);
-                    for (i, part) in p.components().enumerate() {
-                        if i > 0 {
-                            result.push('/');
+            s.spawn(move |_| {
+                // 工作线程：持续从队列中取出目录进行扫描
+                loop {
+                    // 尝试从队列中取出一个目录
+                    let dir_path = match dirs_to_scan.pop() {
+                        Some(d) => d,
+                        None => break, // 队列为空，退出
+                    };
+
+                    // 扫描目录
+                    if let Ok(entries) = fs::read_dir(&dir_path) {
+                        for entry in entries.filter_map(Result::ok) {
+                            let entry_path = entry.path();
+
+                            // 跳过符号链接
+                            let ft = match entry.file_type() {
+                                Ok(ft) => ft,
+                                Err(_) => continue,
+                            };
+
+                            if ft.is_symlink() {
+                                continue;
+                            }
+
+                            let is_dir = ft.is_dir();
+
+                            // 构建相对路径
+                            let rel_path = match entry_path.strip_prefix(&root_path) {
+                                Ok(p) => p.to_string_lossy().replace('\\', "/"),
+                                Err(_) => continue,
+                            };
+
+                            let name = entry_path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("?")
+                                .to_string();
+
+                            let size = if is_dir {
+                                0
+                            } else {
+                                entry.metadata()
+                                    .map(|m| m.len() as i64)
+                                    .unwrap_or(0)
+                            };
+
+                            // 收集文件信息
+                            if !is_dir {
+                                file_entries.insert(rel_path.clone(), size);
+                            } else {
+                                // 将子目录加入队列
+                                dirs_to_scan.push(entry_path);
+                            }
+
+                            // 添加到结果
+                            items.push(Item {
+                                path: rel_path,
+                                name,
+                                size,
+                                size_formatted: String::new(),
+                                is_dir,
+                            });
                         }
-                        result.push_str(part.as_os_str().to_string_lossy().as_ref());
                     }
-                    result
                 }
-                Err(_) => path.to_string_lossy().replace('\\', "/"),
-            };
-
-            // 获取文件名
-            let name = path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("?")
-                .to_string();
-
-            items.push(Item {
-                path: rel_path,
-                name,
-                size,
-                size_formatted: format_size(size),
-                is_dir,
             });
-
-            if is_dir {
-                dirs_to_scan.push_back(path);
-            }
         }
+    });
+
+    let scan_phase = scan_start.elapsed().as_secs_f64();
+
+    // ========== 统计计算阶段 ==========
+    let compute_start = std::time::Instant::now();
+
+    // 收集所有结果
+    let mut items_vec: Vec<Item> = Vec::new();
+    while let Some(item) = items.pop() {
+        items_vec.push(item);
     }
 
-    items.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+    // 并行计算目录大小
+    let file_entries_vec: Vec<(String, i64)> = file_entries
+        .iter()
+        .map(|entry| (entry.key().clone(), *entry.value()))
+        .collect();
 
-    let mut dir_sizes: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    // 计算实际的总大小（只计算文件，不重复计算目录）
+    let actual_total_size: i64 = file_entries_vec.iter().map(|(_, size)| *size).sum();
 
-    for item in &items {
-        if !item.is_dir {
-            let mut current_path = item.path.as_str();
-            loop {
-                dir_sizes.entry(current_path.to_string())
-                    .and_modify(|s| *s += item.size)
-                    .or_insert(item.size);
-
-                if let Some(pos) = current_path.rfind('/') {
-                    current_path = &current_path[..pos];
-                } else {
-                    dir_sizes.entry(String::new())
-                        .and_modify(|s| *s += item.size)
-                        .or_insert(item.size);
-                    break;
+    // 使用并行迭代器计算目录大小
+    let dir_sizes: HashMap<String, i64> = file_entries_vec
+        .par_iter()
+        .fold(
+            || HashMap::with_capacity(16),
+            |mut acc, (file_path, file_size)| {
+                let mut pos = 0;
+                while let Some(slash_pos) = &file_path[pos..].find('/') {
+                    let abs_pos = pos + slash_pos;
+                    let parent_path = &file_path[..abs_pos];
+                    *acc.entry(parent_path.to_string()).or_insert(0) += file_size;
+                    pos = abs_pos + 1;
                 }
-            }
-        }
-    }
+                *acc.entry(String::new()).or_insert(0) += file_size;
+                acc
+            },
+        )
+        .reduce(
+            || HashMap::new(),
+            |mut acc, other| {
+                for (k, v) in other {
+                    *acc.entry(k).or_insert(0) += v;
+                }
+                acc
+            },
+        );
 
-    for item in &mut items {
+    let compute_phase = compute_start.elapsed().as_secs_f64();
+
+    // ========== 格式化和排序阶段 ==========
+    let format_start = std::time::Instant::now();
+
+    // 并行更新大小和格式化
+    items_vec.par_iter_mut().for_each(|item| {
         if item.is_dir {
-            if let Some(&total_size) = dir_sizes.get(&item.path) {
-                item.size = total_size;
-                item.size_formatted = format_size(total_size);
-            }
+            item.size = dir_sizes.get(&item.path).copied().unwrap_or(0);
         }
-    }
+        item.size_formatted = format_size(item.size);
+    });
 
-    items.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+    // 排序
+    items_vec.sort_unstable_by(|a, b| b.size.cmp(&a.size));
 
-    Ok(items)
+    let format_phase = format_start.elapsed().as_secs_f64();
+    let total = total_start.elapsed().as_secs_f64();
+
+    Ok(ScanOutput {
+        items: items_vec,
+        total_size: actual_total_size,  // 修复：使用实际文件总大小
+        timing: TimingInfo {
+            scan_phase,
+            compute_phase,
+            format_phase,
+            total,
+        },
+    })
 }

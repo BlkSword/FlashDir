@@ -3,7 +3,14 @@
     <span class="statusbar-item">{{ path || '就绪' }}</span>
     <span class="statusbar-item">{{ totalItems }} 个项目</span>
     <span class="statusbar-item">{{ formattedSize }}</span>
-    <span v-if="scanTime > 0" class="statusbar-item">{{ scanTime.toFixed(2) }} 秒</span>
+    <span v-if="scanTime > 0" class="statusbar-item">
+      <span class="time-label">总耗时:</span>
+      <span class="time-value">{{ scanTime }}s</span>
+    </span>
+    <span v-if="shouldShowBackendTime" class="statusbar-item">
+      <span class="time-label">后端:</span>
+      <span class="time-value backend">{{ backendTime }}s</span>
+    </span>
   </div>
 </template>
 
@@ -22,12 +29,23 @@ const props = defineProps({
     default: 0
   },
   scanTime: {
-    type: Number,
+    type: [String, Number],
+    default: 0
+  },
+  backendTime: {
+    type: [String, Number],
     default: 0
   }
 })
 
 const formattedSize = computed(() => formatSize(props.totalSize))
+
+// 判断是否显示后端时间
+const shouldShowBackendTime = computed(() => {
+  const bt = Number(props.backendTime)
+  const st = Number(props.scanTime)
+  return bt > 0 && bt !== st && Math.abs(bt - st) > 0.1  // 差异大于 0.1s 才显示
+})
 </script>
 
 <style scoped>
@@ -44,5 +62,19 @@ const formattedSize = computed(() => formatSize(props.totalSize))
 
 .statusbar-item {
   white-space: nowrap;
+}
+
+.time-label {
+  color: #999;
+}
+
+.time-value {
+  color: #52c41a;
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-weight: 600;
+}
+
+.time-value.backend {
+  color: #1890ff;
 }
 </style>
