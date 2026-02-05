@@ -75,6 +75,18 @@
         浏览
       </a-button>
     </div>
+
+    <div class="search-wrapper">
+      <a-input-search
+        v-model:value="searchKeyword"
+        placeholder="搜索文件..."
+        :disabled="loading"
+        allow-clear
+        @input="handleSearchInput"
+        @clear="handleSearchClear"
+        style="width: 200px"
+      />
+    </div>
   </div>
 </template>
 
@@ -113,9 +125,10 @@ const props = defineProps({
   }
 })
 
-const emit = defineEmits(['scan', 'browse', 'navigate', 'show-history'])
+const emit = defineEmits(['scan', 'browse', 'navigate', 'show-history', 'search'])
 
 const localPath = ref(props.path || '')
+const searchKeyword = ref('')
 
 watch(() => props.path, (newVal) => {
   localPath.value = newVal || ''
@@ -125,6 +138,10 @@ const handleScan = () => {
   if (localPath.value.trim()) {
     emit('scan', localPath.value.trim())
   }
+}
+
+const handleSearchInput = (e) => {
+  emit('search', '')
 }
 </script>
 
@@ -144,10 +161,15 @@ const handleScan = () => {
   align-items: center;
   gap: 8px;
   flex: 1;
-  max-width: 600px;
+  max-width: 500px;
 }
 
 .path-input-wrapper .ant-input {
   flex: 1;
+}
+
+.search-wrapper {
+  display: flex;
+  align-items: center;
 }
 </style>

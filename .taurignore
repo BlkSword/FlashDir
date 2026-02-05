@@ -1,0 +1,8 @@
+# 忽略 Vite 构建输出
+src-tauri/app/dist
+src-tauri/app/node_modules
+src-tauri/app/.vite
+
+# 忽略其他临时文件
+*.log
+.DS_Store

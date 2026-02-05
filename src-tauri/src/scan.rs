@@ -1,5 +1,6 @@
 use anyhow;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -26,6 +27,7 @@ pub struct ScanResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HistoryItem {
     pub path: String,
     #[serde(with = "chrono::serde::ts_seconds")]
@@ -82,7 +84,12 @@ impl ScanCache {
     }
 
     fn estimate_size(&self, result: &ScanResult) -> usize {
-        result.items.len() * (100 + std::mem::size_of::<Item>())
+        result.items.iter().map(|item| {
+            std::mem::size_of::<Item>()
+                + item.path.capacity()
+                + item.name.capacity()
+                + item.size_formatted.capacity()
+        }).sum::<usize>()
     }
 
     fn get_total_size(&self) -> usize {
@@ -199,17 +206,14 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
     Ok(result)
 }
 
-// 简化、可靠的扫描函数
 fn scan_directory_fast(root_path: &Path) -> Result<Vec<Item>, anyhow::Error> {
     use std::fs;
 
-    // 预分配容量以减少重新分配（根据目录大小预估）
     let mut items = Vec::with_capacity(1024);
-    let mut dirs_to_scan = Vec::with_capacity(256);
-    dirs_to_scan.push(root_path.to_path_buf());
+    let mut dirs_to_scan = VecDeque::with_capacity(256);
+    dirs_to_scan.push_back(root_path.to_path_buf());
 
-    // 使用 BFS 遍历目录
-    while let Some(current_dir) = dirs_to_scan.pop() {
+    while let Some(current_dir) = dirs_to_scan.pop_front() {
         let entries = match fs::read_dir(&current_dir) {
             Ok(e) => e,
             Err(_) => continue,
@@ -217,42 +221,93 @@ fn scan_directory_fast(root_path: &Path) -> Result<Vec<Item>, anyhow::Error> {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            let metadata = match fs::metadata(&path) {
-                Ok(m) => m,
+
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
                 Err(_) => continue,
             };
 
-            let is_dir = metadata.is_dir();
-            let size = metadata.len() as i64;
+            let is_dir = file_type.is_dir();
 
-            // 计算相对路径
-            let rel_path = path.strip_prefix(root_path)
-                .unwrap_or(&path);
-            let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
+            let size = if is_dir {
+                0
+            } else {
+                match entry.metadata() {
+                    Ok(m) => m.len() as i64,
+                    Err(_) => 0,
+                }
+            };
 
-            // 获取名称（直接使用 &str 避免克隆）
+            let rel_path = match path.strip_prefix(root_path) {
+                Ok(p) => {
+                    let path_str = p.to_string_lossy();
+                    let estimated_len = path_str.len() + 10;
+                    let mut result = String::with_capacity(estimated_len);
+                    for (i, part) in p.components().enumerate() {
+                        if i > 0 {
+                            result.push('/');
+                        }
+                        result.push_str(part.as_os_str().to_string_lossy().as_ref());
+                    }
+                    result
+                }
+                Err(_) => path.to_string_lossy().replace('\\', "/"),
+            };
+
+            // 获取文件名
             let name = path.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("?")
                 .to_string();
 
             items.push(Item {
-                path: rel_path_str,
+                path: rel_path,
                 name,
                 size,
                 size_formatted: format_size(size),
                 is_dir,
             });
 
-            // 如果是目录，添加到待扫描列表
             if is_dir {
-                dirs_to_scan.push(path);
+                dirs_to_scan.push_back(path);
             }
         }
     }
 
-    // 按大小排序（稳定的排序）
-    items.sort_by(|a, b| b.size.cmp(&a.size));
+    items.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+
+    let mut dir_sizes: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
+    for item in &items {
+        if !item.is_dir {
+            let mut current_path = item.path.as_str();
+            loop {
+                dir_sizes.entry(current_path.to_string())
+                    .and_modify(|s| *s += item.size)
+                    .or_insert(item.size);
+
+                if let Some(pos) = current_path.rfind('/') {
+                    current_path = &current_path[..pos];
+                } else {
+                    dir_sizes.entry(String::new())
+                        .and_modify(|s| *s += item.size)
+                        .or_insert(item.size);
+                    break;
+                }
+            }
+        }
+    }
+
+    for item in &mut items {
+        if item.is_dir {
+            if let Some(&total_size) = dir_sizes.get(&item.path) {
+                item.size = total_size;
+                item.size_formatted = format_size(total_size);
+            }
+        }
+    }
+
+    items.sort_unstable_by(|a, b| b.size.cmp(&a.size));
 
     Ok(items)
 }

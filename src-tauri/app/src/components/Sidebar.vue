@@ -13,14 +13,20 @@
           <FolderOutlined v-if="!isLeaf" />
           <FileOutlined v-else />
         </template>
+        <template #title="{ title, sizeFormatted }">
+          <span class="tree-node-title">
+            <span class="node-name">{{ title }}</span>
+            <span v-if="sizeFormatted" class="node-size">{{ sizeFormatted }}</span>
+          </span>
+        </template>
       </a-tree>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, watch } from 'vue'
 import { FolderOutlined, FileOutlined } from '@ant-design/icons-vue'
+import { ref, watch } from 'vue'
 
 const props = defineProps({
   treeData: {
@@ -54,7 +60,7 @@ const handleSelect = (keys) => {
 
 <style scoped>
 .sidebar {
-  width: 250px;
+  width: 300px;
   background: #fafafa;
   border-right: 1px solid #f0f0f0;
   overflow: hidden;
@@ -77,15 +83,50 @@ const handleSelect = (keys) => {
   padding: 8px 0;
 }
 
-:deep(.ant-tree-node-content-wrapper) {
-  padding: 4px 8px;
+.tree-node-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding-right: 8px;
 }
 
-:deep(.ant-tree-node-content-wrapper:hover) {
+.node-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-size {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: #999;
+  font-family: 'Consolas', 'Monaco', monospace;
+  text-align: right;
+  min-width: 50px;
+}
+
+.ant-tree-node-content-wrapper {
+  padding: 4px 8px;
+  display: flex;
+  align-items: center;
+}
+
+.ant-tree-node-content-wrapper:hover {
   background: #f5f5f5;
 }
 
-:deep(.ant-tree-node-selected .ant-tree-node-content-wrapper) {
+.ant-tree-node-selected .ant-tree-node-content-wrapper {
   background: #e6f7ff;
+}
+
+.ant-tree-node-selected .node-size {
+  color: #1890ff;
+}
+
+.ant-tree-iconEle {
+  flex-shrink: 0;
 }
 </style>

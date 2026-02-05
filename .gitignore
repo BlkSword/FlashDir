@@ -38,3 +38,4 @@ Thumbs.db
 .env.*.local
 .claude/settings.local.json
 CLAUDE.md
+DELETION_LOG.md

@@ -59,20 +59,12 @@
         </template>
       </template>
     </a-table>
-
-    <a-empty
-      v-if="!loading && items.length === 0"
-      description="请在上方输入目录路径并点击扫描"
-      :image="Empty.PRESENTED_IMAGE_SIMPLE"
-      style="margin-top: 100px"
-    />
   </div>
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
 import { FolderOutlined, FileOutlined } from '@ant-design/icons-vue'
-import { Empty } from 'ant-design-vue'
+import { ref, computed } from 'vue'
 
 const props = defineProps({
   items: {
@@ -180,24 +172,24 @@ const handleRowClick = (record) => {
   justify-content: center;
 }
 
-:deep(.ant-table) {
+.ant-table {
   font-size: 13px;
 }
 
-:deep(.ant-table-thead > tr > th) {
+.ant-table-thead > tr > th {
   background: #fafafa;
   font-weight: 600;
 }
 
-:deep(.ant-table-tbody > tr) {
+.ant-table-tbody > tr {
   cursor: pointer;
 }
 
-:deep(.ant-table-tbody > tr:hover > td) {
+.ant-table-tbody > tr:hover > td {
   background: #f5f5f5 !important;
 }
 
-:deep(.ant-table-tbody > tr.ant-table-row-selected > td) {
+.ant-table-tbody > tr.ant-table-row-selected > td {
   background: #e6f7ff !important;
 }
 </style>

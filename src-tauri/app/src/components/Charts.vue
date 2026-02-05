@@ -28,6 +28,7 @@
 <script setup>
 import { ref, watch, onMounted, nextTick, onBeforeUnmount } from 'vue'
 import { Chart, registerables } from 'chart.js'
+import { formatSize, debounce } from '../utils/format.js'
 
 Chart.register(...registerables)
 
@@ -47,21 +48,8 @@ const barChart = ref(null)
 let doughnutChartInstance = null
 let barChartInstance = null
 
-// 计算文件类型分布
 const typeStats = ref([])
-
-// Top 5 项目
 const topItems = ref([])
-
-const formatSize = (bytes) => {
-  if (bytes < 1024) return `${bytes} B`
-  const kb = bytes / 1024
-  if (kb < 1024) return `${kb.toFixed(1)} KB`
-  const mb = kb / 1024
-  if (mb < 1024) return `${mb.toFixed(1)} MB`
-  const gb = mb / 1024
-  return `${gb.toFixed(1)} GB`
-}
 
 const updateStats = () => {
   if (props.items.length === 0) {
@@ -106,14 +94,20 @@ const updateStats = () => {
     }))
 }
 
+// 创建或更新环形图
 const createDoughnutChart = () => {
   if (!doughnutChart.value) return
 
+  const ctx = doughnutChart.value.getContext('2d')
+
   if (doughnutChartInstance) {
-    doughnutChartInstance.destroy()
+    doughnutChartInstance.data.labels = typeStats.value.map(s => s.type)
+    doughnutChartInstance.data.datasets[0].data = typeStats.value.map(s => s.size)
+    doughnutChartInstance.data.datasets[0].backgroundColor = typeStats.value.map(s => s.color)
+    doughnutChartInstance.update('none')
+    return
   }
 
-  const ctx = doughnutChart.value.getContext('2d')
   doughnutChartInstance = new Chart(ctx, {
     type: 'doughnut',
     data: {
@@ -163,11 +157,15 @@ const createDoughnutChart = () => {
 const createBarChart = () => {
   if (!barChart.value) return
 
+  const ctx = barChart.value.getContext('2d')
+
   if (barChartInstance) {
-    barChartInstance.destroy()
+    barChartInstance.data.labels = topItems.value.map(i => i.name)
+    barChartInstance.data.datasets[0].data = topItems.value.map(i => i.size || 0)
+    barChartInstance.update('none')
+    return
   }
 
-  const ctx = barChart.value.getContext('2d')
   barChartInstance = new Chart(ctx, {
     type: 'bar',
     data: {
@@ -219,7 +217,7 @@ const createBarChart = () => {
   })
 }
 
-const updateCharts = () => {
+const debouncedUpdateCharts = debounce(() => {
   updateStats()
 
   if (typeStats.value.length > 0) {
@@ -239,11 +237,15 @@ const updateCharts = () => {
     barChartInstance.destroy()
     barChartInstance = null
   }
+}, 150) // 150ms 防抖延迟
+
+const updateCharts = () => {
+  debouncedUpdateCharts()
 }
 
 watch(() => [props.items, props.totalSize], () => {
   updateCharts()
-}, { deep: true })
+})
 
 onMounted(() => {
   updateCharts()
@@ -312,7 +314,7 @@ onBeforeUnmount(() => {
   font-size: 12px;
 }
 
-:deep(.ant-card-body) {
+.ant-card-body {
   padding: 12px;
 }
 </style>

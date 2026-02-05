@@ -7,7 +7,6 @@ use std::io::Write;
 use std::path::PathBuf;
 use tokio::task;
 
-// 获取历史记录文件路径
 fn get_history_file_path() -> Result<PathBuf, String> {
     let home_dir = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
@@ -19,7 +18,6 @@ fn get_history_file_path() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-// 加载历史记录（从文件）
 pub fn load_history_from_file() -> Vec<HistoryItem> {
     match get_history_file_path() {
         Ok(path) => {
@@ -31,7 +29,6 @@ pub fn load_history_from_file() -> Vec<HistoryItem> {
                     Err(_) => Vec::new()
                 }
             } else {
-                // 确保目录存在
                 if let Some(parent) = path.parent() {
                     let _ = fs::create_dir_all(parent);
                 }
@@ -42,11 +39,9 @@ pub fn load_history_from_file() -> Vec<HistoryItem> {
     }
 }
 
-// 保存历史记录到文件
 fn save_history_to_file(history: &[HistoryItem]) -> Result<(), String> {
     let path = get_history_file_path()?;
 
-    // 确保目录存在
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("创建目录失败: {}", e))?;
@@ -78,7 +73,6 @@ pub async fn scan_directory(
 
     match scan::scan_directory(path, force_refresh).await {
         Ok(mut result) => {
-            // 添加到历史记录（包括缓存命中）
             let history_item = HistoryItem {
                 path: path.to_string(),
                 scan_time: Utc::now(),
@@ -87,25 +81,20 @@ pub async fn scan_directory(
                 items: result.items.clone(),
             };
 
-            // 保存到历史记录
             let mut history = state.history.lock().unwrap();
             history.push(history_item.clone());
 
-            // 保持历史记录在合理范围内（最多保存20条，减少内存占用）
             if history.len() > 20 {
                 history.remove(0);
             }
 
-            // 异步保存到文件，避免阻塞
             let history_slice: Vec<_> = history.iter().cloned().collect();
-            drop(history); // 释放锁
+            drop(history);
 
-            // 在后台任务中保存，不阻塞响应
             task::spawn_blocking(move || {
                 let _ = save_history_to_file(&history_slice);
             });
 
-            // 更新结果中的路径为规范路径
             result.path = path.to_string();
 
             Ok(result)
@@ -117,7 +106,6 @@ pub async fn scan_directory(
 #[command]
 pub fn get_history(state: State<'_, AppState>) -> Vec<HistoryItem> {
     let history = state.history.lock().unwrap();
-    // 返回逆序（最新的在前）
     history.iter().rev().cloned().collect()
 }
 

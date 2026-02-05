@@ -13,6 +13,8 @@ export default defineConfig({
   build: {
     outDir: '../dist',
     emptyOutDir: true,
+    // 开发模式下不生成 source map，减少文件写入
+    sourcemap: false,
     rollupOptions: {
       output: {
         assetFileNames: 'assets/[name]-[hash][extname]',
@@ -21,8 +23,16 @@ export default defineConfig({
       },
     },
   },
+  // 优化开发服务器配置
   server: {
     port: 5173,
     strictPort: true,
+    // 禁用文件监听时的某些功能
+    watch: {
+      // 忽略 node_modules 和 dist 目录
+      ignored: ['**/node_modules/**', '**/dist/**', '../dist/**'],
+    },
   },
+  // 清空缓存目录
+  cacheDir: '../node_modules/.vite',
 })

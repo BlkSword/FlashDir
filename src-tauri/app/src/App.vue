@@ -1,6 +1,5 @@
 <template>
   <div class="app-container">
-    <!-- 工具栏 -->
     <Toolbar
       :path="currentPath"
       :can-go-back="canGoBack"
@@ -11,18 +10,16 @@
       @browse="handleBrowse"
       @navigate="handleNavigate"
       @show-history="historyVisible = true"
+      @search="handleSearchInput"
     />
 
-    <!-- 主内容区 -->
     <div class="main-container">
-      <!-- 侧边栏 -->
       <Sidebar
         :tree-data="treeData"
         :selected-path="currentPath"
         @select="handleSelectPath"
       />
 
-      <!-- 内容区域 -->
       <div class="content-area">
         <FileList
           :items="displayItems"
@@ -32,12 +29,11 @@
           @select="handleSelectItem"
         />
 
-        <!-- 分页 -->
         <div class="pagination-wrapper">
           <a-pagination
             v-model:current="currentPage"
             v-model:page-size="pageSize"
-            :total="totalItems"
+            :total="filteredTotalItems"
             :show-size-changer="true"
             :show-quick-jumper="true"
             :page-size-options="['50', '100', '200', '500', '1000']"
@@ -47,14 +43,12 @@
         </div>
       </div>
 
-      <!-- 统计图表面板 -->
       <Charts
         :items="allItems"
         :total-size="totalSize"
       />
     </div>
 
-    <!-- 状态栏 -->
     <StatusBar
       :path="currentPath"
       :total-items="totalItems"
@@ -62,7 +56,6 @@
       :scan-time="scanTime"
     />
 
-    <!-- 历史记录模态框 -->
     <a-modal
       v-model:open="historyVisible"
       title="历史记录"
@@ -88,10 +81,10 @@ import Charts from './components/Charts.vue'
 import StatusBar from './components/StatusBar.vue'
 import HistoryList from './components/HistoryList.vue'
 import { useTauri } from './composables/useTauri'
+import { debounce, getParentPath } from './utils/format.js'
 
 const { invoke, openDialog } = useTauri()
 
-// ==================== 状态管理 ====================
 const currentPath = ref('')
 const allItems = ref([])
 const loading = ref(false)
@@ -99,24 +92,21 @@ const scanTime = ref(0)
 const treeData = ref([])
 const history = ref([])
 
-// 导航历史
 const navigationHistory = ref([])
 const navigationIndex = ref(-1)
 
-// 分页
 const currentPage = ref(1)
 const pageSize = ref(100)
 
-// 排序
 const sortConfig = ref({
   column: 'size',
   direction: 'desc'
 })
 
-// 历史记录模态框
+const searchKeyword = ref('')
+
 const historyVisible = ref(false)
 
-// ==================== 计算属性 ====================
 const canGoBack = computed(() => navigationIndex.value > 0)
 const canGoForward = computed(() => navigationIndex.value < navigationHistory.value.length - 1)
 const canGoUp = computed(() => {
@@ -131,51 +121,69 @@ const totalSize = computed(() => {
   return allItems.value.reduce((sum, item) => sum + (item.size || 0), 0)
 })
 
-// 分页后的显示数据
 const displayItems = computed(() => {
   let items = [...allItems.value]
 
-  // 排序
+  if (searchKeyword.value.trim()) {
+    const keyword = searchKeyword.value.toLowerCase().trim()
+    items = items.filter(item => {
+      return item.name.toLowerCase().includes(keyword) ||
+             item.path.toLowerCase().includes(keyword)
+    })
+  }
+
+  const sortColumn = sortConfig.value.column
+  const sortDirection = sortConfig.value.direction
+
   items.sort((a, b) => {
     let aVal, bVal
 
-    if (sortConfig.value.column === 'name') {
-      aVal = a.name || a.path
-      bVal = b.name || b.path
-      return sortConfig.value.direction === 'asc'
-        ? aVal.localeCompare(bVal)
-        : bVal.localeCompare(aVal)
-    }
+    switch (sortColumn) {
+      case 'name':
+        aVal = a.name || a.path
+        bVal = b.name || b.path
+        return sortDirection === 'asc'
+          ? aVal.localeCompare(bVal, 'zh-CN')
+          : bVal.localeCompare(aVal, 'zh-CN')
 
-    if (sortConfig.value.column === 'type') {
-      aVal = a.isDir ? 0 : 1
-      bVal = b.isDir ? 0 : 1
-      if (aVal !== bVal) {
-        return sortConfig.value.direction === 'asc' ? aVal - bVal : bVal - aVal
-      }
-      aVal = a.name || a.path
-      bVal = b.name || b.path
-      return sortConfig.value.direction === 'asc'
-        ? aVal.localeCompare(bVal)
-        : bVal.localeCompare(aVal)
-    }
+      case 'type':
+        aVal = a.isDir ? 0 : 1
+        bVal = b.isDir ? 0 : 1
+        if (aVal !== bVal) {
+          return sortDirection === 'asc' ? aVal - bVal : bVal - aVal
+        }
+        aVal = a.name || a.path
+        bVal = b.name || b.path
+        return sortDirection === 'asc'
+          ? aVal.localeCompare(bVal, 'zh-CN')
+          : bVal.localeCompare(aVal, 'zh-CN')
 
-    if (sortConfig.value.column === 'size') {
-      aVal = a.size || 0
-      bVal = b.size || 0
-      return sortConfig.value.direction === 'asc' ? aVal - bVal : bVal - aVal
-    }
+      case 'size':
+        aVal = a.size || 0
+        bVal = b.size || 0
+        return sortDirection === 'asc' ? aVal - bVal : bVal - aVal
 
-    return 0
+      default:
+        return 0
+    }
   })
 
-  // 分页
   const start = (currentPage.value - 1) * pageSize.value
   const end = start + pageSize.value
   return items.slice(start, end)
 })
 
-// ==================== 方法 ====================
+const filteredTotalItems = computed(() => {
+  if (searchKeyword.value.trim()) {
+    return allItems.value.filter(item => {
+      const keyword = searchKeyword.value.toLowerCase().trim()
+      return item.name.toLowerCase().includes(keyword) ||
+             item.path.toLowerCase().includes(keyword)
+    }).length
+  }
+  return allItems.value.length
+})
+
 const handleScan = async (path, addToHistory = true) => {
   if (!path || path.trim() === '') {
     message.warning('请输入有效的目录路径')
@@ -193,14 +201,12 @@ const handleScan = async (path, addToHistory = true) => {
     scanTime.value = result.scanTime || 0
     currentPath.value = path
 
-    // 更新导航历史
     if (addToHistory) {
       navigationHistory.value = navigationHistory.value.slice(0, navigationIndex.value + 1)
       navigationHistory.value.push(path)
       navigationIndex.value = navigationHistory.value.length - 1
     }
 
-    // 构建树形数据
     buildTreeData()
 
     message.success(`扫描完成，找到 ${allItems.value.length} 个项目`)
@@ -238,14 +244,17 @@ const handleNavigate = async (direction) => {
     const path = navigationHistory.value[navigationIndex.value]
     await handleScan(path, false)
   } else if (direction === 'up' && canGoUp.value) {
-    const parts = currentPath.value.split(/[/\\]/)
-    parts.pop()
-    const parentPath = parts.join('/')
-    if (parentPath) {
+    const parentPath = getParentPath(currentPath.value)
+    if (parentPath && parentPath !== currentPath.value) {
       await handleScan(parentPath)
     }
   }
 }
+
+const handleSearchInput = debounce((keyword) => {
+  searchKeyword.value = keyword
+  currentPage.value = 1
+}, 300)
 
 const handleSelectPath = (path) => {
   handleScan(path)
@@ -256,7 +265,6 @@ const handleSelectItem = (item) => {
     const fullPath = currentPath.value + '/' + item.path
     handleScan(fullPath)
   } else {
-    // 打开文件或显示文件信息
     message.info(`文件: ${item.name}`)
   }
 }
@@ -285,48 +293,52 @@ const handleClearHistory = async () => {
   }
 }
 
-// 构建树形数据
 const buildTreeData = () => {
   const dirs = allItems.value.filter(item => item.isDir)
-  const tree = {}
 
+  const dirSizeMap = {}
   dirs.forEach(dir => {
-    const parts = dir.path.split('/')
-    let current = tree
-
-    parts.forEach((part, index) => {
-      if (!current[part]) {
-        current[part] = {
-          name: part,
-          children: {},
-          fullPath: dir.path,
-          isLeaf: index === parts.length - 1
-        }
-      }
-      current = current[part].children
-    })
-  })
-
-  treeData.value = convertTreeToArray(tree, currentPath.value)
-}
-
-const convertTreeToArray = (tree, basePath = '') => {
-  return Object.keys(tree).map(key => {
-    const node = tree[key]
-    const fullPath = basePath ? `${basePath}/${node.fullPath}` : node.fullPath
-
-    return {
-      key: fullPath,
-      title: node.name,
-      isLeaf: node.isLeaf,
-      children: node.children && Object.keys(node.children).length > 0
-        ? convertTreeToArray(node.children, fullPath)
-        : undefined
+    dirSizeMap[dir.path] = {
+      size: dir.size,
+      sizeFormatted: dir.sizeFormatted
     }
   })
+
+  const buildNode = (path) => {
+    const node = {
+      key: path,
+      title: path.split('/').pop() || path,
+      size: 0,
+      sizeFormatted: '0 B',
+      children: undefined
+    }
+
+    const sizeInfo = dirSizeMap[path]
+    if (sizeInfo) {
+      node.size = sizeInfo.size
+      node.sizeFormatted = sizeInfo.sizeFormatted
+    }
+
+    const children = dirs.filter(dir => {
+      const parentPath = dir.path.substring(0, dir.path.lastIndexOf('/'))
+      return parentPath === path
+    })
+
+    if (children.length > 0) {
+      node.children = children.map(child => buildNode(child.path))
+    }
+
+    return node
+  }
+
+  const topLevelDirs = dirs.filter(dir => {
+    const parentPath = dir.path.substring(0, dir.path.lastIndexOf('/'))
+    return !parentPath || !dirSizeMap[parentPath]
+  })
+
+  treeData.value = topLevelDirs.map(dir => buildNode(dir.path))
 }
 
-// 加载历史记录
 const loadHistory = async () => {
   try {
     const historyData = await invoke('get_history')
@@ -336,19 +348,16 @@ const loadHistory = async () => {
   }
 }
 
-// ==================== 生命周期 ====================
 onMounted(() => {
   loadHistory()
 })
 
-// 监听历史记录模态框打开，重新加载最新数据
 watch(historyVisible, (isOpen) => {
   if (isOpen) {
     loadHistory()
   }
 })
 
-// 监听分页变化，重置到第一页
 watch(() => allItems.value, () => {
   currentPage.value = 1
 })
