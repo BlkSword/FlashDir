@@ -19,4 +19,16 @@ anyhow = "1.0"
 lazy_static = "1.4"
 dashmap = "6.1"
 rayon = "1.10"
-crossbeam = "0.8"
+crossbeam = { version = "0.8", features = ["crossbeam-channel"] }
+lru = "0.12"
+num_cpus = "1.16"
+mimalloc = "0.1"
+parking_lot = "0.12"
+smartstring = { version = "1.0", features = ["serde"] }
+ahash = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = true

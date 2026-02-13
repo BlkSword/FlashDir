@@ -50,8 +50,16 @@ let barChartInstance = null
 
 const typeStats = ref([])
 const topItems = ref([])
+const lastDataFingerprint = ref('')
 
 const updateStats = () => {
+  // 数据指纹检测，避免重复计算
+  const fingerprint = `${props.items.length}-${props.totalSize}`
+  if (fingerprint === lastDataFingerprint.value && typeStats.value.length > 0) {
+    return
+  }
+  lastDataFingerprint.value = fingerprint
+
   if (props.items.length === 0) {
     typeStats.value = []
     topItems.value = []

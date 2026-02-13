@@ -1,10 +1,16 @@
 use anyhow;
-use crossbeam::queue::SegQueue;
+use crossbeam::channel::{unbounded, Sender, Receiver};
+use lru::LruCache;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use smartstring::SmartString;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
+
+pub type CompactString = SmartString<smartstring::Compact>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -18,11 +24,11 @@ pub struct TimingInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Item {
-    pub path: String,
-    pub name: String,
+    pub path: CompactString,
+    pub name: CompactString,
     pub size: i64,
     #[serde(rename = "sizeFormatted")]
-    pub size_formatted: String,
+    pub size_formatted: CompactString,
     #[serde(rename = "isDir")]
     pub is_dir: bool,
 }
@@ -32,25 +38,60 @@ pub struct Item {
 pub struct ScanResult {
     pub items: Vec<Item>,
     pub total_size: i64,
-    pub total_size_formatted: String,
+    pub total_size_formatted: CompactString,
     pub scan_time: f64,
-    pub path: String,
+    pub path: CompactString,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<TimingInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArcScanResult {
+    pub items: Arc<Vec<Item>>,
+    pub total_size: i64,
+    pub total_size_formatted: Arc<str>,
+    pub scan_time: f64,
+    pub path: Arc<str>,
+    pub timing: Option<TimingInfo>,
+}
+
+impl From<ArcScanResult> for ScanResult {
+    fn from(result: ArcScanResult) -> Self {
+        Self {
+            items: Arc::unwrap_or_clone(result.items),
+            total_size: result.total_size,
+            total_size_formatted: CompactString::from(result.total_size_formatted.as_ref()),
+            scan_time: result.scan_time,
+            path: CompactString::from(result.path.as_ref()),
+            timing: result.timing,
+        }
+    }
+}
+
+impl From<&ArcScanResult> for ScanResult {
+    fn from(result: &ArcScanResult) -> Self {
+        Self {
+            items: result.items.as_ref().clone(),
+            total_size: result.total_size,
+            total_size_formatted: CompactString::from(result.total_size_formatted.as_ref()),
+            scan_time: result.scan_time,
+            path: CompactString::from(result.path.as_ref()),
+            timing: result.timing.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryItem {
-    pub path: String,
+    pub path: CompactString,
     #[serde(with = "chrono::serde::ts_seconds")]
     pub scan_time: chrono::DateTime<chrono::Utc>,
     pub total_size: i64,
-    pub size_format: String,
-    pub items: Vec<Item>,
+    pub size_format: CompactString,
+    pub item_count: usize,
 }
 
-/// 轻量级历史记录摘要，用于前端列表展示
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryItemSummary {
@@ -65,116 +106,121 @@ pub struct HistoryItemSummary {
 impl From<&HistoryItem> for HistoryItemSummary {
     fn from(item: &HistoryItem) -> Self {
         Self {
-            path: item.path.clone(),
+            path: item.path.to_string(),
             scan_time: item.scan_time,
             total_size: item.total_size,
-            size_format: item.size_format.clone(),
-            item_count: item.items.len(),
+            size_format: item.size_format.to_string(),
+            item_count: item.item_count,
         }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
-    pub result: ScanResult,
+    pub result: ArcScanResult,
     pub dir_mtime: chrono::DateTime<chrono::Local>,
+    pub size: usize,
 }
 
 pub struct ScanCache {
-    cache: dashmap::DashMap<String, CacheEntry>,
-    max_entries: usize,
+    cache: Mutex<LruCache<String, CacheEntry>>,
     max_size_bytes: usize,
-    current_size: dashmap::DashMap<String, usize>,
 }
 
 impl ScanCache {
     pub fn new(max_entries: usize, max_size_mb: usize) -> Self {
         ScanCache {
-            cache: dashmap::DashMap::new(),
-            max_entries,
+            cache: Mutex::new(LruCache::new(NonZeroUsize::new(max_entries).unwrap())),
             max_size_bytes: max_size_mb * 1024 * 1024,
-            current_size: dashmap::DashMap::new(),
         }
     }
 
     pub fn get(&self, path: &str) -> Option<CacheEntry> {
-        self.cache.get(path).map(|entry| entry.clone())
+        let mut cache = self.cache.lock();
+        cache.get(path).cloned()
     }
 
     pub fn insert(&self, path: String, result: ScanResult) {
-        let entry_size = self.estimate_size(&result);
+        let arc_result = ArcScanResult {
+            items: Arc::new(result.items),
+            total_size: result.total_size,
+            total_size_formatted: Arc::from(result.total_size_formatted.as_str()),
+            scan_time: result.scan_time,
+            path: Arc::from(result.path.as_str()),
+            timing: result.timing,
+        };
 
-        if self.cache.len() >= self.max_entries
-            || self.get_total_size() + entry_size > self.max_size_bytes
-        {
-            self.evict_oldest();
+        let entry_size = Self::estimate_size(&arc_result);
+        let mut cache = self.cache.lock();
+
+        let current_total: usize = cache.iter().map(|(_, e)| e.size).sum();
+        if current_total + entry_size > self.max_size_bytes {
+            while cache.iter().map(|(_, e)| e.size).sum::<usize>() + entry_size > self.max_size_bytes
+                && !cache.is_empty()
+            {
+                cache.pop_lru();
+            }
         }
 
-        self.current_size.insert(path.clone(), entry_size);
-        self.cache.insert(
+        cache.put(
             path,
             CacheEntry {
-                result,
+                result: arc_result,
                 dir_mtime: chrono::Local::now(),
+                size: entry_size,
             },
         );
     }
 
-    fn estimate_size(&self, result: &ScanResult) -> usize {
+    fn estimate_size(result: &ArcScanResult) -> usize {
         result.items.iter().map(|item| {
             std::mem::size_of::<Item>()
-                + item.path.capacity()
-                + item.name.capacity()
-                + item.size_formatted.capacity()
+                + item.path.len()
+                + item.name.len()
+                + item.size_formatted.len()
         }).sum::<usize>()
-    }
-
-    fn get_total_size(&self) -> usize {
-        self.current_size.iter().map(|entry| *entry.value()).sum()
-    }
-
-    fn evict_oldest(&self) {
-        let mut entries: Vec<_> = self.cache.iter().collect();
-        entries.sort_by(|a, b| a.value().dir_mtime.cmp(&b.value().dir_mtime));
-        if let Some(entry) = entries.first() {
-            let key = entry.key().clone();
-            self.current_size.remove(&key);
-            self.cache.remove(&key);
-        }
+            + std::mem::size_of::<Arc<Vec<Item>>>()
     }
 
     pub fn invalidate(&self, path: &str) {
-        let keys_to_remove: Vec<String> = self
-            .cache
+        let mut cache = self.cache.lock();
+        let keys_to_remove: Vec<String> = cache
             .iter()
-            .filter(|entry| entry.key().starts_with(path))
-            .map(|entry| entry.key().clone())
+            .filter(|(k, _)| k.starts_with(path))
+            .map(|(k, _)| k.clone())
             .collect();
         for key in keys_to_remove {
-            self.current_size.remove(&key);
-            self.cache.remove(&key);
+            cache.pop(&key);
         }
     }
 }
 
 lazy_static::lazy_static! {
     static ref SCAN_CACHE: ScanCache = ScanCache::new(30, 200);
+    static ref SIZE_UNITS: [&'static str; 5] = ["B", "KB", "MB", "GB", "TB"];
 }
 
-pub fn format_size(bytes: i64) -> String {
+#[inline]
+pub fn format_size(bytes: i64) -> CompactString {
     if bytes < 1024 {
-        return format!("{} B", bytes);
+        return CompactString::from(format!("{} B", bytes));
     }
-    let kb = bytes as f64 / 1024.0;
-    if kb < 1024.0 {
-        return format!("{:.1} KB", kb);
+
+    let mut size = bytes as f64;
+    let mut unit_index = 0;
+
+    while size >= 1024.0 && unit_index < 4 {
+        size /= 1024.0;
+        unit_index += 1;
     }
-    let mb = kb / 1024.0;
-    if mb < 1024.0 {
-        return format!("{:.1} MB", mb);
+
+    if size < 10.0 {
+        CompactString::from(format!("{:.2} {}", size, SIZE_UNITS[unit_index]))
+    } else if size < 100.0 {
+        CompactString::from(format!("{:.1} {}", size, SIZE_UNITS[unit_index]))
+    } else {
+        CompactString::from(format!("{:.0} {}", size, SIZE_UNITS[unit_index]))
     }
-    let gb = mb / 1024.0;
-    format!("{:.1} GB", gb)
 }
 
 pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResult, anyhow::Error> {
@@ -200,7 +246,7 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
         Err(e) => return Err(anyhow::anyhow!("路径规范化失败: {}", e)),
     };
 
-    let root_dir = canonical_path.to_string_lossy().replace('\\', "/");
+    let root_dir = normalize_path_separator(canonical_path.as_os_str());
 
     let mtime = match metadata.modified() {
         Ok(m) => m,
@@ -211,7 +257,7 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
     if !force_refresh {
         if let Some(cached) = SCAN_CACHE.get(&root_dir) {
             if cached.dir_mtime >= mtime_datetime {
-                let mut result = cached.result.clone();
+                let mut result = ScanResult::from(&cached.result);
                 result.scan_time = 0.0;
                 return Ok(result);
             }
@@ -234,16 +280,15 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
         total_size: output.total_size,
         total_size_formatted: format_size(output.total_size),
         scan_time,
-        path: path.to_string(),
+        path: CompactString::from(path),
         timing: Some(output.timing),
     };
 
-    SCAN_CACHE.insert(root_dir.clone(), result.clone());
+    SCAN_CACHE.insert(root_dir, result.clone());
 
     Ok(result)
 }
 
-/// 扫描结果，包含详细时间信息
 struct ScanOutput {
     items: Vec<Item>,
     total_size: i64,
@@ -256,32 +301,48 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
 
     let total_start = std::time::Instant::now();
 
-    let dirs_to_scan = Arc::new(SegQueue::new());
-    let items = Arc::new(SegQueue::new());
-    let file_entries = Arc::new(dashmap::DashMap::with_capacity(4096));
+    let (dir_sender, dir_receiver): (Sender<PathBuf>, Receiver<PathBuf>) = unbounded();
+    let (item_sender, item_receiver): (Sender<ItemInternal>, Receiver<ItemInternal>) = unbounded();
+    let file_entries = Arc::new(dashmap::DashMap::with_capacity_and_hasher(
+        4096,
+        ahash::RandomState::new(),
+    ));
 
-    dirs_to_scan.push(root_path.to_path_buf());
+    dir_sender.send(root_path.to_path_buf()).unwrap();
 
-    let num_threads = rayon::current_num_threads().max(8);
-    rayon::ThreadPoolBuilder::new()
+    let cpu_count = num_cpus::get();
+    let num_threads = (cpu_count * 2).min(32).max(8);
+
+    let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
-        .build_global()
-        .ok();
+        .build()?;
 
     let scan_start = std::time::Instant::now();
 
-    rayon::scope(|s| {
+    pool.scope(|s| {
         for _ in 0..num_threads {
-            let dirs_to_scan = Arc::clone(&dirs_to_scan);
-            let items = Arc::clone(&items);
+            let dir_sender = dir_sender.clone();
+            let dir_receiver = dir_receiver.clone();
+            let item_sender = item_sender.clone();
             let file_entries = Arc::clone(&file_entries);
             let root_path = root_path.to_path_buf();
 
             s.spawn(move |_| {
+                let mut idle_count = 0;
                 loop {
-                    let dir_path = match dirs_to_scan.pop() {
-                        Some(d) => d,
-                        None => break,
+                    let dir_path = match dir_receiver.try_recv() {
+                        Ok(d) => {
+                            idle_count = 0;
+                            d
+                        }
+                        Err(_) => {
+                            idle_count += 1;
+                            if idle_count > 100 && dir_sender.is_empty() {
+                                break;
+                            }
+                            std::thread::yield_now();
+                            continue;
+                        }
                     };
 
                     if let Ok(entries) = fs::read_dir(&dir_path) {
@@ -300,7 +361,7 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
                             let is_dir = ft.is_dir();
 
                             let rel_path = match entry_path.strip_prefix(&root_path) {
-                                Ok(p) => p.to_string_lossy().replace('\\', "/"),
+                                Ok(p) => normalize_path_separator_compact(p.as_os_str()),
                                 Err(_) => continue,
                             };
 
@@ -313,22 +374,19 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
                             let size = if is_dir {
                                 0
                             } else {
-                                entry.metadata()
-                                    .map(|m| m.len() as i64)
-                                    .unwrap_or(0)
+                                entry.metadata().map(|m| m.len() as i64).unwrap_or(0)
                             };
 
                             if !is_dir {
                                 file_entries.insert(rel_path.clone(), size);
                             } else {
-                                dirs_to_scan.push(entry_path);
+                                let _ = dir_sender.send(entry.path());
                             }
 
-                            items.push(Item {
+                            let _ = item_sender.send(ItemInternal {
                                 path: rel_path,
-                                name,
+                                name: CompactString::from(name),
                                 size,
-                                size_formatted: String::new(),
                                 is_dir,
                             });
                         }
@@ -338,59 +396,69 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
         }
     });
 
-    let scan_phase = scan_start.elapsed().as_secs_f64();
+    drop(item_sender);
+    drop(dir_sender);
 
+    let scan_phase = scan_start.elapsed().as_secs_f64();
     let compute_start = std::time::Instant::now();
 
-    let mut items_vec: Vec<Item> = Vec::new();
-    while let Some(item) = items.pop() {
-        items_vec.push(item);
-    }
-
-    // 并行计算目录大小
-    let file_entries_vec: Vec<(String, i64)> = file_entries
+    let internal_items: Vec<ItemInternal> = item_receiver.try_iter().collect();
+    let file_count = file_entries.len();
+    let file_entries_vec: Vec<(CompactString, i64)> = file_entries
         .iter()
         .map(|entry| (entry.key().clone(), *entry.value()))
         .collect();
 
     let actual_total_size: i64 = file_entries_vec.iter().map(|(_, size)| *size).sum();
 
-    let dir_sizes: HashMap<String, i64> = file_entries_vec
-        .par_iter()
-        .fold(
-            || HashMap::with_capacity(16),
-            |mut acc, (file_path, file_size)| {
-                let mut pos = 0;
-                while let Some(slash_pos) = &file_path[pos..].find('/') {
-                    let abs_pos = pos + slash_pos;
-                    let parent_path = &file_path[..abs_pos];
-                    *acc.entry(parent_path.to_string()).or_insert(0) += file_size;
-                    pos = abs_pos + 1;
-                }
-                *acc.entry(String::new()).or_insert(0) += file_size;
-                acc
-            },
-        )
-        .reduce(
-            || HashMap::new(),
-            |mut acc, other| {
-                for (k, v) in other {
-                    *acc.entry(k).or_insert(0) += v;
-                }
-                acc
-            },
-        );
+    let dir_sizes = Arc::new(dashmap::DashMap::with_capacity_and_hasher(
+        (file_count / 4).max(64),
+        ahash::RandomState::new(),
+    ));
+
+    file_entries_vec.par_iter().for_each(|(file_path, file_size)| {
+        let mut pos = 0;
+        while let Some(slash_pos) = file_path[pos..].find('/') {
+            let abs_pos = pos + slash_pos;
+            let parent_path = &file_path[..abs_pos];
+            dir_sizes
+                .entry(CompactString::from(parent_path))
+                .and_modify(|v| *v += file_size)
+                .or_insert(*file_size);
+            pos = abs_pos + 1;
+        }
+        dir_sizes
+            .entry(CompactString::new())
+            .and_modify(|v| *v += file_size)
+            .or_insert(*file_size);
+    });
+
+    let dir_sizes: HashMap<CompactString, i64> = dir_sizes
+        .iter()
+        .map(|entry| (entry.key().clone(), *entry.value()))
+        .collect();
 
     let compute_phase = compute_start.elapsed().as_secs_f64();
-
     let format_start = std::time::Instant::now();
 
-    items_vec.par_iter_mut().for_each(|item| {
-        if item.is_dir {
-            item.size = dir_sizes.get(&item.path).copied().unwrap_or(0);
-        }
-        item.size_formatted = format_size(item.size);
-    });
+    let mut items_vec: Vec<Item> = internal_items
+        .into_par_iter()
+        .map(|internal| {
+            let size = if internal.is_dir {
+                dir_sizes.get(&internal.path).copied().unwrap_or(0)
+            } else {
+                internal.size
+            };
+
+            Item {
+                path: internal.path,
+                name: internal.name,
+                size,
+                size_formatted: format_size(size),
+                is_dir: internal.is_dir,
+            }
+        })
+        .collect();
 
     items_vec.sort_unstable_by(|a, b| b.size.cmp(&a.size));
 
@@ -407,4 +475,31 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
             total,
         },
     })
+}
+
+struct ItemInternal {
+    path: CompactString,
+    name: CompactString,
+    size: i64,
+    is_dir: bool,
+}
+
+#[inline]
+fn normalize_path_separator(path: &std::ffi::OsStr) -> String {
+    let s = path.to_string_lossy();
+    if s.contains('\\') {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    }
+}
+
+#[inline]
+fn normalize_path_separator_compact(path: &std::ffi::OsStr) -> CompactString {
+    let s = path.to_string_lossy();
+    if s.contains('\\') {
+        CompactString::from(s.replace('\\', "/"))
+    } else {
+        CompactString::from(s.as_ref())
+    }
 }

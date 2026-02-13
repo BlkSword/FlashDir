@@ -6,6 +6,8 @@
       :loading="loading"
       :pagination="false"
       :scroll="{ y: tableHeight }"
+      :virtual="true"
+      :row-height="40"
       size="small"
       row-key="path"
       @row-click="handleRowClick"
@@ -133,6 +135,8 @@ const handleRowClick = (record) => {
 .file-list-container {
   flex: 1;
   overflow: hidden;
+  contain: content;
+  will-change: transform;
 }
 
 .name-cell {

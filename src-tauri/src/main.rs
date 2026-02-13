@@ -3,13 +3,18 @@
     windows_subsystem = "windows"
 )]
 
-use std::sync::Mutex;
+// 全局高性能内存分配器
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use std::collections::VecDeque;
+use parking_lot::Mutex;
 
 mod commands;
 mod scan;
 
 struct AppState {
-    history: Mutex<Vec<scan::HistoryItem>>,
+    history: Mutex<VecDeque<scan::HistoryItem>>,
 }
 
 #[tokio::main]
@@ -19,7 +24,7 @@ async fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .manage(AppState {
-            history: Mutex::new(commands::load_history_from_file()),
+            history: Mutex::new(commands::load_history_from_file_sync()),
         })
         .setup(|_app| Ok(()))
         .invoke_handler(tauri::generate_handler![
