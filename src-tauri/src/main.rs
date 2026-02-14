@@ -3,7 +3,6 @@
     windows_subsystem = "windows"
 )]
 
-// 全局高性能内存分配器
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -12,6 +11,9 @@ use parking_lot::Mutex;
 
 mod commands;
 mod scan;
+mod perf;
+mod disk_cache;
+mod binary_protocol;
 
 struct AppState {
     history: Mutex<VecDeque<scan::HistoryItem>>,
@@ -19,6 +21,8 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
+    let _ = disk_cache::DiskCache::instance();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -26,12 +30,21 @@ async fn main() {
         .manage(AppState {
             history: Mutex::new(commands::load_history_from_file_sync()),
         })
-        .setup(|_app| Ok(()))
         .invoke_handler(tauri::generate_handler![
             commands::scan_directory,
+            commands::scan_directory_binary,
+            commands::scan_directories_batch,
             commands::get_history_summary,
             commands::get_history,
             commands::clear_history,
+            commands::get_performance_metrics,
+            commands::get_performance_history,
+            commands::clear_performance_history,
+            commands::get_performance_summary,
+            commands::get_disk_cache_stats,
+            commands::clear_disk_cache,
+            commands::get_memory_cache_stats,
+            commands::get_system_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

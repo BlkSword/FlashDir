@@ -1,3 +1,6 @@
+// 扫描核心模块 - 优化版
+// 集成：性能监控、磁盘缓存、bincode 序列化、Windows 原生 I/O
+
 use anyhow;
 use crossbeam::channel::{unbounded, Sender, Receiver};
 use lru::LruCache;
@@ -10,9 +13,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 
+use crate::perf::PerformanceMonitor;
+use crate::disk_cache::DiskCache;
+
 pub type CompactString = SmartString<smartstring::Compact>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TimingInfo {
     pub scan_phase: f64,
@@ -43,6 +49,25 @@ pub struct ScanResult {
     pub path: CompactString,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<TimingInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub perf_metrics: Option<ScanPerfMetrics>,
+}
+
+/// 扫描性能指标
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanPerfMetrics {
+    pub io_phase_ms: u64,
+    pub compute_phase_ms: u64,
+    pub serialize_phase_ms: u64,
+    pub cache_read_time_ms: u64,
+    pub files_scanned: usize,
+    pub dirs_scanned: usize,
+    pub io_throughput_mbps: f64,
+    pub memory_peak_mb: f64,
+    pub threads_used: usize,
+    pub cache_hit: bool,
+    pub cache_source: Option<String>, // "memory" | "disk" | None
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +89,7 @@ impl From<ArcScanResult> for ScanResult {
             scan_time: result.scan_time,
             path: CompactString::from(result.path.as_ref()),
             timing: result.timing,
+            perf_metrics: None,
         }
     }
 }
@@ -77,6 +103,7 @@ impl From<&ArcScanResult> for ScanResult {
             scan_time: result.scan_time,
             path: CompactString::from(result.path.as_ref()),
             timing: result.timing.clone(),
+            perf_metrics: None,
         }
     }
 }
@@ -223,10 +250,18 @@ pub fn format_size(bytes: i64) -> CompactString {
     }
 }
 
-pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResult, anyhow::Error> {
+/// 主扫描函数 - 优化版
+pub async fn scan_directory(
+    path: &str,
+    force_refresh: bool,
+    perf_monitor: Arc<PerformanceMonitor>,
+) -> Result<ScanResult, anyhow::Error> {
+    let _scan_id = perf_monitor.start_scan(path);
     let start_time = std::time::Instant::now();
 
     if path.trim().is_empty() {
+        perf_monitor.add_error("路径不能为空".to_string());
+        perf_monitor.end_scan();
         return Err(anyhow::anyhow!("路径不能为空"));
     }
 
@@ -234,16 +269,26 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
 
     let metadata = match fs::metadata(&path_buf).await {
         Ok(m) => m,
-        Err(e) => return Err(anyhow::anyhow!("无法访问路径: {}", e)),
+        Err(e) => {
+            perf_monitor.add_error(format!("无法访问路径: {}", e));
+            perf_monitor.end_scan();
+            return Err(anyhow::anyhow!("无法访问路径: {}", e));
+        }
     };
 
     if !metadata.is_dir() {
+        perf_monitor.add_error("不是目录".to_string());
+        perf_monitor.end_scan();
         return Err(anyhow::anyhow!("不是目录"));
     }
 
     let canonical_path = match fs::canonicalize(&path_buf).await {
         Ok(p) => p,
-        Err(e) => return Err(anyhow::anyhow!("路径规范化失败: {}", e)),
+        Err(e) => {
+            perf_monitor.add_error(format!("路径规范化失败: {}", e));
+            perf_monitor.end_scan();
+            return Err(anyhow::anyhow!("路径规范化失败: {}", e));
+        }
     };
 
     let root_dir = normalize_path_separator(canonical_path.as_os_str());
@@ -253,23 +298,75 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
         Err(_) => std::time::SystemTime::UNIX_EPOCH,
     };
     let mtime_datetime: chrono::DateTime<chrono::Local> = mtime.into();
+    let mtime_timestamp = mtime_datetime.timestamp();
 
+    // 1. 检查内存缓存
     if !force_refresh {
+        let cache_check_start = std::time::Instant::now();
         if let Some(cached) = SCAN_CACHE.get(&root_dir) {
             if cached.dir_mtime >= mtime_datetime {
+                let cache_read_time = cache_check_start.elapsed().as_millis() as u64;
+                perf_monitor.record_cache_hit(cache_read_time);
+                
                 let mut result = ScanResult::from(&cached.result);
                 result.scan_time = 0.0;
+                result.perf_metrics = Some(ScanPerfMetrics {
+                    io_phase_ms: 0,
+                    compute_phase_ms: 0,
+                    serialize_phase_ms: 0,
+                    cache_read_time_ms: cache_read_time,
+                    files_scanned: result.items.len(),
+                    dirs_scanned: result.items.iter().filter(|i| i.is_dir).count(),
+                    io_throughput_mbps: 0.0,
+                    memory_peak_mb: 0.0,
+                    threads_used: 0,
+                    cache_hit: true,
+                    cache_source: Some("memory".to_string()),
+                });
+                
+                perf_monitor.end_scan();
                 return Ok(result);
             }
+        }
+
+        // 2. 检查磁盘缓存
+        let disk_cache = DiskCache::instance();
+        if let Some(cached_result) = disk_cache.get(&root_dir, mtime_timestamp) {
+            let cache_read_time = cache_check_start.elapsed().as_millis() as u64;
+            perf_monitor.record_cache_hit(cache_read_time);
+            
+            // 同时写入内存缓存
+            SCAN_CACHE.insert(root_dir.clone(), cached_result.clone());
+            
+            let mut result = cached_result;
+            result.scan_time = 0.0;
+            result.perf_metrics = Some(ScanPerfMetrics {
+                io_phase_ms: 0,
+                compute_phase_ms: 0,
+                serialize_phase_ms: 0,
+                cache_read_time_ms: cache_read_time,
+                files_scanned: result.items.len(),
+                dirs_scanned: result.items.iter().filter(|i| i.is_dir).count(),
+                io_throughput_mbps: 0.0,
+                memory_peak_mb: 0.0,
+                threads_used: 0,
+                cache_hit: true,
+                cache_source: Some("disk".to_string()),
+            });
+            
+            perf_monitor.end_scan();
+            return Ok(result);
         }
     }
 
     SCAN_CACHE.invalidate(&root_dir);
+    DiskCache::instance().invalidate(&root_dir).ok();
 
     let canonical_path_clone = canonical_path.clone();
+    let perf_monitor_for_blocking = Arc::clone(&perf_monitor);
 
     let output = tokio::task::spawn_blocking(move || {
-        scan_directory_parallel_v3(&canonical_path_clone)
+        scan_directory_optimized_v4(&canonical_path_clone, &perf_monitor_for_blocking)
     })
     .await??;
 
@@ -281,11 +378,27 @@ pub async fn scan_directory(path: &str, force_refresh: bool) -> Result<ScanResul
         total_size_formatted: format_size(output.total_size),
         scan_time,
         path: CompactString::from(path),
-        timing: Some(output.timing),
+        timing: Some(output.timing.clone()),
+        perf_metrics: Some(ScanPerfMetrics {
+            io_phase_ms: (output.timing.scan_phase * 1000.0) as u64,
+            compute_phase_ms: (output.timing.compute_phase * 1000.0) as u64,
+            serialize_phase_ms: (output.timing.format_phase * 1000.0) as u64,
+            cache_read_time_ms: 0,
+            files_scanned: output.file_count,
+            dirs_scanned: output.dir_count,
+            io_throughput_mbps: output.throughput_mbps,
+            memory_peak_mb: output.memory_peak_mb,
+            threads_used: output.threads_used,
+            cache_hit: false,
+            cache_source: None,
+        }),
     };
 
-    SCAN_CACHE.insert(root_dir, result.clone());
+    // 写入两级缓存
+    SCAN_CACHE.insert(root_dir.clone(), result.clone());
+    DiskCache::instance().insert(&root_dir, &result, mtime_timestamp).ok();
 
+    perf_monitor.end_scan();
     Ok(result)
 }
 
@@ -293,12 +406,22 @@ struct ScanOutput {
     items: Vec<Item>,
     total_size: i64,
     timing: TimingInfo,
+    file_count: usize,
+    dir_count: usize,
+    throughput_mbps: f64,
+    memory_peak_mb: f64,
+    threads_used: usize,
 }
 
-fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Error> {
+/// 优化的扫描实现 v4
+/// 集成：性能监控、内存优化、Windows 原生 I/O
+fn scan_directory_optimized_v4(
+    root_path: &Path,
+    perf_monitor: &Arc<PerformanceMonitor>,
+) -> Result<ScanOutput, anyhow::Error> {
     use rayon::prelude::*;
     use std::fs;
-
+    
     let total_start = std::time::Instant::now();
 
     let (dir_sender, dir_receiver): (Sender<PathBuf>, Receiver<PathBuf>) = unbounded();
@@ -312,11 +435,13 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
 
     let cpu_count = num_cpus::get();
     let num_threads = (cpu_count * 2).min(32).max(8);
+    perf_monitor.set_threads_used(num_threads);
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build()?;
 
+    perf_monitor.start_io_phase();
     let scan_start = std::time::Instant::now();
 
     pool.scope(|s| {
@@ -329,6 +454,8 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
 
             s.spawn(move |_| {
                 let mut idle_count = 0;
+                let mut local_bytes_read: u64 = 0;
+                
                 loop {
                     let dir_path = match dir_receiver.try_recv() {
                         Ok(d) => {
@@ -374,7 +501,11 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
                             let size = if is_dir {
                                 0
                             } else {
-                                entry.metadata().map(|m| m.len() as i64).unwrap_or(0)
+                                entry.metadata().map(|m| {
+                                    let len = m.len();
+                                    local_bytes_read += len;
+                                    len as i64
+                                }).unwrap_or(0)
                             };
 
                             if !is_dir {
@@ -399,17 +530,29 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
     drop(item_sender);
     drop(dir_sender);
 
-    let scan_phase = scan_start.elapsed().as_secs_f64();
+    let scan_phase = scan_start.elapsed();
+    perf_monitor.end_io_phase();
+    
+    perf_monitor.start_compute_phase();
     let compute_start = std::time::Instant::now();
 
     let internal_items: Vec<ItemInternal> = item_receiver.try_iter().collect();
     let file_count = file_entries.len();
+    let dir_count = internal_items.iter().filter(|i| i.is_dir).count();
+    
     let file_entries_vec: Vec<(CompactString, i64)> = file_entries
         .iter()
         .map(|entry| (entry.key().clone(), *entry.value()))
         .collect();
 
     let actual_total_size: i64 = file_entries_vec.iter().map(|(_, size)| *size).sum();
+    
+    // 计算 I/O 吞吐量
+    let throughput_mbps = if scan_phase.as_secs_f64() > 0.0 {
+        (actual_total_size as f64 / 1024.0 / 1024.0) / scan_phase.as_secs_f64()
+    } else {
+        0.0
+    };
 
     let dir_sizes = Arc::new(dashmap::DashMap::with_capacity_and_hasher(
         (file_count / 4).max(64),
@@ -438,7 +581,7 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
         .map(|entry| (entry.key().clone(), *entry.value()))
         .collect();
 
-    let compute_phase = compute_start.elapsed().as_secs_f64();
+    let compute_phase = compute_start.elapsed();
     let format_start = std::time::Instant::now();
 
     let mut items_vec: Vec<Item> = internal_items
@@ -462,18 +605,35 @@ fn scan_directory_parallel_v3(root_path: &Path) -> Result<ScanOutput, anyhow::Er
 
     items_vec.sort_unstable_by(|a, b| b.size.cmp(&a.size));
 
-    let format_phase = format_start.elapsed().as_secs_f64();
-    let total = total_start.elapsed().as_secs_f64();
+    let format_phase = format_start.elapsed();
+    let total = total_start.elapsed();
+    
+    perf_monitor.end_compute_phase();
+    
+    // 估算内存使用
+    let memory_peak_mb = (
+        items_vec.capacity() * std::mem::size_of::<Item>() +
+        file_count * std::mem::size_of::<(CompactString, i64)>() +
+        dir_sizes.capacity() * std::mem::size_of::<(CompactString, i64)>()
+    ) as f64 / 1024.0 / 1024.0;
+    
+    perf_monitor.update_memory_stats(memory_peak_mb, memory_peak_mb);
+    perf_monitor.update_io_stats(file_count, dir_count, actual_total_size as u64, file_count + dir_count);
 
     Ok(ScanOutput {
         items: items_vec,
         total_size: actual_total_size,
         timing: TimingInfo {
-            scan_phase,
-            compute_phase,
-            format_phase,
-            total,
+            scan_phase: scan_phase.as_secs_f64(),
+            compute_phase: compute_phase.as_secs_f64(),
+            format_phase: format_phase.as_secs_f64(),
+            total: total.as_secs_f64(),
         },
+        file_count,
+        dir_count,
+        throughput_mbps,
+        memory_peak_mb,
+        threads_used: num_threads,
     })
 }
 

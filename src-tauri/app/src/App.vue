@@ -76,7 +76,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, shallowRef, nextTick } from 'vue'
+import { ref, computed, watch, onMounted, shallowRef } from 'vue'
 import { message } from 'ant-design-vue'
 import Toolbar from './components/Toolbar.vue'
 import Sidebar from './components/Sidebar.vue'
@@ -113,7 +113,6 @@ const sortConfig = ref({
 const searchKeyword = ref('')
 const historyVisible = ref(false)
 
-// 缓存排序结果
 const sortedItemsCache = shallowRef([])
 const lastSortKey = ref('')
 
@@ -139,18 +138,14 @@ const totalSize = computed(() => {
   return sum
 })
 
-// 过滤计算
 const filteredItems = computed(() => {
   const keyword = searchKeyword.value.trim()
   if (!keyword) return allItems.value
-
-  const lowerKeyword = keyword.toLowerCase()
   return sortWorker.filterItemsSync(allItems.value, keyword)
 })
 
 const filteredTotalItems = computed(() => filteredItems.value.length)
 
-// 显示项目计算 - 使用缓存
 const displayItems = computed(() => {
   const items = filteredItems.value
   const sortColumn = sortConfig.value.column
@@ -160,13 +155,7 @@ const displayItems = computed(() => {
 
   let sorted
   if (newSortKey !== lastSortKey.value) {
-    // 使用 Worker 进行排序（大数据量）或同步排序（小数据量）
-    if (items.length > 1000) {
-      // 异步排序将在 watch 中处理
-      sorted = sortWorker.sortItemsSync(items, sortColumn, sortDirection)
-    } else {
-      sorted = sortWorker.sortItemsSync(items, sortColumn, sortDirection)
-    }
+    sorted = sortWorker.sortItemsSync(items, sortColumn, sortDirection)
     lastSortKey.value = newSortKey
     sortedItemsCache.value = sorted
   } else {
@@ -198,14 +187,12 @@ const handleScan = async (path, addToHistory = true) => {
 
     backendTime.value = typeof result.scanTime === 'number' ? result.scanTime : 0
 
-    // 使用 requestIdleCallback 或 setTimeout 分片处理
     await new Promise(resolve => {
       requestAnimationFrame(() => {
         allItems.value = result.items || []
         currentPath.value = path
-        lastSortKey.value = '' // 重置排序缓存
+        lastSortKey.value = ''
 
-        // 使用 requestIdleCallback 延迟构建树
         if ('requestIdleCallback' in window) {
           requestIdleCallback(() => buildTreeData(), { timeout: 100 })
         } else {
@@ -224,17 +211,6 @@ const handleScan = async (path, addToHistory = true) => {
 
     const fullEndTime = performance.now()
     scanTime.value = parseFloat(((fullEndTime - fullStartTime) / 1000).toFixed(2))
-
-    const timingInfo = result.timing
-    if (timingInfo) {
-      const safeNum = (n) => typeof n === 'number' ? n.toFixed(2) + 's' : 'N/A'
-      console.log('性能详情:', {
-        扫描阶段: safeNum(timingInfo.scan_phase),
-        统计阶段: safeNum(timingInfo.compute_phase),
-        格式化阶段: safeNum(timingInfo.format_phase),
-        后端总计: safeNum(timingInfo.total)
-      })
-    }
 
     message.success(`扫描完成 (总计: ${scanTime.value}s，找到 ${allItems.value.length} 个项目)`)
   } catch (error) {
@@ -281,7 +257,7 @@ const handleNavigate = async (direction) => {
 const handleSearchInput = debounce((keyword) => {
   searchKeyword.value = keyword
   currentPage.value = 1
-  lastSortKey.value = '' // 重置排序缓存
+  lastSortKey.value = ''
 }, 200)
 
 const handleSelectPath = (path) => {
@@ -304,7 +280,7 @@ const handleSort = (column) => {
     sortConfig.value.column = column
     sortConfig.value.direction = column === 'name' ? 'asc' : 'desc'
   }
-  lastSortKey.value = '' // 重置排序缓存
+  lastSortKey.value = ''
 }
 
 const handleSelectHistory = async (path) => {
@@ -331,7 +307,6 @@ const handleSizeChange = (current, size) => {
   currentPage.value = current
 }
 
-// 优化的树数据构建 - 懒加载模式
 const buildTreeData = () => {
   const dirs = allItems.value.filter(item => item.isDir)
   if (dirs.length === 0) {
@@ -339,72 +314,55 @@ const buildTreeData = () => {
     return
   }
 
-  // 只构建顶层目录，子目录按需加载
-  const topLevelNodes = []
   const nodeMap = new Map()
 
-  // 分批处理，避免阻塞主线程
-  const batchSize = 500
-  let processedCount = 0
+  for (const dir of dirs) {
+    const pathParts = dir.path.split('/')
+    const name = pathParts[pathParts.length - 1] || dir.path
 
-  const processBatch = () => {
-    const endIndex = Math.min(processedCount + batchSize, dirs.length)
+    nodeMap.set(dir.path, {
+      key: dir.path,
+      title: name,
+      size: dir.size,
+      sizeFormatted: dir.sizeFormatted,
+      isLeaf: true,
+      children: []
+    })
+  }
 
-    for (let i = processedCount; i < endIndex; i++) {
-      const dir = dirs[i]
-      const pathParts = dir.path.split('/')
+  const topLevelNodes = []
 
-      const node = {
-        key: dir.path,
-        title: pathParts[pathParts.length - 1] || dir.path,
-        size: dir.size,
-        sizeFormatted: dir.sizeFormatted,
-        isLeaf: true // 初始标记为叶子节点
-      }
+  for (const [path, node] of nodeMap) {
+    const lastSlashIndex = path.lastIndexOf('/')
 
-      nodeMap.set(dir.path, node)
-    }
-
-    processedCount = endIndex
-
-    if (processedCount < dirs.length) {
-      // 继续处理下一批
-      if ('requestIdleCallback' in window) {
-        requestIdleCallback(processBatch, { timeout: 50 })
-      } else {
-        setTimeout(processBatch, 0)
-      }
+    if (lastSlashIndex === -1 || lastSlashIndex === 0) {
+      topLevelNodes.push(node)
     } else {
-      // 所有节点创建完成，构建顶层
-      finalizeTree(nodeMap, topLevelNodes)
-    }
-  }
+      const parentPath = path.substring(0, lastSlashIndex)
+      const parentNode = nodeMap.get(parentPath)
 
-  const finalizeTree = (nodeMap, topLevelNodes) => {
-    for (const [path, node] of nodeMap) {
-      const lastSlashIndex = path.lastIndexOf('/')
-
-      if (lastSlashIndex === -1) {
-        topLevelNodes.push(node)
+      if (parentNode) {
+        parentNode.isLeaf = false
+        parentNode.children.push(node)
       } else {
-        const parentPath = path.substring(0, lastSlashIndex)
-        const parentNode = nodeMap.get(parentPath)
-
-        if (parentNode) {
-          parentNode.isLeaf = false
-        } else {
-          topLevelNodes.push(node)
-        }
+        topLevelNodes.push(node)
       }
     }
-
-    // 对顶层节点排序
-    topLevelNodes.sort((a, b) => (b.size || 0) - (a.size || 0))
-    treeData.value = topLevelNodes
   }
 
-  // 开始分批处理
-  processBatch()
+  const sortBySize = (a, b) => (b.size || 0) - (a.size || 0)
+
+  const sortChildren = (nodes) => {
+    nodes.sort(sortBySize)
+    for (const node of nodes) {
+      if (node.children && node.children.length > 0) {
+        sortChildren(node.children)
+      }
+    }
+  }
+
+  sortChildren(topLevelNodes)
+  treeData.value = topLevelNodes
 }
 
 const loadHistory = async () => {
@@ -426,7 +384,6 @@ watch(historyVisible, (isOpen) => {
   }
 })
 
-// 当数据变化时重置页码
 watch(() => allItems.value.length, () => {
   currentPage.value = 1
   lastSortKey.value = ''

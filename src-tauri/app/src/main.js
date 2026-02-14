@@ -4,6 +4,7 @@ import App from './App.vue'
 import 'ant-design-vue/dist/reset.css'
 import './style.css'
 import lazyDirective from './directives/lazy.js'
+import { useWasmSort } from './composables/useWasmSort.js'
 
 const app = createApp(App)
 
@@ -15,6 +16,16 @@ app.use(Antd)
 
 // 挂载应用
 app.mount('#app')
+
+// 初始化 WASM 排序模块
+const { initialize: initWasm } = useWasmSort()
+initWasm().then(success => {
+  if (success) {
+    console.log('[Performance] WASM 排序模块已加载')
+  } else {
+    console.warn('[Performance] WASM 排序模块加载失败，将使用 JavaScript 回退')
+  }
+})
 
 // 开发环境性能提示
 if (import.meta.env.DEV) {
