@@ -8,14 +8,12 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FindClose, FindFirstFileExW, FindNextFileW, GetFileSizeEx,
-    FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FINDEX_INFO_LEVELS, FINDEX_SEARCH_OPS, FIND_FIRST_EX_CASE_SENSITIVE,
-    FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW,
+    CreateFileW, FindClose, FindFirstFileExW, FindNextFileW, GetFileSizeEx, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FIND_FIRST_EX_CASE_SENSITIVE, FIND_FIRST_EX_LARGE_FETCH, FINDEX_INFO_LEVELS,
+    FINDEX_SEARCH_OPS, WIN32_FIND_DATAW,
 };
-use windows_sys::Win32::System::IO::{
-    CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus,
-};
+use windows_sys::Win32::System::IO::{CreateIoCompletionPort, GetQueuedCompletionStatus, PostQueuedCompletionStatus};
 
 use crate::FileInfo;
 
@@ -82,8 +80,9 @@ pub struct StatsSnapshot {
 
 impl IocpScanner {
     pub fn new() -> std::io::Result<Self> {
-        let iocp_handle =
-            unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
+        let iocp_handle = unsafe {
+            CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0)
+        };
 
         if iocp_handle.is_null() || iocp_handle == INVALID_HANDLE_VALUE {
             return Err(std::io::Error::last_os_error());
@@ -112,7 +111,10 @@ impl IocpScanner {
         drop(collector);
         let _ = tokio::time::timeout(tokio::time::Duration::from_secs(5), collector).await;
 
-        let files = Arc::try_unwrap(results).unwrap().into_inner().unwrap();
+        let files = Arc::try_unwrap(results)
+            .unwrap()
+            .into_inner()
+            .unwrap();
 
         let elapsed = start.elapsed();
         let stats = self.stats.snapshot();
@@ -218,11 +220,7 @@ impl IocpScanner {
         let mut find_data = *find_data;
 
         loop {
-            let name_len = find_data
-                .cFileName
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(260);
+            let name_len = find_data.cFileName.iter().position(|&c| c == 0).unwrap_or(260);
             let name = OsString::from_wide(&find_data.cFileName[..name_len]);
 
             if name != "." && name != ".." {
