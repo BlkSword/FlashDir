@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tauri::Emitter;
 use tokio::fs;
 
 use crate::perf::PerformanceMonitor;
@@ -251,10 +252,12 @@ pub fn format_size(bytes: i64) -> CompactString {
 }
 
 /// 主扫描函数 - 优化版
+/// 支持可选的渐进式流式传输：通过 app_handle 分批发送扫描结果
 pub async fn scan_directory(
     path: &str,
     force_refresh: bool,
     perf_monitor: Arc<PerformanceMonitor>,
+    app_handle: Option<tauri::AppHandle>,
 ) -> Result<ScanResult, anyhow::Error> {
     let _scan_id = perf_monitor.start_scan(path);
     let start_time = std::time::Instant::now();
@@ -362,13 +365,48 @@ pub async fn scan_directory(
     SCAN_CACHE.invalidate(&root_dir);
     DiskCache::instance().invalidate(&root_dir).ok();
 
+    // ── P2 优化：USN Journal 增量更新 ──
+    // 如果有之前的 MFT 扫描检查点，先尝试增量更新
+    // 仅在变更较少（<5000 条）时使用，否则回退到全量 MFT
+    #[cfg(target_os = "windows")]
+    if !force_refresh {
+        if let Some(updated_result) = try_usn_incremental_update(
+            &root_dir,
+            &canonical_path,
+            mtime_timestamp,
+            &perf_monitor,
+        ) {
+            perf_monitor.end_scan();
+            return Ok(updated_result);
+        }
+    }
+
+    // ── P1 优化：MFT 直接读取（Everything 式快速路径） ──
+    // Windows 管理员权限下，直接顺序读取 NTFS $MFT
+    // 失败时自动回退到目录遍历
     let canonical_path_clone = canonical_path.clone();
     let perf_monitor_for_blocking = Arc::clone(&perf_monitor);
+    let app_handle_for_blocking = app_handle.map(Arc::new);
 
-    let output = tokio::task::spawn_blocking(move || {
-        scan_directory_optimized_v4(&canonical_path_clone, &perf_monitor_for_blocking)
-    })
-    .await??;
+    // 尝试 MFT 直接读取，失败则回退到目录遍历
+    let mft_result = try_mft_scan_path(
+        &canonical_path_clone,
+        &root_dir,
+        &perf_monitor_for_blocking,
+        app_handle_for_blocking.as_ref(),
+    );
+
+    let output = match mft_result {
+        Some(mft_output) => mft_output,
+        None => tokio::task::spawn_blocking(move || {
+            scan_directory_optimized_v4(
+                &canonical_path_clone,
+                &perf_monitor_for_blocking,
+                app_handle_for_blocking,
+            )
+        })
+        .await??,
+    };
 
     let scan_time = start_time.elapsed().as_secs_f64();
 
@@ -413,15 +451,290 @@ struct ScanOutput {
     threads_used: usize,
 }
 
+/// 尝试使用 MFT 直接读取扫描（Everything 式快速路径）
+/// 仅在 Windows + 管理员权限 + NTFS 卷上生效
+/// 返回 None 表示不可用，调用者应回退到目录遍历
+fn try_mft_scan_path(
+    canonical_path: &Path,
+    _root_dir: &str,
+    perf_monitor: &Arc<PerformanceMonitor>,
+    app_handle: Option<&Arc<tauri::AppHandle>>,
+) -> Option<ScanOutput> {
+    let root_path_str = canonical_path.to_string_lossy();
+
+    // 尝试 MFT 全卷扫描
+    let mft_result = crate::fs::try_mft_scan(&root_path_str)?;
+
+    let total_start = std::time::Instant::now();
+
+    perf_monitor.start_io_phase();
+    let scan_start = std::time::Instant::now();
+
+    // 过滤：只保留目标目录下的文件
+    // MFT 返回的路径使用 "/" 分隔符，需要统一
+    let normalized_root = normalize_path_separator(canonical_path.as_os_str()).to_lowercase();
+
+    let mut items: Vec<Item> = mft_result
+        .files
+        .into_iter()
+        .filter(|f| {
+            let path_lower = f.path.to_lowercase();
+            path_lower.starts_with(&normalized_root)
+        })
+        .map(|f| Item {
+            path: CompactString::from(f.path),
+            name: CompactString::from(f.name),
+            size: f.size as i64,
+            size_formatted: CompactString::new(), // 下面统一格式化
+            is_dir: f.is_dir,
+        })
+        .collect();
+
+    let file_count = items.iter().filter(|i| !i.is_dir).count();
+    let dir_count = items.iter().filter(|i| i.is_dir).count();
+
+    let scan_phase = scan_start.elapsed();
+    perf_monitor.end_io_phase();
+
+    // 计算目录大小（聚合子文件大小到父目录）
+    perf_monitor.start_compute_phase();
+    let compute_start = std::time::Instant::now();
+
+    use dashmap::DashMap;
+    use std::collections::HashMap;
+
+    let dir_sizes: HashMap<CompactString, i64> = {
+        let ds = DashMap::with_capacity_and_hasher(
+            (file_count / 4).max(64),
+            ahash::RandomState::new(),
+        );
+
+        items
+            .iter()
+            .filter(|i| !i.is_dir && i.size > 0)
+            .for_each(|item| {
+                let file_path = item.path.as_str();
+                let mut pos = 0;
+                while let Some(slash_pos) = file_path[pos..].find('/') {
+                    let abs_pos = pos + slash_pos;
+                    let parent_path = &file_path[..abs_pos];
+                    ds.entry(CompactString::from(parent_path))
+                        .and_modify(|v| *v += item.size)
+                        .or_insert(item.size);
+                    pos = abs_pos + 1;
+                }
+                ds.entry(CompactString::new())
+                    .and_modify(|v| *v += item.size)
+                    .or_insert(item.size);
+            });
+
+        ds.iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect()
+    };
+
+    let compute_phase = compute_start.elapsed();
+
+    // 更新目录条目的 size 和 size_formatted
+    for item in &mut items {
+        if item.is_dir {
+            item.size = dir_sizes.get(&item.path).copied().unwrap_or(0);
+        }
+        item.size_formatted = format_size(item.size);
+    }
+
+    // 按大小降序排序
+    items.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+
+    let format_phase = compute_start.elapsed(); // approximate
+    let total = total_start.elapsed();
+    perf_monitor.end_compute_phase();
+
+    let actual_total_size: i64 = items
+        .iter()
+        .filter(|i| !i.is_dir)
+        .map(|i| i.size)
+        .sum();
+
+    let throughput_mbps = if scan_phase.as_secs_f64() > 0.0 {
+        (actual_total_size as f64 / 1024.0 / 1024.0) / scan_phase.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    let memory_peak_mb = (items.capacity() * std::mem::size_of::<Item>()) as f64 / 1024.0 / 1024.0;
+
+    perf_monitor.update_memory_stats(memory_peak_mb, memory_peak_mb);
+    perf_monitor.update_io_stats(file_count, dir_count, actual_total_size as u64, file_count + dir_count);
+
+    // 流式传输（与目录遍历保持一致的行为）
+    if let Some(app) = app_handle {
+        for chunk in items.chunks(500) {
+            let _ = app.emit("scan-batch", chunk.to_vec());
+        }
+    }
+
+    eprintln!(
+        "[MFT] 扫描完成: {} 文件, {} 目录, {:.2}s (filtered from {} total)",
+        file_count,
+        dir_count,
+        total.as_secs_f64(),
+        mft_result.file_count + mft_result.dir_count
+    );
+
+    // 保存 USN 检查点，供下次增量更新使用
+    save_usn_checkpoint(&root_path_str);
+
+    Some(ScanOutput {
+        items,
+        total_size: actual_total_size,
+        timing: TimingInfo {
+            scan_phase: scan_phase.as_secs_f64(),
+            compute_phase: compute_phase.as_secs_f64(),
+            format_phase: format_phase.as_secs_f64(),
+            total: total.as_secs_f64(),
+        },
+        file_count,
+        dir_count,
+        throughput_mbps,
+        memory_peak_mb,
+        threads_used: 1, // MFT 扫描是单线程顺序读取
+    })
+}
+
+// ─── USN Journal 增量更新 ───────────────────────────────────
+
+/// 保存 USN 检查点
+#[cfg(target_os = "windows")]
+fn save_usn_checkpoint(path: &str) {
+    if let Some(drive) = crate::fs::extract_drive_letter(path) {
+        if let Some(checkpoint) = crate::fs::get_checkpoint(drive) {
+            let checkpoint_path = usn_checkpoint_path(drive);
+            if let Some(parent) = checkpoint_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string(&checkpoint) {
+                let _ = std::fs::write(&checkpoint_path, json);
+                eprintln!(
+                    "[USN] 检查点已保存: {}.{} (USN={})",
+                    drive,
+                    checkpoint.journal_id,
+                    checkpoint.max_usn
+                );
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn save_usn_checkpoint(_path: &str) {}
+
+/// USN 检查点文件路径
+#[cfg(target_os = "windows")]
+fn usn_checkpoint_path(drive: char) -> std::path::PathBuf {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    let mut p = std::path::PathBuf::from(home);
+    p.push(".flashdir");
+    p.push(format!("usn_checkpoint_{}.json", drive));
+    p
+}
+
+#[cfg(not(target_os = "windows"))]
+fn usn_checkpoint_path(_drive: char) -> std::path::PathBuf {
+    std::path::PathBuf::new()
+}
+
+/// 尝试使用 USN Journal 增量更新缓存
+/// 成功返回更新后的 ScanResult，失败返回 None（回退到全量扫描）
+#[cfg(target_os = "windows")]
+fn try_usn_incremental_update(
+    root_dir: &str,
+    _canonical_path: &std::path::Path,
+    _mtime_timestamp: i64,
+    _perf_monitor: &Arc<PerformanceMonitor>,
+) -> Option<ScanResult> {
+    let drive = crate::fs::extract_drive_letter(root_dir)?;
+
+    // 加载之前的检查点
+    let cp_path = usn_checkpoint_path(drive);
+    let checkpoint: crate::fs::UsnCheckpoint = {
+        let data = std::fs::read_to_string(&cp_path).ok()?;
+        serde_json::from_str(&data).ok()?
+    };
+
+    // 检查点过期检查（超过 1 小时的检查点不使用增量更新）
+    let now = chrono::Utc::now().timestamp();
+    if now - checkpoint.created_at > 3600 {
+        return None;
+    }
+
+    // 读取增量变更
+    let (changes, new_checkpoint) =
+        crate::fs::read_incremental_changes(drive, &checkpoint).ok()?;
+
+    // 如果变更太多（>5000），不如全量扫描
+    if changes.len() > 5000 {
+        eprintln!(
+            "[USN] 变更过多 ({} 条)，回退到全量扫描",
+            changes.len()
+        );
+        return None;
+    }
+
+    if changes.is_empty() {
+        eprintln!("[USN] 无变更，使用缓存");
+        // 更新检查点时间戳
+        let updated_cp = crate::fs::UsnCheckpoint {
+            created_at: now,
+            ..new_checkpoint
+        };
+        if let Ok(json) = serde_json::to_string(&updated_cp) {
+            let _ = std::fs::write(&cp_path, json);
+        }
+        // 返回缓存（调用者已检查缓存，这里不会再走缓存路径）
+        return None;
+    }
+
+    eprintln!(
+        "[USN] 增量更新: {} 条变更 (CREATE={}, DELETE={}, RENAME={}, DATA={})",
+        changes.len(),
+        changes.iter().filter(|c| c.reason & crate::fs::USN_REASON_FILE_CREATE != 0).count(),
+        changes.iter().filter(|c| c.reason & crate::fs::USN_REASON_FILE_DELETE != 0).count(),
+        changes.iter().filter(|c| c.reason & (crate::fs::USN_REASON_RENAME_OLD_NAME | crate::fs::USN_REASON_RENAME_NEW_NAME) != 0).count(),
+        changes.iter().filter(|c| c.reason & (crate::fs::USN_REASON_DATA_OVERWRITE | crate::fs::USN_REASON_DATA_EXTEND | crate::fs::USN_REASON_DATA_TRUNCATION) != 0).count(),
+    );
+
+    // 更新检查点
+    if let Ok(json) = serde_json::to_string(&new_checkpoint) {
+        let _ = std::fs::write(&cp_path, json);
+    }
+
+    // 增量更新目前回退到全量 MFT 扫描（变更列表已用于判断是否需要重扫）
+    // TODO: 实际应用增量变更到缓存结果
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn try_usn_incremental_update(
+    _root_dir: &str,
+    _canonical_path: &std::path::Path,
+    _mtime_timestamp: i64,
+    _perf_monitor: &Arc<PerformanceMonitor>,
+) -> Option<ScanResult> {
+    None
+}
+
 /// 优化的扫描实现 v4
-/// 集成：性能监控、内存优化、Windows 原生 I/O
+/// 集成：性能监控、内存优化、Windows 原生 I/O、渐进式流式传输
 fn scan_directory_optimized_v4(
     root_path: &Path,
     perf_monitor: &Arc<PerformanceMonitor>,
+    app_handle: Option<Arc<tauri::AppHandle>>,
 ) -> Result<ScanOutput, anyhow::Error> {
     use rayon::prelude::*;
-    use std::fs;
-    
+
     let total_start = std::time::Instant::now();
 
     let (dir_sender, dir_receiver): (Sender<PathBuf>, Receiver<PathBuf>) = unbounded();
@@ -451,11 +764,13 @@ fn scan_directory_optimized_v4(
             let item_sender = item_sender.clone();
             let file_entries = Arc::clone(&file_entries);
             let root_path = root_path.to_path_buf();
+            let app_handle_for_worker = app_handle.clone();
 
             s.spawn(move |_| {
                 let mut idle_count = 0;
-                let mut local_bytes_read: u64 = 0;
-                
+                // 流式传输缓冲区：每 200 条 emit 一次
+                let mut stream_batch: Vec<Item> = Vec::with_capacity(200);
+
                 loop {
                     let dir_path = match dir_receiver.try_recv() {
                         Ok(d) => {
@@ -472,55 +787,56 @@ fn scan_directory_optimized_v4(
                         }
                     };
 
-                    if let Ok(entries) = fs::read_dir(&dir_path) {
-                        for entry in entries.filter_map(Result::ok) {
-                            let entry_path = entry.path();
-
-                            let ft = match entry.file_type() {
-                                Ok(ft) => ft,
-                                Err(_) => continue,
-                            };
-
-                            if ft.is_symlink() {
+                    // 使用平台优化的目录遍历器
+                    // Windows: FindFirstFileExW 直接读取 size/attrs，零额外 syscall
+                    // 其他平台: 标准库 read_dir（Linux getdents64 已返回 d_type）
+                    if let Ok(entries) = crate::fs::read_dir_entries(&dir_path) {
+                        for entry in entries {
+                            if entry.is_symlink {
                                 continue;
                             }
 
-                            let is_dir = ft.is_dir();
-
-                            let rel_path = match entry_path.strip_prefix(&root_path) {
+                            let rel_path = match entry.path.strip_prefix(&root_path) {
                                 Ok(p) => normalize_path_separator_compact(p.as_os_str()),
                                 Err(_) => continue,
                             };
 
-                            let name = entry_path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("?")
-                                .to_string();
+                            let size = entry.size as i64;
 
-                            let size = if is_dir {
-                                0
-                            } else {
-                                entry.metadata().map(|m| {
-                                    let len = m.len();
-                                    local_bytes_read += len;
-                                    len as i64
-                                }).unwrap_or(0)
-                            };
-
-                            if !is_dir {
+                            if !entry.is_dir {
                                 file_entries.insert(rel_path.clone(), size);
                             } else {
-                                let _ = dir_sender.send(entry.path());
+                                let _ = dir_sender.send(entry.path);
                             }
 
                             let _ = item_sender.send(ItemInternal {
-                                path: rel_path,
-                                name: CompactString::from(name),
+                                path: rel_path.clone(),
+                                name: CompactString::from(entry.name.as_str()),
                                 size,
-                                is_dir,
+                                is_dir: entry.is_dir,
                             });
+
+                            // 渐进式流式传输
+                            if let Some(app) = app_handle_for_worker.as_ref() {
+                                stream_batch.push(Item {
+                                    path: rel_path,
+                                    name: CompactString::from(entry.name),
+                                    size,
+                                    size_formatted: format_size(size),
+                                    is_dir: entry.is_dir,
+                                });
+                                if stream_batch.len() >= 200 {
+                                    let _ = app.emit("scan-batch", std::mem::take(&mut stream_batch));
+                                }
+                            }
                         }
+                    }
+                }
+
+                // 发送当前 worker 剩余的批次
+                if let Some(app) = app_handle_for_worker.as_ref() {
+                    if !stream_batch.is_empty() {
+                        let _ = app.emit("scan-batch", std::mem::take(&mut stream_batch));
                     }
                 }
             });

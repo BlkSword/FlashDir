@@ -14,6 +14,7 @@ mod scan;
 mod perf;
 mod disk_cache;
 mod binary_protocol;
+mod fs;
 
 struct AppState {
     history: Mutex<VecDeque<scan::HistoryItem>>,
@@ -45,6 +46,8 @@ async fn main() {
             commands::clear_disk_cache,
             commands::get_memory_cache_stats,
             commands::get_system_info,
+            commands::check_mft_available,
+            commands::restart_as_admin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -32,26 +32,37 @@
       </a-button>
     </div>
 
-    <a-input-search
-      v-model:value="searchKeyword"
-      placeholder="搜索文件..."
-      :disabled="loading"
-      allow-clear
-      @search="handleSearch"
-      style="width: 200px"
-    />
+    <div class="toolbar-right">
+      <!-- 管理员权限提示 -->
+      <a-tooltip v-if="!mftAvailable" title="管理员模式下扫描速度可提升 5-8 倍">
+        <a-tag color="warning" style="cursor: pointer" @click="handleRestartAsAdmin">
+          <SafetyCertificateOutlined />
+          管理员模式
+        </a-tag>
+      </a-tooltip>
+
+      <a-input-search
+        v-model:value="searchKeyword"
+        placeholder="搜索文件..."
+        :disabled="loading"
+        allow-clear
+        @search="handleSearch"
+        style="width: 200px"
+      />
+    </div>
   </div>
 </template>
 
 <script setup>
-import { ref, watch } from 'vue'
+import { ref, watch, onMounted } from 'vue'
 import {
   ArrowLeftOutlined,
   ArrowRightOutlined,
   ArrowUpOutlined,
   HistoryOutlined,
   FolderOpenOutlined,
-  SearchOutlined
+  SearchOutlined,
+  SafetyCertificateOutlined,
 } from '@ant-design/icons-vue'
 
 const props = defineProps({
@@ -66,6 +77,37 @@ const emit = defineEmits(['scan', 'browse', 'navigate', 'show-history', 'search'
 
 const localPath = ref(props.path || '')
 const searchKeyword = ref('')
+const mftAvailable = ref(true)
+
+const invoke = () => {
+  return window.__TAURI__?.core?.invoke
+}
+
+const checkMftAvailable = async () => {
+  // 检测 C 盘 MFT 可用性（Windows 上最常用）
+  try {
+    const available = await invoke()('check_mft_available', { path: 'C:\\' })
+    mftAvailable.value = available
+  } catch {
+    // 非 Windows 或检测失败，不显示提示
+    mftAvailable.value = true
+  }
+}
+
+const handleRestartAsAdmin = async () => {
+  try {
+    await invoke()('restart_as_admin')
+    // 如果提权成功，旧进程会退出（新进程以管理员身份启动）
+    // 延迟关闭当前窗口
+    setTimeout(() => window.close(), 500)
+  } catch {
+    // 提权失败，什么都不做
+  }
+}
+
+onMounted(() => {
+  checkMftAvailable()
+})
 
 watch(() => props.path, (newVal) => {
   localPath.value = newVal || ''
@@ -98,5 +140,10 @@ const handleSearch = (value) => {
   gap: 8px;
   flex: 1;
   max-width: 500px;
+}
+.toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 </style>

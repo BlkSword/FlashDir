@@ -95,11 +95,12 @@ async fn save_history_to_file_async(history: &VecDeque<HistoryItem>) -> Result<(
     Ok(())
 }
 
-/// 扫描目录 - 优化版
+/// 扫描目录 - 优化版（支持渐进式流式传输）
 #[command]
 pub async fn scan_directory(
     path: String,
     force_refresh: bool,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ScanResult, String> {
     let path = path.trim().to_string();
@@ -110,7 +111,7 @@ pub async fn scan_directory(
 
     let perf_monitor = PerformanceMonitor::instance();
 
-    match scan::scan_directory(&path, force_refresh, perf_monitor).await {
+    match scan::scan_directory(&path, force_refresh, perf_monitor, Some(app)).await {
         Ok(result) => {
             let history_item = HistoryItem {
                 path: smartstring::SmartString::from(path.clone()),
@@ -147,9 +148,10 @@ pub async fn scan_directory(
 pub async fn scan_directory_binary(
     path: String,
     force_refresh: bool,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<BinaryPayload, String> {
-    let result = scan_directory(path, force_refresh, state).await?;
+    let result = scan_directory(path, force_refresh, app, state).await?;
     
     // 转换为优化格式并序列化
     let optimized: OptimizedScanResult = result.into();
@@ -163,12 +165,13 @@ pub async fn scan_directory_binary(
 pub async fn scan_directories_batch(
     paths: Vec<String>,
     force_refresh: bool,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<ScanResult>, String> {
     let mut results = Vec::with_capacity(paths.len());
-    
+
     for path in paths {
-        match scan_directory(path, force_refresh, state.clone()).await {
+        match scan_directory(path, force_refresh, app.clone(), state.clone()).await {
             Ok(result) => results.push(result),
             Err(e) => eprintln!("扫描失败: {}", e),
         }
@@ -290,4 +293,16 @@ pub struct SystemInfo {
     pub memory_used_mb: u64,
     pub os_name: String,
     pub os_version: String,
+}
+
+/// 检测 MFT 直接扫描是否可用（Windows 管理员权限）
+#[command]
+pub fn check_mft_available(path: String) -> bool {
+    crate::fs::check_mft_available(&path)
+}
+
+/// 以管理员权限重启应用
+#[command]
+pub fn restart_as_admin() -> bool {
+    crate::fs::restart_as_admin()
 }

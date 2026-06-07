@@ -76,8 +76,9 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, shallowRef } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, shallowRef, triggerRef } from 'vue'
 import { message } from 'ant-design-vue'
+import { listen } from '@tauri-apps/api/event'
 import Toolbar from './components/Toolbar.vue'
 import Sidebar from './components/Sidebar.vue'
 import FileList from './components/FileList.vue'
@@ -90,6 +91,10 @@ import { debounce, getParentPath } from './utils/format.js'
 
 const { invoke, openDialog } = useTauri()
 const sortWorker = useSortWorker()
+
+// 渐进式流式传输：scan-batch 事件监听器
+let unlistenScanBatch = null
+const streamedItemCount = ref(0)
 
 const currentPath = ref('')
 const allItems = shallowRef([])
@@ -176,6 +181,25 @@ const handleScan = async (path, addToHistory = true) => {
   loading.value = true
   scanTime.value = 0
   backendTime.value = 0
+  streamedItemCount.value = 0
+
+  // 清除旧数据
+  allItems.value = []
+  treeData.value = []
+
+  // 注册流式事件监听器（在发起扫描前）
+  if (unlistenScanBatch) {
+    unlistenScanBatch()
+  }
+  unlistenScanBatch = await listen('scan-batch', (event) => {
+    const batch = event.payload
+    if (Array.isArray(batch) && batch.length > 0) {
+      // 使用 push + triggerRef 避免 O(n²) 的数组展开拷贝
+      allItems.value.push(...batch)
+      triggerRef(allItems)
+      streamedItemCount.value = allItems.value.length
+    }
+  })
 
   const fullStartTime = performance.now()
 
@@ -187,21 +211,17 @@ const handleScan = async (path, addToHistory = true) => {
 
     backendTime.value = typeof result.scanTime === 'number' ? result.scanTime : 0
 
-    await new Promise(resolve => {
-      requestAnimationFrame(() => {
-        allItems.value = result.items || []
-        currentPath.value = path
-        lastSortKey.value = ''
+    // 始终以最终结果为权威（流式数据仅作预览，最终结果保证一致性和排序）
+    allItems.value = result.items || []
 
-        if ('requestIdleCallback' in window) {
-          requestIdleCallback(() => buildTreeData(), { timeout: 100 })
-        } else {
-          setTimeout(() => buildTreeData(), 50)
-        }
+    currentPath.value = path
+    lastSortKey.value = ''
 
-        resolve()
-      })
-    })
+    if ('requestIdleCallback' in window) {
+      requestIdleCallback(() => buildTreeData(), { timeout: 100 })
+    } else {
+      setTimeout(() => buildTreeData(), 50)
+    }
 
     if (addToHistory) {
       navigationHistory.value = navigationHistory.value.slice(0, navigationIndex.value + 1)
@@ -218,6 +238,12 @@ const handleScan = async (path, addToHistory = true) => {
     message.error('扫描失败: ' + error)
   } finally {
     loading.value = false
+    // 清理事件监听器
+    if (unlistenScanBatch) {
+      unlistenScanBatch()
+      unlistenScanBatch = null
+    }
+    streamedItemCount.value = 0
   }
 }
 
@@ -376,6 +402,13 @@ const loadHistory = async () => {
 
 onMounted(() => {
   loadHistory()
+})
+
+onUnmounted(() => {
+  if (unlistenScanBatch) {
+    unlistenScanBatch()
+    unlistenScanBatch = null
+  }
 })
 
 watch(historyVisible, (isOpen) => {
