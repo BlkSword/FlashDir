@@ -10,11 +10,8 @@ use std::collections::VecDeque;
 use parking_lot::Mutex;
 
 mod commands;
-mod scan;
-mod perf;
-mod disk_cache;
-mod binary_protocol;
-mod fs;
+
+use flashdir::scan;
 
 struct AppState {
     history: Mutex<VecDeque<scan::HistoryItem>>,
@@ -22,7 +19,7 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    let _ = disk_cache::DiskCache::instance();
+    let _ = flashdir::disk_cache::DiskCache::instance();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())

@@ -6,20 +6,24 @@
 
 | 指标 | 数值 |
 |------|------|
-| **100 万+文件扫描** | ~40s |
+| **C 盘全盘扫描（64 万+文件）** | ~5.8s（MFT 管理员模式） |
+| **C:\Windows（33 万文件）** | ~0.76s（MFT）/ ~58s（普通模式） |
 | **搜索响应** | 毫秒级 |
-| **缓存命中** | <5ms |
+| **缓存命中（内存）** | <1ms |
+| **缓存命中（磁盘）** | <5ms |
+| **USN Journal 增量刷新** | <50ms（少量变更时） |
 | **内存占用** | ~65MB（优化后） |
 
 ## 主要特点
 
 - **便携版本**：单个 EXE 文件，双击即可运行，无需安装
-- **极速扫描**：并行扫描 + 多级缓存，100 万文件 40 秒完成
+- **极速扫描**：NTFS $MFT 直接读取（管理员模式），64 万文件 5.8 秒完成
 - **毫秒级搜索**：实时过滤，输入即搜索
-- **智能缓存**：内存缓存 + SQLite 持久化，重启不丢失
+- **智能缓存**：内存 LRU + SQLite 持久化 + USN Journal 增量刷新，重启不丢失
 - **可视化图表**：Chart.js 展示文件类型分布和 Top 大文件
 - **目录树导航**：可展开的文件夹层级浏览
 - **虚拟滚动**：大数据量列表流畅渲染
+- **终端模式**：CLI 版本支持纯终端操作和 JSON 输出
 
 ## 快速上手
 
@@ -48,6 +52,25 @@ npm run tauri:build
 
 构建产物位于 `src-tauri/target/release/bundle/`。
 
+### CLI 终端版本
+
+```bash
+# 构建 CLI
+cd src-tauri && cargo build --release --bin cli
+
+# 使用（普通模式，无需管理员）
+./target/release/cli.exe C:\Users\Downloads --top 20
+
+# 管理员模式（启用 MFT 极速扫描，需 UAC 确认）
+./target/release/cli.exe C:\ --top 10
+
+# JSON 输出
+./target/release/cli.exe C:\Windows --json --top 50
+
+# 全部选项
+./target/release/cli.exe --help
+```
+
 ## 技术栈
 
 | 层级 | 技术 |
@@ -55,6 +78,7 @@ npm run tauri:build
 | **后端** | Rust 2021 + Tauri 2.0 + Tokio + Rayon + DashMap |
 | **前端** | Vue 3 + Vite + Ant Design Vue + Chart.js |
 | **存储** | SQLite 持久化缓存 + LRU 内存缓存 |
+| **文件系统** | NTFS $MFT 直接读取 + USN Journal + FindFirstFileExW |
 
 ### 核心依赖
 
@@ -68,6 +92,7 @@ npm run tauri:build
 - `mimalloc` - 高性能内存分配器
 - `parking_lot` - 高性能锁
 - `smartstring` - 紧凑字符串
+- `windows-sys` - Windows NTFS API（MFT/USN Journal）
 
 **前端 (Vue 3)**
 - `ant-design-vue` - UI 组件库
@@ -85,11 +110,22 @@ FlashDir/
 │   │       ├── components/   # UI 组件
 │   │       └── composables/  # 组合式函数
 │   ├── src/                  # Rust 后端
-│   │   ├── main.rs          # 入口
-│   │   ├── commands.rs      # 命令处理
-│   │   ├── scan.rs          # 扫描逻辑
-│   │   ├── disk_cache.rs    # 磁盘缓存
-│   │   └── binary_protocol.rs # 二进制序列化
+│   │   ├── lib.rs           # 共享库入口
+│   │   ├── main.rs          # Tauri GUI 入口
+│   │   ├── commands.rs      # Tauri 命令处理
+│   │   ├── scan.rs          # 扫描引擎
+│   │   ├── disk_cache.rs    # SQLite 磁盘缓存
+│   │   ├── binary_protocol.rs # bincode 序列化
+│   │   ├── bin/
+│   │   │   └── cli.rs       # CLI 终端工具
+│   │   ├── fs/
+│   │   │   ├── mod.rs
+│   │   │   ├── windows_walker.rs   # FindFirstFileExW 快速遍历
+│   │   │   ├── fallback_walker.rs  # 非 Windows 回退
+│   │   │   ├── mft_scanner.rs      # NTFS $MFT 读取
+│   │   │   └── usn_journal.rs      # USN Journal 增量
+│   │   └── perf/
+│   │       └── mod.rs       # 性能监控
 │   ├── wasm-sort/           # WASM 排序模块
 │   └── tauri.conf.json
 └── README.md
@@ -99,13 +135,17 @@ FlashDir/
 
 ### 目录扫描
 
-递归分析目录结构，支持按名称、大小、类型排序，分页浏览（50/100/200/500/1000 条/页）。
+- **MFT 直接读取**（Windows 管理员模式）：顺序读取 NTFS $MFT 主文件表，全盘 64 万文件 ~5.8s
+- **快速目录遍历**（普通模式）：`FindFirstFileExW` 原生 API，零额外系统调用，33 万文件 ~58s
+- 支持按名称、大小、类型排序，分页浏览（50/100/200/500/1000 条/页）
+- 渐进式流式传输：扫描中实时推送结果，首批数据 1 秒内可见
 
-### 多级缓存
+### 多级缓存 + 增量更新
 
-- **内存缓存**：DashMap 并发安全，LRU 淘汰策略
-- **磁盘缓存**：SQLite 持久化，应用重启后缓存保留
-- **自动失效**：基于目录修改时间自动检测
+- **内存缓存**：DashMap 并发安全 + LRU 淘汰，<1ms 命中
+- **磁盘缓存**：SQLite 持久化 + bincode 序列化，<5ms 命中
+- **USN Journal 增量刷新**：NTFS 变更日志，只读取变化的文件，<50ms 完成刷新
+- **自动失效**：基于目录修改时间和 USN 检查点自动检测
 
 ### 可视化图表
 
@@ -120,19 +160,26 @@ FlashDir/
 
 ## 性能优化
 
-### 性能指标
+### 性能指标（实测数据）
 
-| 指标 | 优化后 |
-|------|--------|
-| 10 万文件扫描 | ~0.8s |
+| 指标 | 数值 |
+|------|------|
+| C 盘全盘扫描（64 万文件，MFT 管理员） | ~5.8s |
+| C:\Windows（33 万文件，MFT） | ~0.76s |
+| C:\Windows（33 万文件，普通模式） | ~58s |
 | 缓存命中响应 | <5ms |
 | 搜索响应时间 | <10ms |
+| USN Journal 增量刷新 | <50ms |
 | 内存峰值 | ~85MB |
 
 ### 已实施的优化
 
 | 优化项 | 实现方式 | 效果 |
 |--------|----------|------|
+| **NTFS $MFT 直接读取** | 顺序读取 $MFT 替代递归目录遍历 | 🔥 **30-76x 扫描提速** |
+| **USN Journal 增量更新** | NTFS 变更日志，只读增量变化 | 毫秒级缓存刷新 |
+| **FindFirstFileExW 快速遍历** | Windows 原生 API，零额外 syscall | 减少 ~40% I/O 调用 |
+| **渐进式流式传输** | 扫描中实时推送结果到前端 | 感知速度大幅提升 |
 | **mimalloc 分配器** | 全局高性能内存分配 | 提升 ~10% |
 | **SmartString** | 短字符串栈存储 | 节省 ~15MB |
 | **LRU 缓存** | `lru` crate 替代排序淘汰 | O(1) 缓存读写和淘汰 |

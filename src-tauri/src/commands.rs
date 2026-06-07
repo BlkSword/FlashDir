@@ -1,10 +1,10 @@
 // 命令处理器 - 优化版
 // 集成性能监控、磁盘缓存、二进制协议
 
-use crate::scan::{self, HistoryItem, HistoryItemSummary, ScanResult};
-use crate::perf::{PerformanceMonitor, ScanMetrics};
-use crate::disk_cache::DiskCache;
-use crate::binary_protocol::{OptimizedScanResult, BinaryPayload};
+use flashdir::scan::{self, HistoryItem, HistoryItemSummary, ScanResult};
+use flashdir::perf::{PerformanceMonitor, ScanMetrics};
+use flashdir::disk_cache::DiskCache;
+use flashdir::binary_protocol::{OptimizedScanResult, BinaryPayload};
 use crate::AppState;
 use chrono::Utc;
 use std::collections::VecDeque;
@@ -225,13 +225,13 @@ pub fn clear_performance_history() {
 
 /// 获取性能摘要
 #[command]
-pub fn get_performance_summary() -> crate::perf::PerformanceSummary {
+pub fn get_performance_summary() -> flashdir::perf::PerformanceSummary {
     PerformanceMonitor::instance().get_summary()
 }
 
 /// 获取磁盘缓存统计
 #[command]
-pub fn get_disk_cache_stats() -> crate::disk_cache::CacheStats {
+pub fn get_disk_cache_stats() -> flashdir::disk_cache::CacheStats {
     DiskCache::instance().get_stats()
 }
 
@@ -298,11 +298,11 @@ pub struct SystemInfo {
 /// 检测 MFT 直接扫描是否可用（Windows 管理员权限）
 #[command]
 pub fn check_mft_available(path: String) -> bool {
-    crate::fs::check_mft_available(&path)
+    flashdir::fs::check_mft_available(&path)
 }
 
 /// 以管理员权限重启应用
 #[command]
 pub fn restart_as_admin() -> bool {
-    crate::fs::restart_as_admin()
+    flashdir::fs::restart_as_admin()
 }
