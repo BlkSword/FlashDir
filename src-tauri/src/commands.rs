@@ -306,3 +306,110 @@ pub fn check_mft_available(path: String) -> bool {
 pub fn restart_as_admin() -> bool {
     flashdir::fs::restart_as_admin()
 }
+
+/// 开发者磁盘分析：识别并分类常见开发工具/缓存目录的空间占用
+/// 输入当前扫描结果的 items，返回按类别聚合的统计
+#[command]
+pub fn analyze_dev_disk(
+    items: Vec<flashdir::scan::Item>,
+    total_size: i64,
+    total_items: usize,
+) -> flashdir::dev_analyzer::DevAnalysisResult {
+    flashdir::dev_analyzer::analyze(&items, total_size, total_items)
+}
+
+// ─── 快照管理 ────────────────────────────────────────────
+
+/// 保存当前扫描结果为快照
+#[command]
+pub fn save_snapshot(
+    path: String,
+    items: Vec<flashdir::scan::Item>,
+    total_size: i64,
+    total_size_formatted: String,
+) -> Result<i64, String> {
+    let result = flashdir::scan::ScanResult {
+        items,
+        total_size,
+        total_size_formatted: flashdir::scan::CompactString::from(total_size_formatted.as_str()),
+        scan_time: 0.0,
+        path: flashdir::scan::CompactString::from(path.as_str()),
+        timing: None,
+        perf_metrics: None,
+    };
+
+    let file_count = result.items.iter().filter(|i| !i.is_dir).count();
+    let dir_count = result.items.iter().filter(|i| i.is_dir).count();
+
+    flashdir::disk_cache::DiskCache::instance()
+        .insert_snapshot(&path, &result, file_count, dir_count)
+        .map_err(|e| format!("保存快照失败: {}", e))
+}
+
+/// 列出指定路径的所有快照
+#[command]
+pub fn list_snapshots(path: String) -> Result<Vec<flashdir::disk_cache::SnapshotInfo>, String> {
+    flashdir::disk_cache::DiskCache::instance()
+        .list_snapshots(&path)
+        .map_err(|e| format!("获取快照列表失败: {}", e))
+}
+
+/// 比较两个快照（传入快照 ID）
+#[command]
+pub fn compare_snapshots(
+    old_id: i64,
+    new_id: i64,
+) -> Result<flashdir::diff_engine::SnapshotDiff, String> {
+    let disk_cache = flashdir::disk_cache::DiskCache::instance();
+
+    let old_result = disk_cache
+        .get_snapshot(old_id)
+        .ok_or_else(|| format!("快照 {} 不存在", old_id))?;
+
+    let new_result = disk_cache
+        .get_snapshot(new_id)
+        .ok_or_else(|| format!("快照 {} 不存在", new_id))?;
+
+    Ok(flashdir::diff_engine::diff(
+        &old_result.items,
+        &new_result.items,
+        old_result.total_size,
+    ))
+}
+
+/// 删除指定快照
+#[command]
+pub fn delete_snapshot(id: i64) -> Result<(), String> {
+    flashdir::disk_cache::DiskCache::instance()
+        .delete_snapshot(id)
+        .map_err(|e| format!("删除快照失败: {}", e))
+}
+
+/// 比较最新快照与当前扫描结果（用于增量增长分析）
+#[command]
+pub fn compare_with_latest_snapshot(
+    path: String,
+    current_items: Vec<flashdir::scan::Item>,
+    current_total_size: i64,
+) -> Result<Option<flashdir::diff_engine::SnapshotDiff>, String> {
+    let disk_cache = flashdir::disk_cache::DiskCache::instance();
+    let snapshots = disk_cache
+        .list_snapshots(&path)
+        .map_err(|e| format!("获取快照列表失败: {}", e))?;
+
+    if snapshots.is_empty() {
+        return Ok(None);
+    }
+
+    // 取最新的快照
+    let latest = &snapshots[0];
+    let old_result = disk_cache
+        .get_snapshot(latest.id)
+        .ok_or_else(|| format!("快照 {} 不存在", latest.id))?;
+
+    Ok(Some(flashdir::diff_engine::diff(
+        &old_result.items,
+        &current_items,
+        old_result.total_size,
+    )))
+}

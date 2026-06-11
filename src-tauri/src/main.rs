@@ -45,6 +45,12 @@ async fn main() {
             commands::get_system_info,
             commands::check_mft_available,
             commands::restart_as_admin,
+            commands::analyze_dev_disk,
+            commands::save_snapshot,
+            commands::list_snapshots,
+            commands::compare_snapshots,
+            commands::delete_snapshot,
+            commands::compare_with_latest_snapshot,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

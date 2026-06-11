@@ -45,10 +45,35 @@
         </div>
       </div>
 
-      <Charts
-        :items="allItems"
-        :total-size="totalSize"
-      />
+      <div class="right-panel">
+        <a-tabs v-model:activeKey="rightPanelTab" size="small" class="panel-tabs">
+          <a-tab-pane key="charts" tab="📊 统计">
+            <Charts
+              :items="allItems"
+              :total-size="totalSize"
+            />
+          </a-tab-pane>
+          <a-tab-pane key="dev" tab="🛠️ 开发者">
+            <DevAnalyzer
+              :items="allItems"
+              :total-size="totalSize"
+            />
+          </a-tab-pane>
+          <a-tab-pane key="snapshots" tab="📸 快照">
+            <SnapshotCompare
+              :items="allItems"
+              :total-size="totalSize"
+              :current-path="currentPath"
+            />
+          </a-tab-pane>
+          <a-tab-pane key="treemap" tab="🗺️ 热图">
+            <Treemap
+              :items="allItems"
+              :total-size="totalSize"
+            />
+          </a-tab-pane>
+        </a-tabs>
+      </div>
     </div>
 
     <StatusBar
@@ -83,11 +108,15 @@ import Toolbar from './components/Toolbar.vue'
 import Sidebar from './components/Sidebar.vue'
 import FileList from './components/FileList.vue'
 import Charts from './components/Charts.vue'
+import DevAnalyzer from './components/DevAnalyzer.vue'
+import SnapshotCompare from './components/SnapshotCompare.vue'
+import Treemap from './components/Treemap.vue'
 import StatusBar from './components/StatusBar.vue'
 import HistoryList from './components/HistoryList.vue'
 import { useTauri } from './composables/useTauri'
 import { useSortWorker } from './composables/useSortWorker'
 import { debounce, getParentPath } from './utils/format.js'
+import { applySmartFilter, getFilterHints } from './utils/smartFilter.js'
 
 const { invoke, openDialog } = useTauri()
 const sortWorker = useSortWorker()
@@ -117,6 +146,7 @@ const sortConfig = ref({
 
 const searchKeyword = ref('')
 const historyVisible = ref(false)
+const rightPanelTab = ref('charts')
 
 const sortedItemsCache = shallowRef([])
 const lastSortKey = ref('')
@@ -146,7 +176,8 @@ const totalSize = computed(() => {
 const filteredItems = computed(() => {
   const keyword = searchKeyword.value.trim()
   if (!keyword) return allItems.value
-  return sortWorker.filterItemsSync(allItems.value, keyword)
+  // Everything-style smart filter: supports ext:zip size:>100MB type:dir etc.
+  return applySmartFilter(allItems.value, keyword)
 })
 
 const filteredTotalItems = computed(() => filteredItems.value.length)
@@ -456,5 +487,41 @@ watch(() => allItems.value.length, () => {
   justify-content: flex-end;
   align-items: center;
   contain: content;
+}
+
+.right-panel {
+  width: 320px;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid #f0f0f0;
+  background: #fafafa;
+  overflow: hidden;
+}
+
+.panel-tabs {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.panel-tabs :deep(.ant-tabs-nav) {
+  margin: 0;
+  padding: 0 12px;
+  background: white;
+  border-bottom: 1px solid #f0f0f0;
+}
+
+.panel-tabs :deep(.ant-tabs-content-holder) {
+  flex: 1;
+  overflow: hidden;
+}
+
+.panel-tabs :deep(.ant-tabs-content) {
+  height: 100%;
+}
+
+.panel-tabs :deep(.ant-tabs-tabpane) {
+  height: 100%;
+  overflow-y: auto;
 }
 </style>

@@ -12,3 +12,5 @@ pub mod perf;
 pub mod disk_cache;
 pub mod binary_protocol;
 pub mod fs;
+pub mod dev_analyzer;
+pub mod diff_engine;

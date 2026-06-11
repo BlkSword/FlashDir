@@ -137,6 +137,15 @@ pub struct MftFileInfo {
     pub is_dir: bool,
 }
 
+/// 单条 MFT 记录解析结果（用于 FRN → 路径解析）
+#[derive(Debug, Clone)]
+pub struct MftRecordInfo {
+    pub name: String,
+    pub parent_frn: u64,
+    pub is_dir: bool,
+    pub real_size: u64,
+}
+
 impl MftScanner {
     /// 打开指定盘符的 NTFS 卷
     /// `drive_letter` 例如 'C' 表示 C: 盘
@@ -381,6 +390,189 @@ impl Drop for MftScanner {
             CloseHandle(self.volume_handle);
         }
     }
+}
+
+// ─── 单条 MFT 记录读取 & FRN 路径解析 ──────────────────────
+
+impl MftScanner {
+    /// 读取单条 MFT 记录（按 FRN 索引）
+    /// FRN 的低 48 位是 MFT 记录号，直接用作 $MFT 中的偏移
+    pub fn read_single_record(&self, frn: u64) -> io::Result<Option<MftRecordInfo>> {
+        // FRN 结构: [48-bit record number][16-bit sequence number]
+        let record_number = frn & 0x0000FFFFFFFFFFFF;
+        let record_size = self.mft_record_size as usize;
+        let offset = self.mft_start_offset + record_number * record_size as u64;
+
+        let mut buffer = vec![0u8; record_size];
+
+        unsafe {
+            // Seek 到记录位置
+            let result = SetFilePointerEx(
+                self.volume_handle,
+                offset as i64,
+                std::ptr::null_mut(),
+                0, // FILE_BEGIN
+            );
+
+            if result == 0 {
+                return Ok(None);
+            }
+
+            // 读取一条记录
+            let mut bytes_read: u32 = 0;
+            let result = ReadFile(
+                self.volume_handle,
+                buffer.as_mut_ptr() as *mut _,
+                record_size as u32,
+                &mut bytes_read,
+                std::ptr::null_mut(),
+            );
+
+            if result == 0 || bytes_read == 0 {
+                return Ok(None);
+            }
+        }
+
+        // 解析记录
+        Ok(parse_mft_record_info(&buffer, frn))
+    }
+
+    /// 从 FRN 出发向上遍历 MFT 父链，解析到根的完整路径
+    /// 返回相对于卷根的路径（如 "Users/xxx/Documents"），使用 "/" 分隔
+    pub fn resolve_frn_path(&self, frn: u64) -> io::Result<Option<String>> {
+        // FRN=5 始终是 NTFS 根目录
+        const ROOT_FRN: u64 = 5;
+
+        if frn == ROOT_FRN {
+            return Ok(Some(String::new()));
+        }
+
+        let mut components: Vec<String> = Vec::new();
+        let mut current_frn = frn;
+        let mut depth = 0;
+        const MAX_DEPTH: u32 = 64; // 防止死循环（损坏的 MFT）
+
+        loop {
+            if depth > MAX_DEPTH {
+                return Ok(None);
+            }
+            depth += 1;
+
+            if let Some(record) = self.read_single_record(current_frn)? {
+                components.push(record.name);
+                current_frn = record.parent_frn;
+
+                if current_frn == ROOT_FRN {
+                    break;
+                }
+            } else {
+                // 记录读不到，可能是 FRN 序列号不匹配或记录已被释放
+                return Ok(None);
+            }
+        }
+
+        // 反转组件并拼接路径
+        components.reverse();
+        let path = components.join("/");
+        Ok(Some(path))
+    }
+}
+
+/// 解析单条 MFT 记录缓冲区，提取 $FILE_NAME 属性（简化版，供 FRN 解析使用）
+fn parse_mft_record_info(data: &[u8], frn: u64) -> Option<MftRecordInfo> {
+    let record_index = (frn & 0x0000FFFFFFFFFFFF) as usize;
+
+    if data.len() < 48 {
+        return None;
+    }
+
+    let signature = u32_from_le(&data[0..4]);
+    if signature != MFT_FILE_SIGNATURE {
+        return None;
+    }
+
+    let flags = u16_from_le(&data[0x16..0x18]);
+    if flags & MFT_RECORD_IN_USE == 0 {
+        return None;
+    }
+
+    let is_dir = flags & MFT_RECORD_IS_DIR != 0;
+
+    let first_attr_offset = u16_from_le(&data[0x14..0x16]) as usize;
+    if first_attr_offset >= data.len() || first_attr_offset < 48 {
+        return None;
+    }
+
+    let mut attr_offset = first_attr_offset;
+    loop {
+        if attr_offset + 16 > data.len() {
+            break;
+        }
+
+        let attr_type = u32_from_le(&data[attr_offset..attr_offset + 4]);
+        if attr_type == ATTR_END {
+            break;
+        }
+
+        let attr_length = u32_from_le(&data[attr_offset + 4..attr_offset + 8]) as usize;
+        if attr_length < 16 || attr_length == 0 {
+            break;
+        }
+
+        let non_resident = data[attr_offset + 8];
+
+        if attr_type == ATTR_FILE_NAME && non_resident == 0 {
+            let content_size =
+                u32_from_le(&data[attr_offset + 0x10..attr_offset + 0x14]) as usize;
+            let content_offset =
+                u16_from_le(&data[attr_offset + 0x14..attr_offset + 0x16]) as usize;
+
+            let fn_start = attr_offset + content_offset;
+            let fn_end = fn_start + content_size;
+
+            if fn_end > data.len() || content_size < 0x42 {
+                break;
+            }
+
+            let fn_data = &data[fn_start..fn_end];
+
+            let parent_frn = u64_from_le(&fn_data[FN_PARENT_FRN..FN_PARENT_FRN + 8]);
+            let real_size = u64_from_le(&fn_data[FN_REAL_SIZE..FN_REAL_SIZE + 8]);
+            let name_len = fn_data[FN_NAME_LENGTH] as usize;
+            let name_start = FN_NAME_START;
+            let name_end = name_start + name_len * 2;
+
+            if name_end > content_size {
+                break;
+            }
+
+            let name = read_utf16le(&fn_data[name_start..name_end]);
+
+            return Some(MftRecordInfo {
+                name,
+                parent_frn,
+                is_dir,
+                real_size,
+            });
+        }
+
+        attr_offset += attr_length;
+        if attr_offset >= data.len() {
+            break;
+        }
+    }
+
+    // 有记录但未找到 $FILE_NAME —— 返回一个占位名称
+    if flags & MFT_RECORD_IN_USE != 0 {
+        return Some(MftRecordInfo {
+            name: format!("<record_{}>", record_index),
+            parent_frn: 5,
+            is_dir,
+            real_size: 0,
+        });
+    }
+
+    None
 }
 
 /// 解析单条 MFT 记录，提取 $FILE_NAME 属性

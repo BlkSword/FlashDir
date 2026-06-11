@@ -363,11 +363,10 @@ pub async fn scan_directory(
     }
 
     SCAN_CACHE.invalidate(&root_dir);
-    DiskCache::instance().invalidate(&root_dir).ok();
 
     // ── P2 优化：USN Journal 增量更新 ──
-    // 如果有之前的 MFT 扫描检查点，先尝试增量更新
-    // 仅在变更较少（<5000 条）时使用，否则回退到全量 MFT
+    // 在失效缓存之前，先尝试用 USN Journal 增量更新过期的缓存数据
+    // 这样即使 mtime 不匹配，也能秒级刷新
     #[cfg(target_os = "windows")]
     if !force_refresh {
         if let Some(updated_result) = try_usn_incremental_update(
@@ -380,6 +379,9 @@ pub async fn scan_directory(
             return Ok(updated_result);
         }
     }
+
+    // USN 增量失败，失效磁盘缓存并执行全量扫描
+    DiskCache::instance().invalidate(&root_dir).ok();
 
     // ── P1 优化：MFT 直接读取（Everything 式快速路径） ──
     // Windows 管理员权限下，直接顺序读取 NTFS $MFT
@@ -684,7 +686,7 @@ fn try_usn_incremental_update(
     }
 
     if changes.is_empty() {
-        eprintln!("[USN] 无变更，使用缓存");
+        eprintln!("[USN] 无变更，直接返回缓存结果");
         // 更新检查点时间戳
         let updated_cp = crate::fs::UsnCheckpoint {
             created_at: now,
@@ -693,27 +695,325 @@ fn try_usn_incremental_update(
         if let Ok(json) = serde_json::to_string(&updated_cp) {
             let _ = std::fs::write(&cp_path, json);
         }
-        // 返回缓存（调用者已检查缓存，这里不会再走缓存路径）
+        // 返回磁盘缓存（无需修改，mtime 已通过 USN 验证为最新）
+        if let Some(cached) = DiskCache::instance().get_stale(root_dir) {
+            // 重新写入内存缓存
+            SCAN_CACHE.insert(root_dir.to_string(), cached.clone());
+            let _ = DiskCache::instance().insert(root_dir, &cached, new_checkpoint.created_at);
+            return Some(cached);
+        }
+        return None;
+    }
+
+    let create_count = changes.iter().filter(|c| c.reason & crate::fs::USN_REASON_FILE_CREATE != 0).count();
+    let delete_count = changes.iter().filter(|c| c.reason & crate::fs::USN_REASON_FILE_DELETE != 0).count();
+    let rename_count = changes.iter().filter(|c| c.reason & (crate::fs::USN_REASON_RENAME_OLD_NAME | crate::fs::USN_REASON_RENAME_NEW_NAME) != 0).count();
+    let data_count = changes.iter().filter(|c| c.reason & (crate::fs::USN_REASON_DATA_OVERWRITE | crate::fs::USN_REASON_DATA_EXTEND | crate::fs::USN_REASON_DATA_TRUNCATION) != 0).count();
+
+    eprintln!(
+        "[USN] 增量更新: {} 条变更 (CREATE={}, DELETE={}, RENAME={}, DATA={})",
+        changes.len(), create_count, delete_count, rename_count, data_count,
+    );
+
+    // ── 加载缓存的扫描结果 ──
+    // 使用 get_stale 获取过期缓存数据（忽略 mtime 检查），因为 USN 增量会将其更新到最新
+    let cached_items = {
+        if let Some(cached) = DiskCache::instance().get_stale(root_dir) {
+            cached.items
+        } else {
+            eprintln!("[USN] 磁盘缓存未命中，无法应用增量更新");
+            return None;
+        }
+    };
+
+    if cached_items.is_empty() {
+        eprintln!("[USN] 缓存为空，无法应用增量更新");
         return None;
     }
 
     eprintln!(
-        "[USN] 增量更新: {} 条变更 (CREATE={}, DELETE={}, RENAME={}, DATA={})",
-        changes.len(),
-        changes.iter().filter(|c| c.reason & crate::fs::USN_REASON_FILE_CREATE != 0).count(),
-        changes.iter().filter(|c| c.reason & crate::fs::USN_REASON_FILE_DELETE != 0).count(),
-        changes.iter().filter(|c| c.reason & (crate::fs::USN_REASON_RENAME_OLD_NAME | crate::fs::USN_REASON_RENAME_NEW_NAME) != 0).count(),
-        changes.iter().filter(|c| c.reason & (crate::fs::USN_REASON_DATA_OVERWRITE | crate::fs::USN_REASON_DATA_EXTEND | crate::fs::USN_REASON_DATA_TRUNCATION) != 0).count(),
+        "[USN] 加载缓存: {} 个项目，开始应用 USN 变更",
+        cached_items.len()
     );
 
-    // 更新检查点
-    if let Ok(json) = serde_json::to_string(&new_checkpoint) {
+    // ── 打开 MFT 扫描器用于 FRN → 路径解析 ──
+    let scanner = match crate::fs::MftScanner::open(drive) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[USN] 无法打开 MFT 扫描器: {}", e);
+            return None;
+        }
+    };
+
+    // ── 路径格式检测（必须在移动 cached_items 之前） ──
+    // MFT 扫描产生 volume-relative 路径 (如 "Users/xxx/Documents/file.txt")
+    // v4 遍历产生 root-relative 路径 (如 "Documents/file.txt")
+    // USN FRN 解析总是产生 volume-relative 路径
+    // 需要根据缓存实际格式决定是否截去前缀
+    let volume_relative_prefix = {
+        // root_dir 格式: "C:/Users/xxx" (forward slashes)
+        let without_drive = if root_dir.len() >= 2 && root_dir.as_bytes().get(1) == Some(&b':') {
+            &root_dir[2..] // 去掉 "C:"
+        } else {
+            root_dir
+        };
+        let trimmed = without_drive.trim_start_matches('/');
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", trimmed)
+        }
+    };
+
+    let cached_is_mft_format = {
+        let first_cached = cached_items.first();
+        first_cached.map_or(false, |item| {
+            !volume_relative_prefix.is_empty()
+                && item.path.starts_with(volume_relative_prefix.as_str())
+        })
+    };
+
+    eprintln!(
+        "[USN] 缓存路径格式: {}, 卷相对前缀: \"{}\"",
+        if cached_is_mft_format { "MFT (volume-relative)" } else { "v4 (root-relative)" },
+        volume_relative_prefix,
+    );
+
+    let normalize_to_cache_format = |vol_relative_path: &str| -> CompactString {
+        if cached_is_mft_format {
+            // MFT 格式：直接使用 volume-relative 路径
+            CompactString::from(vol_relative_path)
+        } else if !volume_relative_prefix.is_empty()
+            && vol_relative_path.starts_with(&volume_relative_prefix)
+        {
+            // v4 格式：截去卷相对前缀，得到 root-relative 路径
+            CompactString::from(&vol_relative_path[volume_relative_prefix.len()..])
+        } else {
+            // 后备：路径不在预期前缀下，直接使用
+            CompactString::from(vol_relative_path)
+        }
+    };
+
+    // ── 构建 HashMap 索引 (path → Item) ──
+    use std::collections::HashMap;
+
+    let mut items_map: HashMap<CompactString, Item> = HashMap::with_capacity(cached_items.len() + changes.len());
+    for item in cached_items {
+        items_map.insert(item.path.clone(), item);
+    }
+
+    // ── 路径解析缓存 (parent_ref → volume_relative_path) ──
+    let mut parent_path_cache: HashMap<u64, Option<String>> = HashMap::new();
+
+    let resolve_parent_path = |parent_ref: u64,
+                                scanner: &crate::fs::MftScanner,
+                                cache: &mut HashMap<u64, Option<String>>|
+     -> Option<String> {
+        if let Some(cached) = cache.get(&parent_ref) {
+            return cached.clone();
+        }
+        let result = scanner.resolve_frn_path(parent_ref).ok().flatten();
+        cache.insert(parent_ref, result.clone());
+        result
+    };
+
+    // ── 应用 USN 变更 ──
+    // Phase 1: 处理删除和旧名称（先移除）
+    for change in &changes {
+        let reason = change.reason;
+
+        let is_delete = reason & crate::fs::USN_REASON_FILE_DELETE != 0;
+        let is_rename_old = reason & crate::fs::USN_REASON_RENAME_OLD_NAME != 0;
+
+        if !is_delete && !is_rename_old {
+            continue;
+        }
+
+        if let Some(parent_path) = resolve_parent_path(change.parent_ref, &scanner, &mut parent_path_cache) {
+            let vol_path = if parent_path.is_empty() {
+                change.name.clone()
+            } else {
+                format!("{}/{}", parent_path, change.name)
+            };
+            let cache_key = normalize_to_cache_format(&vol_path);
+            if items_map.remove(&cache_key).is_some() {
+                let action = if is_delete { "DEL" } else { "RN_OLD" };
+                eprintln!("  [USN-{}] 移除: {}", action, cache_key);
+            }
+        }
+    }
+
+    // Phase 2: 处理创建、重命名新名称、数据变更
+    for change in &changes {
+        let reason = change.reason;
+
+        let is_create = reason & crate::fs::USN_REASON_FILE_CREATE != 0;
+        let is_rename_new = reason & crate::fs::USN_REASON_RENAME_NEW_NAME != 0;
+        let is_data_change = reason & (crate::fs::USN_REASON_DATA_OVERWRITE
+            | crate::fs::USN_REASON_DATA_EXTEND
+            | crate::fs::USN_REASON_DATA_TRUNCATION)
+            != 0;
+
+        if !is_create && !is_rename_new && !is_data_change {
+            continue;
+        }
+
+        if let Some(parent_path) = resolve_parent_path(change.parent_ref, &scanner, &mut parent_path_cache) {
+            let vol_path = if parent_path.is_empty() {
+                change.name.clone()
+            } else {
+                format!("{}/{}", parent_path, change.name)
+            };
+            let cache_key = normalize_to_cache_format(&vol_path);
+
+            if is_create || is_rename_new {
+                // 读取 MFT 获取文件大小和目录标志
+                let (file_size, is_dir) = match scanner.read_single_record(change.file_ref) {
+                    Ok(Some(record)) => (record.real_size as i64, record.is_dir),
+                    _ => {
+                        // 回退：用 USN attributes 判断目录标志
+                        let is_dir_attr = (change.attributes & 0x10) != 0; // FILE_ATTRIBUTE_DIRECTORY
+                        (0i64, is_dir_attr)
+                    }
+                };
+
+                let item = Item {
+                    path: cache_key.clone(),
+                    name: CompactString::from(change.name.as_str()),
+                    size: file_size,
+                    size_formatted: format_size(file_size),
+                    is_dir,
+                };
+
+                items_map.insert(cache_key.clone(), item);
+                let action = if is_create { "CREATE" } else { "RN_NEW" };
+                eprintln!(
+                    "  [USN-{}] 添加: {} ({} bytes, dir={})",
+                    action, cache_key, file_size, is_dir
+                );
+            } else if is_data_change {
+                // 更新文件大小（从 MFT 读取最新值）
+                if let Some(item) = items_map.get_mut(&cache_key) {
+                    if let Ok(Some(record)) = scanner.read_single_record(change.file_ref) {
+                        if !item.is_dir {
+                            let new_size = record.real_size as i64;
+                            if new_size != item.size {
+                                eprintln!(
+                                    "  [USN-DATA] 更新大小: {} {} -> {} bytes",
+                                    cache_key, item.size, new_size
+                                );
+                                item.size = new_size;
+                                item.size_formatted = format_size(new_size);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 释放 MFT 扫描器
+    drop(scanner);
+    drop(parent_path_cache);
+
+    // ── 重建目录大小 ──
+    // 文件大小可能已更新，需要重新聚合计入目录
+    let mut new_items: Vec<Item> = items_map.into_values().collect();
+
+    // 重新计算目录大小：为每个目录累计其子文件的字节数
+    {
+        use std::collections::HashMap as StdHashMap;
+
+        let mut dir_sizes: StdHashMap<CompactString, i64> = StdHashMap::new();
+
+        for item in &new_items {
+            if !item.is_dir && item.size > 0 {
+                let file_path = item.path.as_str();
+                // 沿路径向上，累加到每个祖先目录
+                let mut pos = 0;
+                while let Some(slash_pos) = file_path[pos..].find('/') {
+                    let abs_pos = pos + slash_pos;
+                    let parent = &file_path[..abs_pos];
+                    *dir_sizes
+                        .entry(CompactString::from(parent))
+                        .or_insert(0) += item.size;
+                    pos = abs_pos + 1;
+                }
+                // 也计入根
+                *dir_sizes.entry(CompactString::new()).or_insert(0) += item.size;
+            }
+        }
+
+        for item in &mut new_items {
+            if item.is_dir {
+                item.size = dir_sizes.get(&item.path).copied().unwrap_or(0);
+                item.size_formatted = format_size(item.size);
+            }
+        }
+    }
+
+    // 按大小降序排序
+    new_items.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+
+    let actual_total_size: i64 = new_items
+        .iter()
+        .filter(|i| !i.is_dir)
+        .map(|i| i.size)
+        .sum();
+
+    let new_file_count = new_items.iter().filter(|i| !i.is_dir).count();
+    let new_dir_count = new_items.iter().filter(|i| i.is_dir).count();
+
+    eprintln!(
+        "[USN] 增量更新完成: {} 文件, {} 目录, {} ({} 变更已应用)",
+        new_file_count,
+        new_dir_count,
+        format_size(actual_total_size),
+        changes.len(),
+    );
+
+    // ── 更新检查点 ──
+    let updated_cp = crate::fs::UsnCheckpoint {
+        created_at: chrono::Utc::now().timestamp(),
+        ..new_checkpoint
+    };
+    if let Ok(json) = serde_json::to_string(&updated_cp) {
         let _ = std::fs::write(&cp_path, json);
     }
 
-    // 增量更新目前回退到全量 MFT 扫描（变更列表已用于判断是否需要重扫）
-    // TODO: 实际应用增量变更到缓存结果
-    None
+    // ── 写回缓存 ──
+    let result = ScanResult {
+        items: new_items,
+        total_size: actual_total_size,
+        total_size_formatted: format_size(actual_total_size),
+        scan_time: 0.0, // USN 增量更新视为即时
+        path: CompactString::from(root_dir),
+        timing: Some(TimingInfo {
+            scan_phase: 0.0,
+            compute_phase: 0.0,
+            format_phase: 0.0,
+            total: 0.0,
+        }),
+        perf_metrics: Some(ScanPerfMetrics {
+            io_phase_ms: 0,
+            compute_phase_ms: 0,
+            serialize_phase_ms: 0,
+            cache_read_time_ms: 0,
+            files_scanned: 0,
+            dirs_scanned: 0,
+            io_throughput_mbps: 0.0,
+            memory_peak_mb: 0.0,
+            threads_used: 0,
+            cache_hit: true,
+            cache_source: Some("usn".to_string()),
+        }),
+    };
+
+    // 写入两级缓存
+    SCAN_CACHE.insert(root_dir.to_string(), result.clone());
+    let _ = DiskCache::instance().insert(root_dir, &result, new_checkpoint.created_at);
+
+    Some(result)
 }
 
 #[cfg(not(target_os = "windows"))]

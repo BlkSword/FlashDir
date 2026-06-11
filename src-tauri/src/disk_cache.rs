@@ -53,6 +53,27 @@ impl DiskCache {
             [],
         )?;
 
+        // ── 快照表：同一目录的多版本扫描历史 ──
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL,
+                scan_time INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                total_size INTEGER NOT NULL,
+                total_size_formatted TEXT NOT NULL,
+                item_count INTEGER NOT NULL,
+                file_count INTEGER NOT NULL,
+                dir_count INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_snapshots_path_time ON snapshots(path, scan_time DESC)",
+            [],
+        )?;
+
         let current_size: i64 = conn
             .query_row("SELECT COALESCE(SUM(size), 0) FROM scan_cache", [], |row| row.get(0))
             .unwrap_or(0);
@@ -104,6 +125,24 @@ impl DiskCache {
         }
 
         None
+    }
+
+    /// 获取缓存的扫描结果，忽略 mtime 检查（用于 USN 增量更新）
+    /// 返回即使缓存已过期也能使用的数据
+    pub fn get_stale(&self, path: &str) -> Option<ScanResult> {
+        let conn = self.conn.lock();
+
+        let data: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT data FROM scan_cache WHERE path = ?1",
+                params![path],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+
+        data.and_then(|d| bincode::deserialize(&d).ok())
     }
 
     pub fn insert(&self, path: &str, result: &ScanResult, dir_mtime: i64) -> Result<()> {
@@ -209,6 +248,119 @@ impl DiskCache {
         )?;
         Ok(())
     }
+
+    // ─── 快照操作 ──────────────────────────────────────────
+
+    /// 保存一次扫描结果作为快照
+    pub fn insert_snapshot(
+        &self,
+        path: &str,
+        result: &ScanResult,
+        file_count: usize,
+        dir_count: usize,
+    ) -> Result<i64> {
+        let data = bincode::serialize(result)?;
+        let now = chrono::Utc::now().timestamp();
+
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO snapshots (path, scan_time, data, total_size, total_size_formatted, item_count, file_count, dir_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                path,
+                now,
+                data,
+                result.total_size,
+                result.total_size_formatted.as_str(),
+                result.items.len(),
+                file_count,
+                dir_count,
+            ],
+        )?;
+
+        let id = conn.last_insert_rowid();
+
+        // 每个路径最多保留 50 个快照
+        conn.execute(
+            "DELETE FROM snapshots WHERE path = ?1 AND id NOT IN (
+                SELECT id FROM snapshots WHERE path = ?1 ORDER BY scan_time DESC LIMIT 50
+            )",
+            params![path],
+        )?;
+
+        // 30 天 TTL
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+        conn.execute(
+            "DELETE FROM snapshots WHERE scan_time < ?1",
+            params![cutoff.timestamp()],
+        )?;
+
+        Ok(id)
+    }
+
+    /// 列出某路径的所有快照（元数据，不含完整数据）
+    pub fn list_snapshots(&self, path: &str) -> Result<Vec<SnapshotInfo>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, path, scan_time, total_size, total_size_formatted, item_count, file_count, dir_count
+             FROM snapshots WHERE path = ?1 ORDER BY scan_time DESC LIMIT 50",
+        )?;
+
+        let snapshots = stmt
+            .query_map(params![path], |row| {
+                Ok(SnapshotInfo {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    scan_time: row.get(2)?,
+                    total_size: row.get(3)?,
+                    total_size_formatted: row.get(4)?,
+                    item_count: row.get(5)?,
+                    file_count: row.get(6)?,
+                    dir_count: row.get(7)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(snapshots)
+    }
+
+    /// 获取指定 ID 的快照完整数据
+    pub fn get_snapshot(&self, id: i64) -> Option<ScanResult> {
+        let conn = self.conn.lock();
+        let data: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT data FROM snapshots WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+
+        data.and_then(|d| bincode::deserialize(&d).ok())
+    }
+
+    /// 删除指定快照
+    pub fn delete_snapshot(&self, id: i64) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM snapshots WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+}
+
+/// 快照元数据（不含完整文件列表）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotInfo {
+    pub id: i64,
+    pub path: String,
+    pub scan_time: i64,
+    pub total_size: i64,
+    pub total_size_formatted: String,
+    pub item_count: usize,
+    pub file_count: usize,
+    pub dir_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

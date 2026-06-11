@@ -41,14 +41,27 @@
         </a-tag>
       </a-tooltip>
 
-      <a-input-search
-        v-model:value="searchKeyword"
-        placeholder="搜索文件..."
-        :disabled="loading"
-        allow-clear
-        @search="handleSearch"
-        style="width: 200px"
-      />
+      <a-tooltip placement="bottomRight">
+        <template #title>
+          <div class="filter-hints">
+            <div>Everything 式过滤器:</div>
+            <div><code>ext:zip</code> — 按扩展名</div>
+            <div><code>size:&gt;100MB</code> — 最小大小</div>
+            <div><code>size:&lt;1GB</code> — 最大大小</div>
+            <div><code>type:dir</code> — 仅目录</div>
+            <div><code>type:file</code> — 仅文件</div>
+            <div><code>dir:node_modules</code> — 路径包含</div>
+          </div>
+        </template>
+        <a-input-search
+          v-model:value="searchKeyword"
+          placeholder="ext:zip size:>100MB..."
+          :disabled="loading"
+          allow-clear
+          @search="handleSearch"
+          style="width: 240px"
+        />
+      </a-tooltip>
     </div>
   </div>
 </template>
