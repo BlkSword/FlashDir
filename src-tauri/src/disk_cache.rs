@@ -8,6 +8,7 @@ use std::sync::Arc;
 use lazy_static::lazy_static;
 
 use crate::scan::ScanResult;
+use crate::global_search::IndexEntry;
 
 /// 磁盘缓存管理器
 pub struct DiskCache {
@@ -71,6 +72,31 @@ impl DiskCache {
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_snapshots_path_time ON snapshots(path, scan_time DESC)",
+            [],
+        )?;
+
+        // ── 全局搜索索引表：持久化全局索引条目 ──
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS global_index (
+                path TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                name_lower TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                is_dir INTEGER NOT NULL,
+                drive TEXT NOT NULL,
+                mtime INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_global_index_name_lower ON global_index(name_lower)",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_global_index_drive ON global_index(drive)",
             [],
         )?;
 
@@ -346,6 +372,114 @@ impl DiskCache {
         let conn = self.conn.lock();
         conn.execute("DELETE FROM snapshots WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    // ─── 全局搜索索引持久化 ─────────────────────────────────
+
+    /// 加载全部全局索引条目
+    pub fn load_global_index(&self) -> Result<Vec<IndexEntry>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT path, name, name_lower, size, is_dir, mtime FROM global_index",
+        )?;
+        let entries = stmt
+            .query_map([], |row| {
+                Ok(IndexEntry {
+                    path: row.get(0)?,
+                    name: row.get(1)?,
+                    name_lower: row.get(2)?,
+                    size: row.get(3)?,
+                    is_dir: row.get::<_, i64>(4)? != 0,
+                    mtime: row.get(5)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(entries)
+    }
+
+    /// 全量重建全局索引时批量写入（事务内先清空再插入）
+    pub fn save_global_index_batch(&self, entries: &[IndexEntry]) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM global_index", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO global_index
+                 (path, name, name_lower, size, is_dir, drive, mtime, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for e in entries {
+                let drive = Self::extract_drive(&e.path).unwrap_or('?').to_string();
+                stmt.execute(params![
+                    e.path,
+                    e.name,
+                    e.name_lower,
+                    e.size,
+                    e.is_dir as i64,
+                    drive,
+                    e.mtime,
+                    chrono::Utc::now().timestamp(),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 单条 upsert（USN 增量同步）
+    pub fn upsert_global_index_entry(&self, entry: &IndexEntry) -> Result<()> {
+        let conn = self.conn.lock();
+        let drive = Self::extract_drive(&entry.path).unwrap_or('?').to_string();
+        conn.execute(
+            "INSERT OR REPLACE INTO global_index
+             (path, name, name_lower, size, is_dir, drive, mtime, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                entry.path,
+                entry.name,
+                entry.name_lower,
+                entry.size,
+                entry.is_dir as i64,
+                drive,
+                entry.mtime,
+                chrono::Utc::now().timestamp(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 按绝对路径删除条目（USN 删除/重命名旧名称）
+    pub fn remove_global_index_by_path(&self, path: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM global_index WHERE path = ?1", params![path])?;
+        Ok(())
+    }
+
+    /// 按前缀删除条目（USN 增量失败时重建某路径）
+    pub fn remove_global_index_by_prefix(&self, prefix: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM global_index WHERE path LIKE ?1",
+            params![format!("{}%", prefix)],
+        )?;
+        Ok(())
+    }
+
+    /// 清空全局索引
+    pub fn clear_global_index(&self) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM global_index", [])?;
+        Ok(())
+    }
+
+    fn extract_drive(path: &str) -> Option<char> {
+        let bytes = path.as_bytes();
+        if bytes.len() >= 2 && bytes[1] == b':' {
+            Some(bytes[0] as char)
+        } else {
+            None
+        }
     }
 }
 

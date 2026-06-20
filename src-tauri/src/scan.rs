@@ -228,6 +228,76 @@ lazy_static::lazy_static! {
     static ref SIZE_UNITS: [&'static str; 5] = ["B", "KB", "MB", "GB", "TB"];
 }
 
+/// 将任意路径规范化为内存/磁盘缓存使用的 key（canonical + 正斜杠）
+fn cache_key_for(path: &str) -> Option<String> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    Some(normalize_path_separator(canonical.as_os_str()))
+}
+
+/// 获取内存缓存中的扫描结果 items（供 dev_analyzer 等模块复用，
+/// 避免把百万级 items 再次跨 IPC 传回后端）
+pub fn get_cached_items(path: &str) -> Option<Arc<Vec<Item>>> {
+    let key = cache_key_for(path)?;
+    SCAN_CACHE.get(&key).map(|e| Arc::clone(&e.result.items))
+}
+
+/// 自定义紧凑二进制编码扫描结果，供前端经 Tauri 原始字节通道接收，
+/// 避免 serde_json 序列化百万级 items 的开销（无 key 名/引号/转义，size 用定宽整数）。
+/// 前端用 DataView + TextDecoder 顺序解析。布局（小端）:
+///   u32 magic=0x4644 | u8 version | u8 flags
+///   i64 total_size | f64 scan_time | u32 item_count | u32 file_count | u32 dir_count
+///   f64 io_ms | f64 compute_ms | f64 serialize_ms
+///   u32 path_len | path_utf8                      （被扫描路径）
+///   逐项: u32 path_len|path_utf8 | u32 name_len|name_utf8 | i64 size | u8 is_dir
+pub fn encode_scan_result(result: &ScanResult) -> Vec<u8> {
+    let item_count = result.items.len();
+    let (file_count, dir_count) = result.perf_metrics.as_ref().map(|m| (m.files_scanned, m.dirs_scanned)).unwrap_or_else(|| {
+        let f = result.items.iter().filter(|i| !i.is_dir).count();
+        (f, item_count.saturating_sub(f))
+    });
+
+    let path_str = result.path.as_str();
+    let est = result.items.iter().map(|i| i.path.len() + i.name.len() + 4 + 4 + 8 + 1).sum::<usize>()
+        + path_str.len() + 64;
+    let mut buf = Vec::with_capacity(est);
+
+    // header
+    buf.extend_from_slice(&0x4644u32.to_le_bytes());
+    buf.push(1u8); // version
+    buf.push(0u8); // flags
+
+    // metadata
+    buf.extend_from_slice(&result.total_size.to_le_bytes());
+    buf.extend_from_slice(&result.scan_time.to_le_bytes());
+    buf.extend_from_slice(&(item_count as u32).to_le_bytes());
+    buf.extend_from_slice(&(file_count as u32).to_le_bytes());
+    buf.extend_from_slice(&(dir_count as u32).to_le_bytes());
+
+    let m = result.perf_metrics.as_ref();
+    buf.extend_from_slice(&(m.map(|m| m.io_phase_ms).unwrap_or(0) as f64).to_le_bytes());
+    buf.extend_from_slice(&(m.map(|m| m.compute_phase_ms).unwrap_or(0) as f64).to_le_bytes());
+    buf.extend_from_slice(&(m.map(|m| m.serialize_phase_ms).unwrap_or(0) as f64).to_le_bytes());
+
+    // 被扫描路径
+    write_bin_str(&mut buf, path_str);
+
+    // items（不传 sizeFormatted，由前端 formatSize 计算）
+    for item in &result.items {
+        write_bin_str(&mut buf, item.path.as_str());
+        write_bin_str(&mut buf, item.name.as_str());
+        buf.extend_from_slice(&item.size.to_le_bytes());
+        buf.push(if item.is_dir { 1u8 } else { 0u8 });
+    }
+
+    buf
+}
+
+#[inline]
+fn write_bin_str(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
+}
+
 #[inline]
 pub fn format_size(bytes: i64) -> CompactString {
     if bytes < 1024 {
@@ -453,6 +523,69 @@ struct ScanOutput {
     threads_used: usize,
 }
 
+/// 从绝对路径中提取盘符和 MFT volume-relative 前缀。
+/// MFT 返回的路径不带盘符（如 `Users/xxx/Documents/file.txt`），而 canonical path
+/// 是完整路径（如 `C:/Users/xxx`）。本函数返回盘符与 volume-relative 前缀，
+/// 例如 `C:/Users/xxx` -> `('C', "Users/xxx/")`，`C:/` -> `('C', "")`。
+fn drive_and_vol_prefix(abs_path: &str) -> Option<(char, String)> {
+    let normalized = abs_path.replace('\\', "/");
+    if normalized.len() >= 2 && normalized.as_bytes().get(1) == Some(&b':') {
+        let drive = normalized.as_bytes()[0] as char;
+        let rest = normalized[2..].trim_start_matches('/');
+        let prefix = if rest.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", rest.to_lowercase())
+        };
+        Some((drive, prefix))
+    } else {
+        None
+    }
+}
+
+/// 把 MFT 返回的 volume-relative 路径转换为绝对路径。
+/// 如果路径已以盘符开头，则直接规范化；否则补全盘符前缀。
+fn mft_path_to_abs(drive: char, vol_relative_path: &str) -> CompactString {
+    let p = vol_relative_path.replace('\\', "/");
+    let vol_prefix = format!("{}:/", drive);
+    let vol_alt = format!("{}:", drive);
+    if p.starts_with(&vol_prefix) || p.starts_with(&vol_alt) {
+        CompactString::from(p)
+    } else if p.is_empty() {
+        CompactString::from(vol_prefix)
+    } else {
+        CompactString::from(format!("{}{}", vol_prefix, p))
+    }
+}
+
+/// 轻量扫描：只做 MFT 读取 + 文件名提取（不聚合目录大小、不排序、不格式化）。
+/// 供全局搜索索引构建使用。与 try_mft_scan_path 使用相同的 canonicalize 预处理，
+/// 但跳过聚合/format/sort，失败返回 None，调用者应回退到完整 scan_directory。
+pub fn scan_lite(path: &str) -> Option<Vec<Item>> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let root_path_str = normalize_path_separator(canonical.as_os_str());
+    let mft_result = crate::fs::try_mft_scan(&root_path_str)?;
+    let (drive, vol_prefix) = drive_and_vol_prefix(&root_path_str)?;
+
+    let items: Vec<Item> = mft_result
+        .files
+        .into_iter()
+        .filter(|f| {
+            let path_lower = f.path.to_lowercase();
+            vol_prefix.is_empty() || path_lower.starts_with(&vol_prefix)
+        })
+        .map(|f| Item {
+            path: mft_path_to_abs(drive, &f.path),
+            name: CompactString::from(f.name),
+            size: f.size as i64,
+            size_formatted: CompactString::new(),
+            is_dir: f.is_dir,
+        })
+        .collect();
+
+    Some(items)
+}
+
 /// 尝试使用 MFT 直接读取扫描（Everything 式快速路径）
 /// 仅在 Windows + 管理员权限 + NTFS 卷上生效
 /// 返回 None 表示不可用，调用者应回退到目录遍历
@@ -462,7 +595,8 @@ fn try_mft_scan_path(
     perf_monitor: &Arc<PerformanceMonitor>,
     app_handle: Option<&Arc<tauri::AppHandle>>,
 ) -> Option<ScanOutput> {
-    let root_path_str = canonical_path.to_string_lossy();
+    let root_path_str = canonical_path.to_string_lossy().to_string();
+    let (drive, vol_prefix) = drive_and_vol_prefix(&root_path_str)?;
 
     // 尝试 MFT 全卷扫描
     let mft_result = crate::fs::try_mft_scan(&root_path_str)?;
@@ -473,18 +607,18 @@ fn try_mft_scan_path(
     let scan_start = std::time::Instant::now();
 
     // 过滤：只保留目标目录下的文件
-    // MFT 返回的路径使用 "/" 分隔符，需要统一
-    let normalized_root = normalize_path_separator(canonical_path.as_os_str()).to_lowercase();
+    // MFT 返回的路径是 volume-relative（不带盘符），需用 volume-relative 前缀匹配
+    let normalized_root = vol_prefix;
 
     let mut items: Vec<Item> = mft_result
         .files
         .into_iter()
         .filter(|f| {
             let path_lower = f.path.to_lowercase();
-            path_lower.starts_with(&normalized_root)
+            normalized_root.is_empty() || path_lower.starts_with(&normalized_root)
         })
         .map(|f| Item {
-            path: CompactString::from(f.path),
+            path: mft_path_to_abs(drive, &f.path),
             name: CompactString::from(f.name),
             size: f.size as i64,
             size_formatted: CompactString::new(), // 下面统一格式化
@@ -502,45 +636,43 @@ fn try_mft_scan_path(
     perf_monitor.start_compute_phase();
     let compute_start = std::time::Instant::now();
 
-    use dashmap::DashMap;
     use std::collections::HashMap;
 
-    let dir_sizes: HashMap<CompactString, i64> = {
-        let ds = DashMap::with_capacity_and_hasher(
-            (file_count / 4).max(64),
-            ahash::RandomState::new(),
-        );
+    // 目录大小聚合：path → 下标索引 + 按下标累加，避免每层祖先都分配 CompactString
+    let dir_index: HashMap<&str, usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| it.is_dir)
+        .map(|(i, it)| (it.path.as_str(), i))
+        .collect();
 
-        items
-            .iter()
-            .filter(|i| !i.is_dir && i.size > 0)
-            .for_each(|item| {
-                let file_path = item.path.as_str();
-                let mut pos = 0;
-                while let Some(slash_pos) = file_path[pos..].find('/') {
-                    let abs_pos = pos + slash_pos;
-                    let parent_path = &file_path[..abs_pos];
-                    ds.entry(CompactString::from(parent_path))
-                        .and_modify(|v| *v += item.size)
-                        .or_insert(item.size);
-                    pos = abs_pos + 1;
-                }
-                ds.entry(CompactString::new())
-                    .and_modify(|v| *v += item.size)
-                    .or_insert(item.size);
-            });
+    let mut dir_sizes: Vec<i64> = vec![0; items.len()];
 
-        ds.iter()
-            .map(|entry| (entry.key().clone(), *entry.value()))
-            .collect()
-    };
+    for item in items.iter() {
+        if item.is_dir || item.size <= 0 {
+            continue;
+        }
+        let file_path = item.path.as_str();
+        let mut pos = 0;
+        while let Some(slash_pos) = file_path[pos..].find('/') {
+            let abs_pos = pos + slash_pos;
+            let parent = &file_path[..abs_pos];
+            if let Some(&idx) = dir_index.get(parent) {
+                dir_sizes[idx] += item.size;
+            }
+            pos = abs_pos + 1;
+        }
+    }
+
+    // 释放对 items 的借用，以便下方 iter_mut 可变借用
+    drop(dir_index);
 
     let compute_phase = compute_start.elapsed();
 
     // 更新目录条目的 size 和 size_formatted
-    for item in &mut items {
+    for (i, item) in items.iter_mut().enumerate() {
         if item.is_dir {
-            item.size = dir_sizes.get(&item.path).copied().unwrap_or(0);
+            item.size = dir_sizes[i];
         }
         item.size_formatted = format_size(item.size);
     }
@@ -817,6 +949,13 @@ fn try_usn_incremental_update(
         result
     };
 
+    // 辅助：把 USN 的 Windows FILETIME 转换为 Unix 秒级时间戳
+    let filetime_to_unix = |ft: i64| -> i64 {
+        // FILETIME 是自 1601-01-01 起的 100 纳秒间隔数
+        // 与 Unix 时间戳（1970-01-01）的差值为 11644473600 秒
+        (ft - 116444736000000000) / 10_000_000
+    };
+
     // ── 应用 USN 变更 ──
     // Phase 1: 处理删除和旧名称（先移除）
     for change in &changes {
@@ -840,6 +979,11 @@ fn try_usn_incremental_update(
                 let action = if is_delete { "DEL" } else { "RN_OLD" };
                 eprintln!("  [USN-{}] 移除: {}", action, cache_key);
             }
+
+            // 同步到全局索引与 SQLite
+            let abs_path = crate::global_search::normalize_abs_path(drive, &vol_path);
+            crate::global_search::instance().remove_by_path(&abs_path);
+            let _ = DiskCache::instance().remove_global_index_by_path(&abs_path);
         }
     }
 
@@ -865,6 +1009,8 @@ fn try_usn_incremental_update(
                 format!("{}/{}", parent_path, change.name)
             };
             let cache_key = normalize_to_cache_format(&vol_path);
+            let abs_path = crate::global_search::normalize_abs_path(drive, &vol_path);
+            let mtime = filetime_to_unix(change.timestamp);
 
             if is_create || is_rename_new {
                 // 读取 MFT 获取文件大小和目录标志
@@ -891,6 +1037,19 @@ fn try_usn_incremental_update(
                     "  [USN-{}] 添加: {} ({} bytes, dir={})",
                     action, cache_key, file_size, is_dir
                 );
+
+                // 同步到全局索引与 SQLite
+                let name = change.name.clone();
+                let entry = crate::global_search::IndexEntry {
+                    path: abs_path.clone(),
+                    name: name.clone(),
+                    name_lower: name.to_lowercase(),
+                    size: file_size,
+                    is_dir,
+                    mtime,
+                };
+                crate::global_search::instance().upsert(entry.clone());
+                let _ = DiskCache::instance().upsert_global_index_entry(&entry);
             } else if is_data_change {
                 // 更新文件大小（从 MFT 读取最新值）
                 if let Some(item) = items_map.get_mut(&cache_key) {
@@ -904,6 +1063,19 @@ fn try_usn_incremental_update(
                                 );
                                 item.size = new_size;
                                 item.size_formatted = format_size(new_size);
+
+                                // 同步到全局索引与 SQLite
+                                let name = item.name.to_string();
+                                let entry = crate::global_search::IndexEntry {
+                                    path: abs_path.clone(),
+                                    name: name.clone(),
+                                    name_lower: name.to_lowercase(),
+                                    size: new_size,
+                                    is_dir: item.is_dir,
+                                    mtime,
+                                };
+                                crate::global_search::instance().upsert(entry.clone());
+                                let _ = DiskCache::instance().upsert_global_index_entry(&entry);
                             }
                         }
                     }
@@ -1039,10 +1211,6 @@ fn scan_directory_optimized_v4(
 
     let (dir_sender, dir_receiver): (Sender<PathBuf>, Receiver<PathBuf>) = unbounded();
     let (item_sender, item_receiver): (Sender<ItemInternal>, Receiver<ItemInternal>) = unbounded();
-    let file_entries = Arc::new(dashmap::DashMap::with_capacity_and_hasher(
-        4096,
-        ahash::RandomState::new(),
-    ));
 
     dir_sender.send(root_path.to_path_buf()).unwrap();
 
@@ -1062,7 +1230,6 @@ fn scan_directory_optimized_v4(
             let dir_sender = dir_sender.clone();
             let dir_receiver = dir_receiver.clone();
             let item_sender = item_sender.clone();
-            let file_entries = Arc::clone(&file_entries);
             let root_path = root_path.to_path_buf();
             let app_handle_for_worker = app_handle.clone();
 
@@ -1103,9 +1270,7 @@ fn scan_directory_optimized_v4(
 
                             let size = entry.size as i64;
 
-                            if !entry.is_dir {
-                                file_entries.insert(rel_path.clone(), size);
-                            } else {
+                            if entry.is_dir {
                                 let _ = dir_sender.send(entry.path);
                             }
 
@@ -1153,16 +1318,15 @@ fn scan_directory_optimized_v4(
     let compute_start = std::time::Instant::now();
 
     let internal_items: Vec<ItemInternal> = item_receiver.try_iter().collect();
-    let file_count = file_entries.len();
-    let dir_count = internal_items.iter().filter(|i| i.is_dir).count();
-    
-    let file_entries_vec: Vec<(CompactString, i64)> = file_entries
-        .iter()
-        .map(|entry| (entry.key().clone(), *entry.value()))
-        .collect();
+    let file_count = internal_items.iter().filter(|i| !i.is_dir).count();
+    let dir_count = internal_items.len() - file_count;
 
-    let actual_total_size: i64 = file_entries_vec.iter().map(|(_, size)| *size).sum();
-    
+    let actual_total_size: i64 = internal_items
+        .iter()
+        .filter(|i| !i.is_dir)
+        .map(|i| i.size)
+        .sum();
+
     // 计算 I/O 吞吐量
     let throughput_mbps = if scan_phase.as_secs_f64() > 0.0 {
         (actual_total_size as f64 / 1024.0 / 1024.0) / scan_phase.as_secs_f64()
@@ -1170,41 +1334,53 @@ fn scan_directory_optimized_v4(
         0.0
     };
 
-    let dir_sizes = Arc::new(dashmap::DashMap::with_capacity_and_hasher(
-        (file_count / 4).max(64),
-        ahash::RandomState::new(),
-    ));
+    // 目录大小聚合：建立"目录 path → 在 internal_items 中的下标"索引，
+    // 配合按下标对齐的原子累加数组，把每个文件大小沿路径向上累加到各祖先目录。
+    // 旧实现为每个祖先 new 一个 CompactString（O(文件数×深度) 堆分配），这里改为仅 index 写入，零字符串分配。
+    use std::sync::atomic::{AtomicI64, Ordering};
 
-    file_entries_vec.par_iter().for_each(|(file_path, file_size)| {
-        let mut pos = 0;
-        while let Some(slash_pos) = file_path[pos..].find('/') {
-            let abs_pos = pos + slash_pos;
-            let parent_path = &file_path[..abs_pos];
-            dir_sizes
-                .entry(CompactString::from(parent_path))
-                .and_modify(|v| *v += file_size)
-                .or_insert(*file_size);
-            pos = abs_pos + 1;
-        }
-        dir_sizes
-            .entry(CompactString::new())
-            .and_modify(|v| *v += file_size)
-            .or_insert(*file_size);
-    });
-
-    let dir_sizes: HashMap<CompactString, i64> = dir_sizes
+    let dir_index: HashMap<&str, usize> = internal_items
         .iter()
-        .map(|entry| (entry.key().clone(), *entry.value()))
+        .enumerate()
+        .filter(|(_, it)| it.is_dir)
+        .map(|(i, it)| (it.path.as_str(), i))
         .collect();
+
+    let dir_sizes: Vec<AtomicI64> = (0..internal_items.len())
+        .map(|_| AtomicI64::new(0))
+        .collect();
+
+    internal_items
+        .par_iter()
+        .for_each(|it| {
+            if it.is_dir {
+                return;
+            }
+            let file_path = it.path.as_str();
+            let mut pos = 0;
+            while let Some(slash_pos) = file_path[pos..].find('/') {
+                let abs_pos = pos + slash_pos;
+                let parent = &file_path[..abs_pos];
+                if let Some(&idx) = dir_index.get(parent) {
+                    dir_sizes[idx].fetch_add(it.size, Ordering::Relaxed);
+                }
+                pos = abs_pos + 1;
+            }
+        });
+
+    // 释放对 internal_items 的借用，以便下方 into_par_iter 消费它
+    drop(dir_index);
 
     let compute_phase = compute_start.elapsed();
     let format_start = std::time::Instant::now();
 
+    // 复用 internal_items（原地转换），不再额外拷贝一份中间结构
     let mut items_vec: Vec<Item> = internal_items
         .into_par_iter()
-        .map(|internal| {
+        .enumerate()
+        .map(|(i, internal)| {
             let size = if internal.is_dir {
-                dir_sizes.get(&internal.path).copied().unwrap_or(0)
+                dir_sizes[i].load(Ordering::Relaxed)
             } else {
                 internal.size
             };
@@ -1223,16 +1399,15 @@ fn scan_directory_optimized_v4(
 
     let format_phase = format_start.elapsed();
     let total = total_start.elapsed();
-    
+
     perf_monitor.end_compute_phase();
-    
-    // 估算内存使用
-    let memory_peak_mb = (
-        items_vec.capacity() * std::mem::size_of::<Item>() +
-        file_count * std::mem::size_of::<(CompactString, i64)>() +
-        dir_sizes.capacity() * std::mem::size_of::<(CompactString, i64)>()
-    ) as f64 / 1024.0 / 1024.0;
-    
+
+    // 估算内存使用（internal_items 已消费进 items_vec；dir_sizes 为紧凑原子数组）
+    let memory_peak_mb = (items_vec.capacity() * std::mem::size_of::<Item>()
+        + dir_sizes.len() * std::mem::size_of::<AtomicI64>()) as f64
+        / 1024.0
+        / 1024.0;
+
     perf_monitor.update_memory_stats(memory_peak_mb, memory_peak_mb);
     perf_monitor.update_io_stats(file_count, dir_count, actual_total_size as u64, file_count + dir_count);
 
@@ -1277,5 +1452,25 @@ fn normalize_path_separator_compact(path: &std::ffi::OsStr) -> CompactString {
         CompactString::from(s.replace('\\', "/"))
     } else {
         CompactString::from(s.as_ref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_drive_and_vol_prefix() {
+        assert_eq!(drive_and_vol_prefix("C:/Users/xxx"), Some(('C', "users/xxx/".to_string())));
+        assert_eq!(drive_and_vol_prefix("C:/"), Some(('C', String::new())));
+        assert_eq!(drive_and_vol_prefix("C:\\Users\\xxx"), Some(('C', "users/xxx/".to_string())));
+        assert_eq!(drive_and_vol_prefix("/home/xxx"), None);
+    }
+
+    #[test]
+    fn test_mft_path_to_abs() {
+        assert_eq!(mft_path_to_abs('C', "Users/xxx/file.txt"), CompactString::from("C:/Users/xxx/file.txt"));
+        assert_eq!(mft_path_to_abs('C', "C:/Users/xxx/file.txt"), CompactString::from("C:/Users/xxx/file.txt"));
+        assert_eq!(mft_path_to_abs('C', ""), CompactString::from("C:/"));
     }
 }

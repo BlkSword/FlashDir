@@ -4,11 +4,10 @@
 use flashdir::scan::{self, HistoryItem, HistoryItemSummary, ScanResult};
 use flashdir::perf::{PerformanceMonitor, ScanMetrics};
 use flashdir::disk_cache::DiskCache;
-use flashdir::binary_protocol::{OptimizedScanResult, BinaryPayload};
 use crate::AppState;
 use chrono::Utc;
 use std::collections::VecDeque;
-use tauri::{command, State};
+use tauri::{command, State, Emitter};
 use std::path::PathBuf;
 use tokio::{fs, io::AsyncWriteExt};
 
@@ -143,21 +142,16 @@ pub async fn scan_directory(
     }
 }
 
-/// 扫描目录 - 二进制格式返回（用于大数据）
+/// 扫描目录 - 自定义紧凑二进制格式（经 Tauri 原始字节通道返回，避免 serde_json 序列化百万级 items）
 #[command]
 pub async fn scan_directory_binary(
     path: String,
     force_refresh: bool,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-) -> Result<BinaryPayload, String> {
+) -> Result<tauri::ipc::Response, String> {
     let result = scan_directory(path, force_refresh, app, state).await?;
-    
-    // 转换为优化格式并序列化
-    let optimized: OptimizedScanResult = result.into();
-    
-    BinaryPayload::from_data(&optimized, 1024 * 1024) // 1MB 压缩阈值
-        .map_err(|e| format!("序列化失败: {}", e))
+    Ok(tauri::ipc::Response::new(scan::encode_scan_result(&result)))
 }
 
 /// 批量扫描
@@ -307,15 +301,14 @@ pub fn restart_as_admin() -> bool {
     flashdir::fs::restart_as_admin()
 }
 
-/// 开发者磁盘分析：识别并分类常见开发工具/缓存目录的空间占用
-/// 输入当前扫描结果的 items，返回按类别聚合的统计
+/// 开发者磁盘分析：从内存缓存读取当前路径的扫描结果（避免百万级 items 跨 IPC 传输），
+/// 识别并分类常见开发工具/缓存目录的空间占用（已按"匹配边界顶层"去重，杜绝重复累加）
 #[command]
-pub fn analyze_dev_disk(
-    items: Vec<flashdir::scan::Item>,
-    total_size: i64,
-    total_items: usize,
-) -> flashdir::dev_analyzer::DevAnalysisResult {
-    flashdir::dev_analyzer::analyze(&items, total_size, total_items)
+pub fn analyze_dev_disk(path: String) -> Option<flashdir::dev_analyzer::DevAnalysisResult> {
+    let items = flashdir::scan::get_cached_items(&path)?;
+    let total_size: i64 = items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum();
+    let total_items = items.len();
+    Some(flashdir::dev_analyzer::analyze(&items, total_size, total_items))
 }
 
 // ─── 快照管理 ────────────────────────────────────────────
@@ -390,7 +383,7 @@ pub fn delete_snapshot(id: i64) -> Result<(), String> {
 pub fn compare_with_latest_snapshot(
     path: String,
     current_items: Vec<flashdir::scan::Item>,
-    current_total_size: i64,
+    _current_total_size: i64,
 ) -> Result<Option<flashdir::diff_engine::SnapshotDiff>, String> {
     let disk_cache = flashdir::disk_cache::DiskCache::instance();
     let snapshots = disk_cache
@@ -412,4 +405,172 @@ pub fn compare_with_latest_snapshot(
         &current_items,
         old_result.total_size,
     )))
+}
+
+// ─── 全局文件搜索 ──────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalSearchResponse {
+    pub ready: bool,
+    pub state: flashdir::global_search::IndexState,
+    pub results: Vec<flashdir::global_search::IndexEntry>,
+    /// 诊断：搜索无结果时返回索引实际条目数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_size: Option<usize>,
+    /// 诊断：搜索无结果时返回前几个索引条目名称(确认 name 字段是否正常)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_names: Option<Vec<String>>,
+}
+
+/// 查询全局索引状态
+#[command]
+pub fn global_search_status() -> flashdir::global_search::IndexState {
+    flashdir::global_search::instance().state()
+}
+
+/// 构建全盘索引：逐盘调 scan_directory（与主界面相同的已验证路径，确保文件名正确）
+#[command]
+pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), String> {
+    {
+        let idx = flashdir::global_search::instance();
+        match idx.state() {
+            flashdir::global_search::IndexState::Ready(..)
+            | flashdir::global_search::IndexState::Loading { .. } => return Ok(()),
+            _ => {}
+        }
+    }
+
+    let idx = flashdir::global_search::instance();
+    idx.set_loading();
+
+    let drives = flashdir::global_search::list_ntfs_drives();
+    if drives.is_empty() {
+        idx.finish_building(&[]);
+        return Err("未检测到可扫描的 NTFS 卷（需要管理员权限读取 MFT）".to_string());
+    }
+
+    let perf = flashdir::perf::PerformanceMonitor::instance();
+    let mut ok_drives: Vec<char> = Vec::new();
+
+    for &drive in &drives {
+        let root = format!("{}:\\", drive);
+        let _ = app.emit(
+            "global-search-progress",
+            serde_json::json!({ "drive": drive.to_string(), "scanned": 0, "phase": "scanning" }),
+        );
+
+        // 1) 内存缓存命中：毫秒级（之前扫过该盘）
+        if let Some(cached) = flashdir::scan::get_cached_items(&root) {
+            idx.append_scan(drive, &cached);
+            ok_drives.push(drive);
+            let _ = app.emit(
+                "global-search-progress",
+                serde_json::json!({ "drive": drive.to_string(), "scanned": cached.len(), "phase": "ok (cache)" }),
+            );
+            continue;
+        }
+
+        // 2) 轻量 MFT 扫描：仅取文件名/路径/大小，跳过聚合/format/排序（3-5s）
+        if let Some(lite_items) = flashdir::scan::scan_lite(&root) {
+            idx.append_scan(drive, &lite_items);
+            ok_drives.push(drive);
+            let _ = app.emit(
+                "global-search-progress",
+                serde_json::json!({ "drive": drive.to_string(), "scanned": lite_items.len(), "phase": "ok (lite)" }),
+            );
+            continue;
+        }
+
+        // 3) 完整 scan_directory（回退，同时写缓存供后续命中）
+        match flashdir::scan::scan_directory(&root, false, std::sync::Arc::clone(&perf), Some(app.clone()))
+            .await
+        {
+            Ok(result) => {
+                idx.append_scan(drive, &result.items);
+                ok_drives.push(drive);
+                let _ = app.emit(
+                    "global-search-progress",
+                    serde_json::json!({ "drive": drive.to_string(), "scanned": result.items.len(), "phase": "ok" }),
+                );
+            }
+            Err(e) => {
+                let _ = app.emit(
+                    "global-search-progress",
+                    serde_json::json!({ "drive": drive.to_string(), "scanned": 0, "phase": format!("skipped: {e}") }),
+                );
+            }
+        }
+    }
+
+    idx.finish_building(&ok_drives);
+    let _ = app.emit(
+        "global-search-progress",
+        serde_json::json!({ "drive": "", "scanned": 0, "phase": "done" }),
+    );
+    Ok(())
+}
+
+/// 全局搜索：按文件名匹配，返回结果（索引未就绪时 ready=false）
+#[command]
+pub fn global_search(query: String, limit: Option<usize>) -> GlobalSearchResponse {
+    let idx = flashdir::global_search::instance();
+    let state = idx.state();
+    let ready = matches!(state, flashdir::global_search::IndexState::Ready(..));
+    let (results, index_size, sample_names) = if ready {
+        let r = idx.search_with_filter(&query, limit.unwrap_or(500));
+        let empty = r.is_empty() && !query.trim().is_empty();
+        let n = if empty { Some(idx.entries_len()) } else { None };
+        let sn = if empty { Some(idx.sample_names(5)) } else { None };
+        (r, n, sn)
+    } else {
+        (vec![], None, None)
+    };
+    GlobalSearchResponse { ready, state, results, index_size, sample_names }
+}
+
+/// 将主界面扫描结果追加到全局索引（复用已验证的 scan_dir 结果，
+/// 绕开 MFT 在异步上下文偶现的 name 解析异常。前端 scan 完成后自动调用）
+#[command]
+pub fn global_search_add_scan(
+    path: String,
+    items: Vec<flashdir::scan::Item>,
+) -> Result<(), String> {
+    flashdir::global_search::instance().add_items(&path, &items);
+    Ok(())
+}
+
+/// 刷新索引（全量重建，走 scan_directory 保证文件名正确）
+#[command]
+pub async fn global_search_refresh(app: tauri::AppHandle) -> Result<(), String> {
+    let idx = flashdir::global_search::instance();
+    idx.set_loading();
+
+    let drives = flashdir::global_search::list_ntfs_drives();
+    let perf = flashdir::perf::PerformanceMonitor::instance();
+    let mut ok_drives: Vec<char> = Vec::new();
+
+    for &drive in &drives {
+        let root = format!("{}:\\", drive);
+        if let Some(cached) = flashdir::scan::get_cached_items(&root) {
+            idx.append_scan(drive, &cached);
+            ok_drives.push(drive);
+            continue;
+        }
+        if let Some(lite_items) = flashdir::scan::scan_lite(&root) {
+            idx.append_scan(drive, &lite_items);
+            ok_drives.push(drive);
+            continue;
+        }
+        if let Ok(result) = flashdir::scan::scan_directory(
+            &root, false, std::sync::Arc::clone(&perf), Some(app.clone()),
+        )
+        .await
+        {
+            idx.append_scan(drive, &result.items);
+            ok_drives.push(drive);
+        }
+    }
+    idx.finish_building(&ok_drives);
+    Ok(())
 }
