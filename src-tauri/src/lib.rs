@@ -14,3 +14,4 @@ pub mod binary_protocol;
 pub mod fs;
 pub mod dev_analyzer;
 pub mod diff_engine;
+pub mod global_search;

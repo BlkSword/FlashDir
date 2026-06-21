@@ -5,6 +5,7 @@
     :width="660"
     :footer="null"
     :destroy-on-close="false"
+    :class="['global-search-modal', isDark ? 'dark-modal' : '']"
     @cancel="close"
   >
     <!-- 搜索框 -->
@@ -107,7 +108,8 @@ const emptyImage = Empty.PRESENTED_IMAGE_SIMPLE
 const lastNoResultMsg = ref('无匹配文件')
 
 const props = defineProps({
-  visible: { type: Boolean, default: false }
+  visible: { type: Boolean, default: false },
+  isDark: { type: Boolean, default: false }
 })
 const emit = defineEmits(['update:visible', 'open-dir'])
 
@@ -389,5 +391,45 @@ watch(
 }
 .footer-spacer {
   flex: 1;
+}
+
+/* Dark mode overrides */
+.global-search-modal.dark-modal .ant-modal-content,
+.global-search-modal.dark-modal .ant-modal-header {
+  background-color: #0f172a;
+  color: #e2e8f0;
+}
+.global-search-modal.dark-modal .ant-modal-title {
+  color: #e2e8f0;
+}
+.global-search-modal.dark-modal .ant-modal-close {
+  color: #94a3b8;
+}
+.global-search-modal.dark-modal .ant-input {
+  background-color: #1e293b;
+  border-color: #334155;
+  color: #e2e8f0;
+}
+.global-search-modal.dark-modal .ant-input::placeholder {
+  color: #64748b;
+}
+.global-search-modal.dark-modal .result-item {
+  border-bottom-color: #1e293b;
+}
+.global-search-modal.dark-modal .result-item:hover {
+  background-color: #1e293b;
+}
+.global-search-modal.dark-modal .result-path {
+  color: #64748b;
+}
+.global-search-modal.dark-modal .result-size,
+.global-search-modal.dark-modal .result-mtime {
+  color: #475569;
+}
+.global-search-modal.dark-modal .modal-footer {
+  border-top-color: #1e293b;
+}
+.global-search-modal.dark-modal .footer-meta {
+  color: #64748b;
 }
 </style>

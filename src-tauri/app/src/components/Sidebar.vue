@@ -1,194 +1,125 @@
 <template>
-  <div class="sidebar">
-    <div class="sidebar-header">文件夹</div>
-    <div class="sidebar-content">
-      <!-- 使用虚拟滚动优化大数据量树形组件 -->
-      <a-tree
-        v-model:selectedKeys="selectedKeys"
-        :tree-data="treeData"
-        :show-icon="true"
-        :show-line="true"
-        :height="treeHeight"
-        :virtual="true"
-        @select="handleSelect"
-      >
-        <template #icon="{ isLeaf }">
-          <FolderOutlined v-if="!isLeaf" />
-          <FileOutlined v-else />
-        </template>
-        <template #title="{ title, sizeFormatted }">
-          <span class="tree-node-title">
-            <span class="node-name">{{ title }}</span>
-            <span v-if="sizeFormatted" class="node-size">{{ sizeFormatted }}</span>
-          </span>
-        </template>
-      </a-tree>
+  <aside
+    class="shrink-0 flex flex-col border-r transition-all duration-200 overflow-hidden"
+    :class="[
+      isDark ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-300',
+      collapsed ? 'w-0 opacity-0' : 'w-64 opacity-100'
+    ]"
+  >
+    <div class="flex-1 overflow-y-auto">
+      <!-- Quick access -->
+      <div class="px-3 py-2">
+        <div
+          class="text-2xs font-semibold uppercase tracking-wider mb-1.5"
+          :class="isDark ? 'text-slate-500' : 'text-slate-500'"
+        >
+          快速访问
+        </div>
+        <nav class="space-y-0.5">
+          <button
+            v-for="item in quickAccess"
+            :key="item.action"
+            class="w-full flex items-center gap-2 px-2.5 py-1.5 rounded text-xs text-left transition-colors"
+            :class="isDark ? 'hover:bg-slate-800 text-slate-300' : 'hover:bg-slate-100 text-slate-700'"
+            @click="$emit('quick-access', item.action)"
+          >
+            <component :is="item.icon" class="w-4 h-4" :class="isDark ? 'text-slate-400' : 'text-slate-500'" />
+            <span class="truncate">{{ item.name }}</span>
+          </button>
+        </nav>
+      </div>
+
+      <!-- Directory tree -->
+      <div class="px-3 py-2 border-t" :class="isDark ? 'border-slate-700' : 'border-slate-200'">
+        <div
+          class="text-2xs font-semibold uppercase tracking-wider mb-1.5"
+          :class="isDark ? 'text-slate-500' : 'text-slate-500'"
+        >
+          目录树
+        </div>
+        <div v-if="!treeData.length" class="text-xs text-slate-400 px-2.5 py-2">
+          扫描后显示目录结构
+        </div>
+        <TreeNode
+          v-for="node in treeData"
+          :key="node.key"
+          :node="node"
+          :selected-path="selectedPath"
+          :is-dark="isDark"
+          @select="$emit('select', $event)"
+        />
+      </div>
+
+      <!-- History -->
+      <div class="px-3 py-2 border-t" :class="isDark ? 'border-slate-700' : 'border-slate-200'">
+        <div
+          class="text-2xs font-semibold uppercase tracking-wider mb-1.5"
+          :class="isDark ? 'text-slate-500' : 'text-slate-500'"
+        >
+          历史
+        </div>
+        <div v-if="!history.length" class="text-xs text-slate-400 px-2.5 py-2">
+          暂无历史记录
+        </div>
+        <div v-else class="space-y-0.5">
+          <button
+            v-for="(item, index) in history.slice(0, 10)"
+            :key="index"
+            class="w-full px-2.5 py-1.5 rounded text-xs text-left truncate transition-colors"
+            :class="isDark ? 'hover:bg-slate-800 text-slate-400' : 'hover:bg-slate-100 text-slate-600'"
+            :title="item.path"
+            @click="$emit('select', item.path)"
+          >
+            {{ item.path }}
+          </button>
+        </div>
+      </div>
     </div>
-  </div>
+  </aside>
 </template>
 
 <script setup>
-import { FolderOutlined, FileOutlined } from '@ant-design/icons-vue'
-import { ref, watch, onMounted, onUnmounted } from 'vue'
+import { h } from 'vue'
+import TreeNode from './TreeNode.vue'
 
 const props = defineProps({
-  treeData: {
-    type: Array,
-    default: () => []
-  },
-  selectedPath: {
-    type: String,
-    default: ''
-  }
+  treeData: { type: Array, default: () => [] },
+  selectedPath: { type: String, default: '' },
+  history: { type: Array, default: () => [] },
+  collapsed: { type: Boolean, default: false },
+  isDark: { type: Boolean, default: false },
 })
 
-const emit = defineEmits(['select'])
-
-const selectedKeys = ref([])
-const treeHeight = ref(600)
-
-// 动态计算树形组件高度
-const updateTreeHeight = () => {
-  const sidebarContent = document.querySelector('.sidebar-content')
-  if (sidebarContent) {
-    treeHeight.value = sidebarContent.clientHeight
-  }
+const ComputerIcon = {
+  render: () => h('svg', { class: 'w-4 h-4', fill: 'none', stroke: 'currentColor', viewBox: '0 0 24 24' }, [
+    h('path', { 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'stroke-width': '2', d: '9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z' })
+  ])
 }
 
-const handleSelect = (keys) => {
-  if (keys.length > 0) {
-    emit('select', keys[0])
-  }
+const HomeIcon = {
+  render: () => h('svg', { class: 'w-4 h-4', fill: 'none', stroke: 'currentColor', viewBox: '0 0 24 24' }, [
+    h('path', { 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'stroke-width': '2', d: 'M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6' })
+  ])
 }
 
-// 监听选中路径变化
-watch(() => props.selectedPath, (newVal) => {
-  if (newVal) {
-    selectedKeys.value = [newVal]
-  } else {
-    selectedKeys.value = []
-  }
-})
+const DownloadIcon = {
+  render: () => h('svg', { class: 'w-4 h-4', fill: 'none', stroke: 'currentColor', viewBox: '0 0 24 24' }, [
+    h('path', { 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'stroke-width': '2', d: '4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4' })
+  ])
+}
 
-// 监听 treeData 变化，更新高度
-watch(() => props.treeData, () => {
-  setTimeout(updateTreeHeight, 100)
-}, { flush: 'post' })
+const DesktopIcon = {
+  render: () => h('svg', { class: 'w-4 h-4', fill: 'none', stroke: 'currentColor', viewBox: '0 0 24 24' }, [
+    h('path', { 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'stroke-width': '2', d: '9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z' })
+  ])
+}
 
-// 窗口大小变化时更新高度
-let resizeObserver = null
+const quickAccess = [
+  { name: '此电脑', action: 'computer', icon: ComputerIcon },
+  { name: '用户目录', action: 'home', icon: HomeIcon },
+  { name: '下载', action: 'downloads', icon: DownloadIcon },
+  { name: '桌面', action: 'desktop', icon: DesktopIcon },
+]
 
-onMounted(() => {
-  updateTreeHeight()
-
-  // 使用 ResizeObserver 监听容器大小变化
-  if (window.ResizeObserver) {
-    const sidebarContent = document.querySelector('.sidebar-content')
-    if (sidebarContent) {
-      resizeObserver = new ResizeObserver(() => {
-        updateTreeHeight()
-      })
-      resizeObserver.observe(sidebarContent)
-    }
-  } else {
-    // 降级方案
-    window.addEventListener('resize', updateTreeHeight)
-  }
-})
-
-onUnmounted(() => {
-  if (resizeObserver) {
-    resizeObserver.disconnect()
-  } else {
-    window.removeEventListener('resize', updateTreeHeight)
-  }
-})
+defineEmits(['select', 'quick-access'])
 </script>
-
-<style scoped>
-.sidebar {
-  width: 300px;
-  background: #fafafa;
-  border-right: 1px solid #f0f0f0;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-  contain: strict;
-}
-
-.sidebar-header {
-  padding: 8px 12px;
-  font-size: 12px;
-  font-weight: 600;
-  color: #8c8c8c;
-  text-transform: uppercase;
-  border-bottom: 1px solid #f0f0f0;
-  contain: content;
-}
-
-.sidebar-content {
-  flex: 1;
-  overflow: hidden;
-  padding: 8px 0;
-  contain: content;
-  will-change: scroll-position;
-}
-
-/* 使用 :deep() 穿透 scoped 样式 */
-:deep(.ant-tree-node-content-wrapper) {
-  padding: 4px 8px;
-  display: flex;
-  align-items: center;
-  flex: 1;
-  min-width: 0;
-}
-
-:deep(.ant-tree-node-content-wrapper:hover) {
-  background: #f5f5f5;
-}
-
-:deep(.ant-tree-node-selected .ant-tree-node-content-wrapper) {
-  background: #e6f7ff;
-}
-
-:deep(.ant-tree-iconEle) {
-  flex-shrink: 0;
-  margin-right: 4px;
-}
-
-:deep(.ant-tree-title) {
-  flex: 1;
-  min-width: 0;
-  padding: 0;
-}
-
-.tree-node-title {
-  display: inline-flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  width: 100%;
-  min-width: 0;
-}
-
-.node-name {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
-}
-
-.node-size {
-  flex-shrink: 0;
-  font-size: 11px;
-  color: #999;
-  font-family: 'Consolas', 'Monaco', monospace;
-  text-align: right;
-  min-width: 50px;
-}
-
-:deep(.ant-tree-node-selected .node-size) {
-  color: #1890ff;
-}
-</style>

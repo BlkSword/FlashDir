@@ -92,14 +92,28 @@ const updateStats = () => {
       color: colors[index % colors.length]
     }))
 
-  // Top 5 项目
-  topItems.value = [...props.items]
-    .sort((a, b) => (b.size || 0) - (a.size || 0))
-    .slice(0, 5)
-    .map(item => ({
-      ...item,
-      name: item.name.length > 30 ? item.name.substring(0, 30) + '...' : item.name
-    }))
+  // Top 5 项目：线性扫描维护一个长度为 5 的有序数组，避免复制整个数组 + 全量 O(n log n) 排序
+  const top5 = []
+  for (const item of props.items) {
+    if (top5.length < 5) {
+      top5.push(item)
+      if (top5.length === 5) {
+        top5.sort((a, b) => (b.size || 0) - (a.size || 0))
+      }
+    } else if ((item.size || 0) > (top5[4].size || 0)) {
+      top5[4] = item
+      // 上浮到正确位置
+      let i = 4
+      while (i > 0 && (top5[i].size || 0) > (top5[i - 1].size || 0)) {
+        const tmp = top5[i]; top5[i] = top5[i - 1]; top5[i - 1] = tmp
+        i--
+      }
+    }
+  }
+  topItems.value = top5.map(item => ({
+    ...item,
+    name: item.name.length > 30 ? item.name.substring(0, 30) + '...' : item.name
+  }))
 }
 
 // 创建或更新环形图

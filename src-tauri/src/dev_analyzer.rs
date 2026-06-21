@@ -9,6 +9,8 @@
 // - 每个文件/目录只归入一个最匹配的类别
 
 use serde::Serialize;
+use rayon::prelude::*;
+use std::collections::HashMap;
 use crate::scan::Item;
 
 // ─── 开发类别定义 ──────────────────────────────────────────
@@ -302,21 +304,51 @@ pub struct DevAnalysisResult {
 // ─── 分析引擎 ────────────────────────────────────────────
 
 /// 对扫描结果进行开发者磁盘分析
+///
+/// 去重原则（匹配边界顶层）:
+/// 后端已把每个目录的 size 聚合为其所有后代文件大小之和。因此若把"目录"和"它的
+/// 子项"同时累加，同一字节会被算多遍——例如 node_modules 目录聚合值 + 其下每个文件。
+/// 正确做法：一个 item 计入类别 c，当且仅当它匹配 c **且**其父目录不匹配同一类别 c。
+/// 这样每个"匹配区域"只在其最顶层被计一次，大小恰好等于真实占用，杜绝重复计算。
 pub fn analyze(items: &[Item], total_size: i64, total_items: usize) -> DevAnalysisResult {
+    // 第一遍（Rayon 并行）：为每个 item 计算它匹配的类别索引（取第一个匹配）
+    let matches: Vec<Option<usize>> = items
+        .par_iter()
+        .map(|item| KNOWN_PATTERNS.iter().position(|p| matches_pattern(item, p)))
+        .collect();
+
+    // 建立"匹配目录的 path → 类别索引"索引（仅目录；父查询用，文件不可能是父路径）
+    let matched_dir: HashMap<&str, usize> = items
+        .iter()
+        .zip(matches.iter())
+        .filter_map(|(item, m)| {
+            if item.is_dir {
+                m.map(|idx| (item.path.as_str(), idx))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     // 为每个已知模式初始化累加器
     let mut accumulators: Vec<CategoryAccumulator> = KNOWN_PATTERNS
         .iter()
-        .map(|p| CategoryAccumulator::new(p))
+        .map(CategoryAccumulator::new)
         .collect();
 
-    // 分类：每个 item 归入第一个匹配的类别
-    for item in items {
-        for (idx, pattern) in KNOWN_PATTERNS.iter().enumerate() {
-            if matches_pattern(item, pattern) {
-                accumulators[idx].add(item);
-                break; // 一个 item 只归入一个类别
-            }
+    // 第二遍：只累加"匹配边界顶层"项（父目录不匹配同一类别）
+    for (i, item) in items.iter().enumerate() {
+        let Some(idx) = matches[i] else { continue };
+        let path = item.path.as_str();
+        let parent = match path.rfind('/') {
+            Some(pos) => &path[..pos],
+            None => "",
+        };
+        // 父目录匹配同一类别 → 已被祖先包含，跳过，避免重复累加聚合 size
+        if matched_dir.get(parent) == Some(&idx) {
+            continue;
         }
+        accumulators[idx].add(item);
     }
 
     // 计算开发者类别总大小
@@ -484,5 +516,76 @@ impl CategoryAccumulator {
             percent_of_total,
             top_items: self.top_items,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::CompactString;
+
+    fn item(path: &str, name: &str, size: i64, is_dir: bool) -> Item {
+        Item {
+            path: CompactString::from(path),
+            name: CompactString::from(name),
+            size,
+            size_formatted: CompactString::new(),
+            is_dir,
+        }
+    }
+
+    #[test]
+    fn dedup_dir_aggregation_no_double_count() {
+        // node_modules 目录聚合 size=100；其下 react 目录聚合=100；react/index.js=100。
+        // 旧实现三者都累加得 300（虚高 3 倍），正确值应为 100（只计顶层 node_modules）。
+        let items = vec![
+            item("p/node_modules", "node_modules", 100, true),
+            item("p/node_modules/react", "react", 100, true),
+            item("p/node_modules/react/index.js", "index.js", 100, false),
+        ];
+        let result = analyze(&items, 100, 3);
+        let node = result
+            .categories
+            .iter()
+            .find(|c| c.category == "node")
+            .unwrap();
+        assert_eq!(node.total_size, 100, "node_modules 不应重复累加子项");
+        assert_eq!(node.item_count, 1, "只计顶层 node_modules");
+    }
+
+    #[test]
+    fn distinct_top_dirs_counted_separately() {
+        // 两个独立的 node_modules 应分别计入，总和=各自聚合
+        let items = vec![
+            item("a/node_modules", "node_modules", 200, true),
+            item("b/node_modules", "node_modules", 300, true),
+        ];
+        let result = analyze(&items, 500, 2);
+        let node = result
+            .categories
+            .iter()
+            .find(|c| c.category == "node")
+            .unwrap();
+        assert_eq!(node.total_size, 500);
+        assert_eq!(node.item_count, 2);
+    }
+
+    #[test]
+    fn nested_node_modules_deduped() {
+        // proj/node_modules/proj2/node_modules：内层应被外层 node_modules 包含 → 跳过。
+        // 注意中间目录 proj2 也匹配（路径含 /node_modules/），需在 items 中才能正确去重。
+        let items = vec![
+            item("proj/node_modules", "node_modules", 400, true),
+            item("proj/node_modules/proj2", "proj2", 250, true),
+            item("proj/node_modules/proj2/node_modules", "node_modules", 150, true),
+        ];
+        let result = analyze(&items, 400, 3);
+        let node = result
+            .categories
+            .iter()
+            .find(|c| c.category == "node")
+            .unwrap();
+        assert_eq!(node.total_size, 400, "内层 node_modules 应被外层包含，不重复计入");
+        assert_eq!(node.item_count, 1);
     }
 }

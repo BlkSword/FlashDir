@@ -252,10 +252,15 @@ async fn main() {
     let total_start = Instant::now();
     let perf_monitor = PerformanceMonitor::instance();
 
+    // no_mft 强制禁用 MFT 快速路径，回退到目录遍历
+    if args.no_mft {
+        scan::set_disable_mft(true);
+    }
+
     // 调用扫描引擎（不使用 app_handle = 无流式事件）
     let result = match scan::scan_directory(
         &args.path,
-        args.no_cache || args.no_mft, // no_mft 会 force_refresh + 绕开 MFT
+        args.no_cache || args.no_mft, // no_mft 同时会强制刷新缓存
         perf_monitor,
         None, // CLI 不需要流式事件
     )

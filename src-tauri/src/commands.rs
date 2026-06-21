@@ -289,10 +289,63 @@ pub struct SystemInfo {
     pub os_version: String,
 }
 
+/// 使用系统默认程序打开文件或目录
+#[command]
+pub async fn open_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    use tauri_plugin_shell::ShellExt;
+
+    let target = if path.starts_with("//?/") {
+        // 将 canonicalize 风格路径转换回普通 Windows 路径
+        path[4..].replace('/', "\\")
+    } else {
+        path.replace('/', "\\")
+    };
+
+    app.shell()
+        .open(&target, None)
+        .map_err(|e| format!("无法打开路径: {}", e))
+}
+
+/// 判断路径是否为目录
+#[command]
+pub async fn is_directory(path: String) -> Result<bool, String> {
+    let p = if path.starts_with("//?/") {
+        PathBuf::from(&path[4..].replace('/', "\\"))
+    } else {
+        PathBuf::from(&path.replace('/', "\\"))
+    };
+
+    match fs::metadata(&p).await {
+        Ok(m) => Ok(m.is_dir()),
+        Err(e) => Err(format!("无法访问路径: {}", e)),
+    }
+}
+
+/// 检测当前进程是否以管理员/提升权限运行
+#[command]
+pub fn is_admin() -> bool {
+    flashdir::fs::is_admin()
+}
+
 /// 检测 MFT 直接扫描是否可用（Windows 管理员权限）
 #[command]
 pub fn check_mft_available(path: String) -> bool {
     flashdir::fs::check_mft_available(&path)
+}
+
+/// 获取当前扫描环境状态（管理员 + 指定路径 MFT 可用性）
+#[command]
+pub fn get_scan_status(path: String) -> ScanStatus {
+    ScanStatus {
+        is_admin: flashdir::fs::is_admin(),
+        mft_available: flashdir::fs::check_mft_available(&path),
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanStatus {
+    pub is_admin: bool,
+    pub mft_available: bool,
 }
 
 /// 以管理员权限重启应用
@@ -327,6 +380,7 @@ pub fn save_snapshot(
         total_size_formatted: flashdir::scan::CompactString::from(total_size_formatted.as_str()),
         scan_time: 0.0,
         path: flashdir::scan::CompactString::from(path.as_str()),
+        mft_available: false,
         timing: None,
         perf_metrics: None,
     };

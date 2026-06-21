@@ -41,6 +41,7 @@ windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_System_IO",
     "Win32_Security",
+    "Win32_System_Threading",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
@@ -50,8 +51,10 @@ default = []
 windows_fast_io = []
 
 [profile.release]
-lto = "fat"
-codegen-units = 1
+# 使用 thin LTO：速度接近 fat（90%+），但链接速度提升 5-10 倍
+lto = "thin"
+# 并行代码生成单元：充分利用多核，大幅缩短编译时间
+codegen-units = 16
 opt-level = 3
 strip = true
 panic = "abort"

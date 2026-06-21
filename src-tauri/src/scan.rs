@@ -16,8 +16,20 @@ use tokio::fs;
 
 use crate::perf::PerformanceMonitor;
 use crate::disk_cache::DiskCache;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub type CompactString = SmartString<smartstring::Compact>;
+
+/// 测试/诊断开关：强制禁用 MFT 快速路径，回退到目录遍历。
+static DISABLE_MFT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_disable_mft(disable: bool) {
+    DISABLE_MFT.store(disable, Ordering::Relaxed);
+}
+
+fn is_mft_disabled() -> bool {
+    DISABLE_MFT.load(Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +60,7 @@ pub struct ScanResult {
     pub total_size_formatted: CompactString,
     pub scan_time: f64,
     pub path: CompactString,
+    pub mft_available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timing: Option<TimingInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,6 +91,7 @@ pub struct ArcScanResult {
     pub total_size_formatted: Arc<str>,
     pub scan_time: f64,
     pub path: Arc<str>,
+    pub mft_available: bool,
     pub timing: Option<TimingInfo>,
 }
 
@@ -89,6 +103,7 @@ impl From<ArcScanResult> for ScanResult {
             total_size_formatted: CompactString::from(result.total_size_formatted.as_ref()),
             scan_time: result.scan_time,
             path: CompactString::from(result.path.as_ref()),
+            mft_available: result.mft_available,
             timing: result.timing,
             perf_metrics: None,
         }
@@ -103,6 +118,7 @@ impl From<&ArcScanResult> for ScanResult {
             total_size_formatted: CompactString::from(result.total_size_formatted.as_ref()),
             scan_time: result.scan_time,
             path: CompactString::from(result.path.as_ref()),
+            mft_available: result.mft_available,
             timing: result.timing.clone(),
             perf_metrics: None,
         }
@@ -175,6 +191,7 @@ impl ScanCache {
             total_size_formatted: Arc::from(result.total_size_formatted.as_str()),
             scan_time: result.scan_time,
             path: Arc::from(result.path.as_str()),
+            mft_available: result.mft_available,
             timing: result.timing,
         };
 
@@ -377,10 +394,17 @@ pub async fn scan_directory(
     if !force_refresh {
         let cache_check_start = std::time::Instant::now();
         if let Some(cached) = SCAN_CACHE.get(&root_dir) {
-            if cached.dir_mtime >= mtime_datetime {
+            // 如果缓存来自目录遍历，但当前进程是管理员且 MFT 可用，
+            // 则放弃缓存并重新扫描，以升级到 MFT 快速路径。
+            let can_upgrade_to_mft = !cached.result.mft_available
+                && cfg!(target_os = "windows")
+                && crate::fs::is_admin()
+                && crate::fs::check_mft_available(&root_dir);
+
+            if cached.dir_mtime >= mtime_datetime && !can_upgrade_to_mft {
                 let cache_read_time = cache_check_start.elapsed().as_millis() as u64;
                 perf_monitor.record_cache_hit(cache_read_time);
-                
+
                 let mut result = ScanResult::from(&cached.result);
                 result.scan_time = 0.0;
                 result.perf_metrics = Some(ScanPerfMetrics {
@@ -396,39 +420,56 @@ pub async fn scan_directory(
                     cache_hit: true,
                     cache_source: Some("memory".to_string()),
                 });
-                
+
                 perf_monitor.end_scan();
                 return Ok(result);
+            } else if can_upgrade_to_mft {
+                eprintln!(
+                    "[Scan] 管理员+MFT 可用，放弃旧缓存并重新扫描以启用 MFT: {}",
+                    root_dir
+                );
             }
         }
 
         // 2. 检查磁盘缓存
         let disk_cache = DiskCache::instance();
         if let Some(cached_result) = disk_cache.get(&root_dir, mtime_timestamp) {
-            let cache_read_time = cache_check_start.elapsed().as_millis() as u64;
-            perf_monitor.record_cache_hit(cache_read_time);
-            
-            // 同时写入内存缓存
-            SCAN_CACHE.insert(root_dir.clone(), cached_result.clone());
-            
-            let mut result = cached_result;
-            result.scan_time = 0.0;
-            result.perf_metrics = Some(ScanPerfMetrics {
-                io_phase_ms: 0,
-                compute_phase_ms: 0,
-                serialize_phase_ms: 0,
-                cache_read_time_ms: cache_read_time,
-                files_scanned: result.items.len(),
-                dirs_scanned: result.items.iter().filter(|i| i.is_dir).count(),
-                io_throughput_mbps: 0.0,
-                memory_peak_mb: 0.0,
-                threads_used: 0,
-                cache_hit: true,
-                cache_source: Some("disk".to_string()),
-            });
-            
-            perf_monitor.end_scan();
-            return Ok(result);
+            let can_upgrade_to_mft = !cached_result.mft_available
+                && cfg!(target_os = "windows")
+                && crate::fs::is_admin()
+                && crate::fs::check_mft_available(&root_dir);
+
+            if !can_upgrade_to_mft {
+                let cache_read_time = cache_check_start.elapsed().as_millis() as u64;
+                perf_monitor.record_cache_hit(cache_read_time);
+
+                // 同时写入内存缓存
+                SCAN_CACHE.insert(root_dir.clone(), cached_result.clone());
+
+                let mut result = cached_result;
+                result.scan_time = 0.0;
+                result.perf_metrics = Some(ScanPerfMetrics {
+                    io_phase_ms: 0,
+                    compute_phase_ms: 0,
+                    serialize_phase_ms: 0,
+                    cache_read_time_ms: cache_read_time,
+                    files_scanned: result.items.len(),
+                    dirs_scanned: result.items.iter().filter(|i| i.is_dir).count(),
+                    io_throughput_mbps: 0.0,
+                    memory_peak_mb: 0.0,
+                    threads_used: 0,
+                    cache_hit: true,
+                    cache_source: Some("disk".to_string()),
+                });
+
+                perf_monitor.end_scan();
+                return Ok(result);
+            } else {
+                eprintln!(
+                    "[Scan] 管理员+MFT 可用，放弃磁盘缓存并重新扫描以启用 MFT: {}",
+                    root_dir
+                );
+            }
         }
     }
 
@@ -488,6 +529,7 @@ pub async fn scan_directory(
         total_size_formatted: format_size(output.total_size),
         scan_time,
         path: CompactString::from(path),
+        mft_available: output.mft_available,
         timing: Some(output.timing.clone()),
         perf_metrics: Some(ScanPerfMetrics {
             io_phase_ms: (output.timing.scan_phase * 1000.0) as u64,
@@ -521,17 +563,25 @@ struct ScanOutput {
     throughput_mbps: f64,
     memory_peak_mb: f64,
     threads_used: usize,
+    mft_available: bool,
 }
 
 /// 从绝对路径中提取盘符和 MFT volume-relative 前缀。
 /// MFT 返回的路径不带盘符（如 `Users/xxx/Documents/file.txt`），而 canonical path
-/// 是完整路径（如 `C:/Users/xxx`）。本函数返回盘符与 volume-relative 前缀，
-/// 例如 `C:/Users/xxx` -> `('C', "Users/xxx/")`，`C:/` -> `('C', "")`。
+/// 是完整路径（如 `C:/Users/xxx` 或 `//?/C:/Users/xxx`）。本函数返回盘符与
+/// volume-relative 前缀，例如 `C:/Users/xxx` -> `('C', "users/xxx/")`，`C:/` -> `('C', "")`。
 fn drive_and_vol_prefix(abs_path: &str) -> Option<(char, String)> {
     let normalized = abs_path.replace('\\', "/");
-    if normalized.len() >= 2 && normalized.as_bytes().get(1) == Some(&b':') {
-        let drive = normalized.as_bytes()[0] as char;
-        let rest = normalized[2..].trim_start_matches('/');
+    // 处理 canonicalize 产生的 \\?\C:\ 前缀（标准化后为 //?/C:/）
+    let trimmed = if normalized.starts_with("//?/") {
+        &normalized[4..]
+    } else {
+        normalized.as_str()
+    };
+
+    if trimmed.len() >= 2 && trimmed.as_bytes().get(1) == Some(&b':') {
+        let drive = trimmed.as_bytes()[0] as char;
+        let rest = trimmed[2..].trim_start_matches('/');
         let prefix = if rest.is_empty() {
             String::new()
         } else {
@@ -562,6 +612,10 @@ fn mft_path_to_abs(drive: char, vol_relative_path: &str) -> CompactString {
 /// 供全局搜索索引构建使用。与 try_mft_scan_path 使用相同的 canonicalize 预处理，
 /// 但跳过聚合/format/sort，失败返回 None，调用者应回退到完整 scan_directory。
 pub fn scan_lite(path: &str) -> Option<Vec<Item>> {
+    if is_mft_disabled() {
+        return None;
+    }
+
     let canonical = std::fs::canonicalize(path).ok()?;
     let root_path_str = normalize_path_separator(canonical.as_os_str());
     let mft_result = crate::fs::try_mft_scan(&root_path_str)?;
@@ -571,8 +625,8 @@ pub fn scan_lite(path: &str) -> Option<Vec<Item>> {
         .files
         .into_iter()
         .filter(|f| {
-            let path_lower = f.path.to_lowercase();
-            vol_prefix.is_empty() || path_lower.starts_with(&vol_prefix)
+            let p = f.path.to_lowercase();
+            vol_prefix.is_empty() || p.starts_with(&vol_prefix)
         })
         .map(|f| Item {
             path: mft_path_to_abs(drive, &f.path),
@@ -595,6 +649,10 @@ fn try_mft_scan_path(
     perf_monitor: &Arc<PerformanceMonitor>,
     app_handle: Option<&Arc<tauri::AppHandle>>,
 ) -> Option<ScanOutput> {
+    if is_mft_disabled() {
+        return None;
+    }
+
     let root_path_str = canonical_path.to_string_lossy().to_string();
     let (drive, vol_prefix) = drive_and_vol_prefix(&root_path_str)?;
 
@@ -614,8 +672,8 @@ fn try_mft_scan_path(
         .files
         .into_iter()
         .filter(|f| {
-            let path_lower = f.path.to_lowercase();
-            normalized_root.is_empty() || path_lower.starts_with(&normalized_root)
+            let p = f.path.to_lowercase();
+            normalized_root.is_empty() || p.starts_with(&normalized_root)
         })
         .map(|f| Item {
             path: mft_path_to_abs(drive, &f.path),
@@ -733,6 +791,7 @@ fn try_mft_scan_path(
         throughput_mbps,
         memory_peak_mb,
         threads_used: 1, // MFT 扫描是单线程顺序读取
+        mft_available: true,
     })
 }
 
@@ -1160,6 +1219,7 @@ fn try_usn_incremental_update(
         total_size_formatted: format_size(actual_total_size),
         scan_time: 0.0, // USN 增量更新视为即时
         path: CompactString::from(root_dir),
+        mft_available: false, // USN 增量更新路径不直接依赖 MFT 直读能力标志
         timing: Some(TimingInfo {
             scan_phase: 0.0,
             compute_phase: 0.0,
@@ -1230,7 +1290,6 @@ fn scan_directory_optimized_v4(
             let dir_sender = dir_sender.clone();
             let dir_receiver = dir_receiver.clone();
             let item_sender = item_sender.clone();
-            let root_path = root_path.to_path_buf();
             let app_handle_for_worker = app_handle.clone();
 
             s.spawn(move |_| {
@@ -1263,11 +1322,7 @@ fn scan_directory_optimized_v4(
                                 continue;
                             }
 
-                            let rel_path = match entry.path.strip_prefix(&root_path) {
-                                Ok(p) => normalize_path_separator_compact(p.as_os_str()),
-                                Err(_) => continue,
-                            };
-
+                            let abs_path = normalize_path_separator_compact(entry.path.as_os_str());
                             let size = entry.size as i64;
 
                             if entry.is_dir {
@@ -1275,7 +1330,7 @@ fn scan_directory_optimized_v4(
                             }
 
                             let _ = item_sender.send(ItemInternal {
-                                path: rel_path.clone(),
+                                path: abs_path.clone(),
                                 name: CompactString::from(entry.name.as_str()),
                                 size,
                                 is_dir: entry.is_dir,
@@ -1284,7 +1339,7 @@ fn scan_directory_optimized_v4(
                             // 渐进式流式传输
                             if let Some(app) = app_handle_for_worker.as_ref() {
                                 stream_batch.push(Item {
-                                    path: rel_path,
+                                    path: abs_path,
                                     name: CompactString::from(entry.name),
                                     size,
                                     size_formatted: format_size(size),
@@ -1425,6 +1480,7 @@ fn scan_directory_optimized_v4(
         throughput_mbps,
         memory_peak_mb,
         threads_used: num_threads,
+        mft_available: false,
     })
 }
 
@@ -1436,22 +1492,33 @@ struct ItemInternal {
 }
 
 #[inline]
+/// 去掉 Windows canonicalize 产生的 \\?\ 或 //?/ 前缀，并统一使用正斜杠。
+fn strip_unc_prefix(s: &str) -> &str {
+    if s.starts_with("\\\\?\\") || s.starts_with("//?/") {
+        &s[4..]
+    } else {
+        s
+    }
+}
+
 fn normalize_path_separator(path: &std::ffi::OsStr) -> String {
     let s = path.to_string_lossy();
-    if s.contains('\\') {
-        s.replace('\\', "/")
+    let stripped = strip_unc_prefix(&s);
+    if stripped.contains('\\') {
+        stripped.replace('\\', "/")
     } else {
-        s.into_owned()
+        stripped.to_string()
     }
 }
 
 #[inline]
 fn normalize_path_separator_compact(path: &std::ffi::OsStr) -> CompactString {
     let s = path.to_string_lossy();
-    if s.contains('\\') {
-        CompactString::from(s.replace('\\', "/"))
+    let stripped = strip_unc_prefix(&s);
+    if stripped.contains('\\') {
+        CompactString::from(stripped.replace('\\', "/"))
     } else {
-        CompactString::from(s.as_ref())
+        CompactString::from(stripped)
     }
 }
 
@@ -1464,6 +1531,8 @@ mod tests {
         assert_eq!(drive_and_vol_prefix("C:/Users/xxx"), Some(('C', "users/xxx/".to_string())));
         assert_eq!(drive_and_vol_prefix("C:/"), Some(('C', String::new())));
         assert_eq!(drive_and_vol_prefix("C:\\Users\\xxx"), Some(('C', "users/xxx/".to_string())));
+        assert_eq!(drive_and_vol_prefix("//?/C:/Users/xxx"), Some(('C', "users/xxx/".to_string())));
+        assert_eq!(drive_and_vol_prefix("\\\\?\\C:\\Users\\xxx"), Some(('C', "users/xxx/".to_string())));
         assert_eq!(drive_and_vol_prefix("/home/xxx"), None);
     }
 

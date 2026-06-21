@@ -1,6 +1,6 @@
 <template>
   <div class="dev-panel" v-if="hasData">
-    <div class="dev-panel-header">🛠️ 开发者分析</div>
+    <div class="dev-panel-header">开发者分析</div>
     <div class="dev-panel-content">
       <!-- 概览卡片 -->
       <div class="dev-summary" v-if="devData">
@@ -88,6 +88,10 @@ const props = defineProps({
   totalSize: {
     type: Number,
     default: 0
+  },
+  currentPath: {
+    type: String,
+    default: ''
   }
 })
 
@@ -125,26 +129,21 @@ const getColor = (category) => {
 }
 
 const analyze = async () => {
-  if (!invoke) return
+  const fingerprint = `${props.currentPath}|${props.items.length}`
+  if (fingerprint === lastDataFingerprint.value) return
 
-  const fingerprint = `${props.items.length}-${props.totalSize}`
-  if (fingerprint === lastDataFingerprint.value && devData.value) {
+  if (!props.currentPath || !props.items || props.items.length === 0) {
+    devData.value = null
+    lastDataFingerprint.value = ''
     return
   }
   lastDataFingerprint.value = fingerprint
 
-  if (!props.items || props.items.length === 0) {
-    devData.value = null
-    return
-  }
-
   try {
-    const result = await invoke('analyze_dev_disk', {
-      items: props.items,
-      totalSize: props.totalSize,
-      totalItems: props.items.length
-    })
-    devData.value = result
+    // 后端从内存缓存读取 items 并用 Rayon 分析（已按"匹配边界顶层"去重），
+    // 前端不再传百万级 items，也不在主线程做 O(n) 路径匹配
+    const result = await invoke('analyze_dev_disk', { path: props.currentPath })
+    devData.value = result || null
   } catch (error) {
     console.error('开发者分析失败:', error)
     devData.value = null
@@ -153,9 +152,9 @@ const analyze = async () => {
 
 const debouncedAnalyze = debounce(analyze, 300)
 
-watch(() => [props.items, props.totalSize], () => {
+watch(() => [props.items.length, props.currentPath], () => {
   debouncedAnalyze()
-}, { deep: false })
+})
 
 // 初始分析
 analyze()

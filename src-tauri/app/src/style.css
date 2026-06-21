@@ -1,26 +1,28 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
 }
 
-body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-  background-color: #ffffff;
-  color: #000000;
+html, body, #app {
+  height: 100%;
   overflow: hidden;
 }
 
-#app {
-  height: 100vh;
-  display: flex;
-  flex-direction: column;
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
 }
 
 /* 滚动条样式 */
 ::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
 }
 
 ::-webkit-scrollbar-track {
@@ -28,12 +30,23 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #bfbfbf;
-  border-radius: 5px;
-  border: 2px solid transparent;
-  background-clip: padding-box;
+  background: #cbd5e1;
+  border-radius: 4px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #999;
+  background: #94a3b8;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+  background: #475569;
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+/* 暗色模式基础 */
+.dark {
+  color-scheme: dark;
 }

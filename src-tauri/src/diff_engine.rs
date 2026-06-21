@@ -5,7 +5,7 @@
 
 use serde::Serialize;
 use std::collections::HashMap;
-use crate::scan::{Item, CompactString, format_size};
+use crate::scan::{Item, format_size};
 
 /// 差异结果
 #[derive(Debug, Clone, Serialize)]

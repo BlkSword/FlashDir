@@ -16,7 +16,7 @@
 //   - 文件实际大小 (real_size)
 //   - 文件属性 (可判断是否为目录)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::mem;
 use std::path::PathBuf;
@@ -34,6 +34,25 @@ use windows_sys::Win32::System::IO::DeviceIoControl;
 
 /// FSCTL_GET_NTFS_VOLUME_DATA = CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 25, METHOD_BUFFERED, FILE_ANY_ACCESS)
 const FSCTL_GET_NTFS_VOLUME_DATA: u32 = 0x00090064;
+
+/// FSCTL_GET_NTFS_FILE_RECORD = CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 26, METHOD_BUFFERED, FILE_ANY_ACCESS)
+const FSCTL_GET_NTFS_FILE_RECORD: u32 = 0x00090068;
+
+/// NTFS_FILE_RECORD_INPUT_BUFFER
+#[repr(C)]
+struct NtfsFileRecordInputBuffer {
+    file_reference_number: i64,
+}
+
+/// NTFS_FILE_RECORD_OUTPUT_BUFFER（头部，实际缓冲区紧随其后）
+/// C 结构布局：LARGE_INTEGER(8) + DWORD(4) + BYTE[1]，FileRecordBuffer 偏移为 12。
+#[repr(C)]
+struct NtfsFileRecordOutputBufferHeader {
+    file_reference_number: i64,
+    file_record_length: u32,
+}
+
+const FILE_RECORD_OUT_HEADER_SIZE: usize = 12;
 
 /// NTFS_VOLUME_DATA_BUFFER 结构体
 #[repr(C)]
@@ -249,73 +268,168 @@ impl MftScanner {
         })
     }
 
-    /// 顺序读取所有 $MFT FILE 记录，解析 $FILE_NAME 属性
+    /// 读取 $MFT 自身的 $DATA 属性 data runs，返回 [(start_lcn, cluster_count)]。
+    /// $MFT 文件记录号是 0，通过 FSCTL_GET_NTFS_FILE_RECORD 读取可正确处理 MFT 碎片。
+    fn read_mft_data_runs(&self) -> io::Result<Vec<(u64, u64)>> {
+        let record_size = self.mft_record_size as usize;
+        let out_buffer_size = FILE_RECORD_OUT_HEADER_SIZE + record_size + 64;
+        let mut out_buffer: Vec<u8> = vec![0u8; out_buffer_size];
+
+        let input = NtfsFileRecordInputBuffer {
+            file_reference_number: 0,
+        };
+
+        let mut bytes_returned: u32 = 0;
+        let success = unsafe {
+            DeviceIoControl(
+                self.volume_handle,
+                FSCTL_GET_NTFS_FILE_RECORD,
+                &input as *const _ as *const _,
+                mem::size_of::<NtfsFileRecordInputBuffer>() as u32,
+                out_buffer.as_mut_ptr() as *mut _,
+                out_buffer.len() as u32,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if success == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "读取 $MFT 文件记录失败: {}",
+                    unsafe { GetLastError() }
+                ),
+            ));
+        }
+
+        if bytes_returned < mem::size_of::<NtfsFileRecordOutputBufferHeader>() as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "$MFT 文件记录输出缓冲区过小",
+            ));
+        }
+
+        let header = unsafe {
+            &*(out_buffer.as_ptr() as *const NtfsFileRecordOutputBufferHeader)
+        };
+        let record_len = header.file_record_length as usize;
+        if record_len == 0 || record_len > out_buffer.len() - FILE_RECORD_OUT_HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("$MFT 文件记录长度无效: len={}, out_len={}", record_len, out_buffer.len()),
+            ));
+        }
+
+        let record_data_start = FILE_RECORD_OUT_HEADER_SIZE;
+        let mut record_buffer = out_buffer[record_data_start..record_data_start + record_len].to_vec();
+        apply_mft_fixup(&mut record_buffer);
+
+        // 遍历属性，找到 $DATA (0x80) 非驻留属性
+        let first_attr_offset = u16_from_le(&record_buffer[0x14..0x16]) as usize;
+        let mut attr_offset = first_attr_offset;
+        loop {
+            if attr_offset + 16 > record_buffer.len() {
+                break;
+            }
+
+            let attr_type = u32_from_le(&record_buffer[attr_offset..attr_offset + 4]);
+            if attr_type == ATTR_END {
+                break;
+            }
+
+            let attr_length = u32_from_le(&record_buffer[attr_offset + 4..attr_offset + 8]) as usize;
+            if attr_length < 16 || attr_length == 0 || attr_offset + attr_length > record_buffer.len() {
+                break;
+            }
+
+            let non_resident = record_buffer[attr_offset + 8];
+
+            if attr_type == ATTR_DATA && non_resident != 0 {
+                let mapping_pairs_offset = u16_from_le(&record_buffer[attr_offset + 0x20..attr_offset + 0x22]) as usize;
+                let runs_start = attr_offset + mapping_pairs_offset;
+                if runs_start >= record_buffer.len() {
+                    break;
+                }
+                return Ok(parse_data_runs(&record_buffer[runs_start..attr_offset + attr_length]));
+            }
+
+            attr_offset += attr_length;
+        }
+
+        // 如果 $MFT 极小（理论上不可能），data runs 解析失败，回退到连续读取
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "无法解析 $MFT 的 $DATA data runs",
+        ))
+    }
+
+    /// 读取所有 $MFT FILE 记录，解析 $FILE_NAME 属性。
+    /// 使用 $MFT 自身的 $DATA data runs 处理 MFT 碎片，确保不遗漏记录。
     fn read_all_records(&self) -> io::Result<MftIndex> {
         let record_size = self.mft_record_size as usize;
-        // MFT 中有一些预留区域（前 16-24 条是系统记录，后面的才是用户文件）
-        // 实际记录数 = mft_valid_size / record_size
         let max_records = (self.mft_valid_size as usize) / record_size;
         let mut index: MftIndex = HashMap::with_capacity(max_records);
+
+        // 获取 $MFT 的 data runs（碎片位置）
+        let data_runs = self.read_mft_data_runs()?;
 
         // 分配读取缓冲区：一次读 256 条记录（256KB）
         let batch_records = 256usize;
         let batch_size = batch_records * record_size;
         let mut buffer: Vec<u8> = vec![0u8; batch_size];
 
-        let mut total_bytes_read = 0u64;
-        let chunk_start = self.mft_start_offset;
+        let mut global_record_index: u64 = 0;
+        let bytes_per_cluster = self.bytes_per_cluster;
 
         unsafe {
-            for batch_start in (0..max_records).step_by(batch_records) {
-                let records_in_batch = (max_records - batch_start).min(batch_records);
-                let read_size = records_in_batch * record_size;
+            for (start_lcn, cluster_count) in data_runs {
+                let fragment_start_offset = start_lcn * bytes_per_cluster;
+                let fragment_size = cluster_count * bytes_per_cluster;
+                let records_in_fragment = (fragment_size / record_size as u64) as usize;
 
-                // Seek 到对应 MFT 位置
-                let seek_offset = chunk_start + (batch_start * record_size) as u64;
-                let mut distance_to_move: i64 = seek_offset as i64;
-                let result = SetFilePointerEx(
-                    self.volume_handle,
-                    seek_offset as i64,
-                    &mut distance_to_move,
-                    0, // FILE_BEGIN
-                );
+                for fragment_batch_start in (0..records_in_fragment).step_by(batch_records) {
+                    let records_in_batch = (records_in_fragment - fragment_batch_start).min(batch_records);
+                    let read_size = records_in_batch * record_size;
 
-                if result == 0 {
-                    // Seek 失败，跳过这一批
-                    continue;
-                }
+                    let seek_offset = fragment_start_offset + (fragment_batch_start * record_size) as u64;
+                    let mut distance_to_move: i64 = seek_offset as i64;
+                    let result = SetFilePointerEx(
+                        self.volume_handle,
+                        seek_offset as i64,
+                        &mut distance_to_move,
+                        0, // FILE_BEGIN
+                    );
 
-                // 读取一批 MFT 记录
-                let mut bytes_read: u32 = 0;
-                let result = ReadFile(
-                    self.volume_handle,
-                    buffer.as_mut_ptr() as *mut _,
-                    read_size as u32,
-                    &mut bytes_read,
-                    std::ptr::null_mut(),
-                );
-
-                if result == 0 || bytes_read == 0 {
-                    // 读取失败或 EOF
-                    if total_bytes_read >= self.mft_valid_size {
-                        break;
+                    if result == 0 {
+                        continue;
                     }
-                    continue;
-                }
 
-                total_bytes_read += bytes_read as u64;
+                    let mut bytes_read: u32 = 0;
+                    let result = ReadFile(
+                        self.volume_handle,
+                        buffer.as_mut_ptr() as *mut _,
+                        read_size as u32,
+                        &mut bytes_read,
+                        std::ptr::null_mut(),
+                    );
 
-                // 解析这一批中的每一条记录
-                for i in 0..records_in_batch {
-                    let record_offset = i * record_size;
-                    if record_offset + record_size > bytes_read as usize {
-                        break;
+                    if result == 0 || bytes_read == 0 {
+                        continue;
                     }
-                    let record_data = &buffer[record_offset..record_offset + record_size];
 
-                    if let Some(entry) = parse_mft_record(record_data, batch_start + i) {
-                        let frn = (batch_start + i) as u64; // 简化：用记录号作为 FRN
-                        index.insert(frn, entry);
+                    for i in 0..records_in_batch {
+                        let record_offset = i * record_size;
+                        if record_offset + record_size > bytes_read as usize {
+                            break;
+                        }
+                        let record_data = &mut buffer[record_offset..record_offset + record_size];
+                        apply_mft_fixup(record_data);
+
+                        if let Some(entry) = parse_mft_record(record_data, global_record_index as usize) {
+                            index.insert(global_record_index, entry);
+                        }
+                        global_record_index += 1;
                     }
                 }
             }
@@ -325,6 +439,7 @@ impl MftScanner {
     }
 
     /// 构建完整路径（优化版：先建树，再 DFS）
+    /// 产生的路径为 volume-relative，如 "Users/xxx/Documents"，不带盘符，也不带根目录前缀。
     pub(crate) fn build_path_hierarchy(index: &MftIndex) -> Vec<MftFileInfo> {
         // 第一步：构建 parent_frn → children 的映射
         let mut children_map: HashMap<u64, Vec<u64>> = HashMap::new();
@@ -335,10 +450,17 @@ impl MftScanner {
                 .push(frn);
         }
 
-        // 第二步：从根目录 (FRN=5) 开始 DFS
+        // 第二步：从根目录 (FRN=5) 的直接子项开始 DFS，current_path 为空。
+        // 这样可以得到 "Users/xxx" 而不是 "./Users/xxx" 或 "/Users/xxx"。
         let mut files = Vec::with_capacity(index.len());
+        let mut visited = HashSet::new();
         let root_frn = 5u64;
-        Self::dfs_resolve(root_frn, String::new(), index, &children_map, &mut files);
+        visited.insert(root_frn);
+        if let Some(children) = children_map.get(&root_frn) {
+            for &child_frn in children {
+                Self::dfs_resolve(child_frn, String::new(), index, &children_map, &mut files, &mut visited, 0);
+            }
+        }
         files
     }
 
@@ -348,7 +470,18 @@ impl MftScanner {
         index: &MftIndex,
         children_map: &HashMap<u64, Vec<u64>>,
         files: &mut Vec<MftFileInfo>,
+        visited: &mut HashSet<u64>,
+        depth: usize,
     ) {
+        const MAX_DEPTH: usize = 128;
+        if depth > MAX_DEPTH {
+            return;
+        }
+        // 防止 MFT 父链中的环导致重复遍历
+        if !visited.insert(frn) {
+            return;
+        }
+
         if let Some(entry) = index.get(&frn) {
             let full_path = if current_path.is_empty() {
                 entry.name.clone()
@@ -364,20 +497,20 @@ impl MftScanner {
                 is_dir: entry.is_dir,
             });
 
-            // 递归处理子节点
-            if let Some(children) = children_map.get(&frn) {
-                for &child_frn in children {
-                    Self::dfs_resolve(
-                        child_frn,
-                        if entry.is_dir {
-                            full_path.clone()
-                        } else {
-                            current_path.clone()
-                        },
-                        index,
-                        children_map,
-                        files,
-                    );
+            // 只有目录才递归处理子节点，避免循环/栈溢出
+            if entry.is_dir {
+                if let Some(children) = children_map.get(&frn) {
+                    for &child_frn in children {
+                        Self::dfs_resolve(
+                            child_frn,
+                            full_path.clone(),
+                            index,
+                            children_map,
+                            files,
+                            visited,
+                            depth + 1,
+                        );
+                    }
                 }
             }
         }
@@ -433,7 +566,8 @@ impl MftScanner {
             }
         }
 
-        // 解析记录
+        // 应用 fixup 后解析记录
+        apply_mft_fixup(&mut buffer);
         Ok(parse_mft_record_info(&buffer, frn))
     }
 
@@ -504,6 +638,7 @@ fn parse_mft_record_info(data: &[u8], frn: u64) -> Option<MftRecordInfo> {
     }
 
     let mut attr_offset = first_attr_offset;
+    let mut best_info: Option<MftRecordInfo> = None;
     loop {
         if attr_offset + 16 > data.len() {
             break;
@@ -531,35 +666,56 @@ fn parse_mft_record_info(data: &[u8], frn: u64) -> Option<MftRecordInfo> {
             let fn_end = fn_start + content_size;
 
             if fn_end > data.len() || content_size < 0x42 {
-                break;
+                attr_offset += attr_length;
+                if attr_offset >= data.len() {
+                    break;
+                }
+                continue;
             }
 
             let fn_data = &data[fn_start..fn_end];
 
-            let parent_frn = u64_from_le(&fn_data[FN_PARENT_FRN..FN_PARENT_FRN + 8]);
+            let parent_frn = u64_from_le(&fn_data[FN_PARENT_FRN..FN_PARENT_FRN + 8]) & 0x0000FFFFFFFFFFFF;
             let real_size = u64_from_le(&fn_data[FN_REAL_SIZE..FN_REAL_SIZE + 8]);
             let name_len = fn_data[FN_NAME_LENGTH] as usize;
             let name_start = FN_NAME_START;
             let name_end = name_start + name_len * 2;
 
             if name_end > content_size {
-                break;
+                attr_offset += attr_length;
+                if attr_offset >= data.len() {
+                    break;
+                }
+                continue;
             }
 
             let name = read_utf16le(&fn_data[name_start..name_end]);
+            let name_type = fn_data[FN_NAME_NAMESPACE];
 
-            return Some(MftRecordInfo {
+            let info = MftRecordInfo {
                 name,
                 parent_frn,
                 is_dir,
                 real_size,
-            });
+            };
+
+            if name_type == 1 || name_type == 3 {
+                return Some(info);
+            }
+
+            if best_info.is_none() {
+                best_info = Some(info);
+            }
         }
 
         attr_offset += attr_length;
         if attr_offset >= data.len() {
             break;
         }
+    }
+
+    if let Some(info) = best_info {
+        return Some(info);
     }
 
     // 有记录但未找到 $FILE_NAME —— 返回一个占位名称
@@ -601,8 +757,12 @@ fn parse_mft_record(data: &[u8], record_index: usize) -> Option<MftEntry> {
         return None;
     }
 
-    // 遍历属性，找到 $FILE_NAME (0x30)
+    // 遍历属性，提取 $FILE_NAME（优先 Win32 长名）和未命名 $DATA 大小。
+    // 某些文件（如 Chrome Code Cache）的 $FILE_NAME.RealSize 为 0，需要从 $DATA 读取真实大小。
     let mut attr_offset = first_attr_offset;
+    let mut best_entry: Option<MftEntry> = None;
+    let mut data_size: u64 = 0;
+
     loop {
         if attr_offset + 16 > data.len() {
             break;
@@ -619,6 +779,7 @@ fn parse_mft_record(data: &[u8], record_index: usize) -> Option<MftEntry> {
         }
 
         let non_resident = data[attr_offset + 8];
+        let attr_name_len = data[attr_offset + 9] as usize;
 
         if attr_type == ATTR_FILE_NAME && non_resident == 0 {
             // 解析 resident $FILE_NAME 属性
@@ -628,40 +789,56 @@ fn parse_mft_record(data: &[u8], record_index: usize) -> Option<MftEntry> {
             let fn_start = attr_offset + content_offset;
             let fn_end = fn_start + content_size;
 
-            if fn_end > data.len() || content_size < 0x42 {
-                break;
+            if fn_end <= data.len() && content_size >= 0x42 {
+                let fn_data = &data[fn_start..fn_end];
+
+                // 提取父 FRN（只取低 48 位记录号，去掉高 16 位序列号）
+                let parent_frn = u64_from_le(&fn_data[FN_PARENT_FRN..FN_PARENT_FRN + 8]) & 0x0000FFFFFFFFFFFF;
+
+                // 提取实际文件大小
+                let real_size = u64_from_le(&fn_data[FN_REAL_SIZE..FN_REAL_SIZE + 8]);
+
+                // 提取文件属性标志
+                let file_attrs = u32_from_le(&fn_data[FN_FLAGS..FN_FLAGS + 4]);
+                let is_reparse = (file_attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+                // 提取文件名
+                let name_len = fn_data[FN_NAME_LENGTH] as usize;
+                let name_start = FN_NAME_START;
+                let name_end = name_start + name_len * 2; // UTF-16LE
+
+                if name_end <= content_size {
+                    let name = read_utf16le(&fn_data[name_start..name_end]);
+                    let name_type = fn_data[FN_NAME_NAMESPACE];
+
+                    let entry = MftEntry {
+                        name,
+                        parent_frn,
+                        real_size,
+                        is_dir,
+                        is_reparse,
+                    };
+
+                    // 1 = Win32, 3 = Win32 + DOS；这两个都是长名，优先使用
+                    if name_type == 1 || name_type == 3 {
+                        best_entry = Some(entry);
+                    } else if best_entry.is_none() {
+                        best_entry = Some(entry);
+                    }
+                }
             }
-
-            let fn_data = &data[fn_start..fn_end];
-
-            // 提取父 FRN
-            let parent_frn = u64_from_le(&fn_data[FN_PARENT_FRN..FN_PARENT_FRN + 8]);
-
-            // 提取实际文件大小
-            let real_size = u64_from_le(&fn_data[FN_REAL_SIZE..FN_REAL_SIZE + 8]);
-
-            // 提取文件属性标志
-            let file_attrs = u32_from_le(&fn_data[FN_FLAGS..FN_FLAGS + 4]);
-            let is_reparse = (file_attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-
-            // 提取文件名
-            let name_len = fn_data[FN_NAME_LENGTH] as usize;
-            let name_start = FN_NAME_START;
-            let name_end = name_start + name_len * 2; // UTF-16LE
-
-            if name_end > content_size {
-                break;
+        } else if attr_type == ATTR_DATA && attr_name_len == 0 {
+            // 未命名 $DATA 属性：从中读取文件真实大小
+            let size = if non_resident == 0 {
+                // resident $DATA：content length 就是文件大小
+                u32_from_le(&data[attr_offset + 0x10..attr_offset + 0x14]) as u64
+            } else {
+                // non-resident $DATA：DataSize 在属性头 0x30 偏移处
+                u64_from_le(&data[attr_offset + 0x30..attr_offset + 0x38])
+            };
+            if size > data_size {
+                data_size = size;
             }
-
-            let name = read_utf16le(&fn_data[name_start..name_end]);
-
-            return Some(MftEntry {
-                name,
-                parent_frn,
-                real_size,
-                is_dir,
-                is_reparse,
-            });
         }
 
         // 移动到下一个属性
@@ -671,12 +848,19 @@ fn parse_mft_record(data: &[u8], record_index: usize) -> Option<MftEntry> {
         }
     }
 
+    if let Some(mut entry) = best_entry {
+        if data_size > entry.real_size {
+            entry.real_size = data_size;
+        }
+        return Some(entry);
+    }
+
     // $FILE_NAME 未找到但有记录（可能是系统文件/元数据文件），返回最小信息
     if flags & MFT_RECORD_IN_USE != 0 {
         return Some(MftEntry {
             name: format!("<record_{}>", record_index),
             parent_frn: 5, // 挂到根目录
-            real_size: 0,
+            real_size: data_size,
             is_dir,
             is_reparse: false,
         });
@@ -705,6 +889,63 @@ fn u64_from_le(data: &[u8]) -> u64 {
     ])
 }
 
+/// 解析 NTFS data run 列表。
+/// data 指向 $DATA 属性的 mapping pairs 区域，以 0x00 结束。
+/// 返回 [(start_lcn, cluster_count)]，start_lcn 已转换为绝对 LCN。
+fn parse_data_runs(data: &[u8]) -> Vec<(u64, u64)> {
+    let mut runs = Vec::new();
+    let mut pos = 0usize;
+    let mut last_lcn: i64 = 0;
+
+    loop {
+        if pos >= data.len() {
+            break;
+        }
+        let header = data[pos];
+        if header == 0 {
+            break;
+        }
+
+        let count_len = (header & 0x0F) as usize;
+        let lcn_len = ((header >> 4) & 0x0F) as usize;
+        pos += 1;
+
+        if count_len == 0 || pos + count_len + lcn_len > data.len() {
+            break;
+        }
+
+        let count = read_signed_or_unsigned(&data[pos..pos + count_len], false) as u64;
+        pos += count_len;
+
+        let lcn_delta = if lcn_len > 0 {
+            read_signed_or_unsigned(&data[pos..pos + lcn_len], true) as i64
+        } else {
+            0i64
+        };
+        pos += lcn_len;
+
+        last_lcn += lcn_delta;
+        runs.push((last_lcn as u64, count));
+    }
+
+    runs
+}
+
+/// 读取小端整数，可选有符号。
+fn read_signed_or_unsigned(data: &[u8], signed: bool) -> i64 {
+    let mut buf = [0u8; 8];
+    buf[..data.len()].copy_from_slice(data);
+    let val = u64::from_le_bytes(buf);
+
+    if !signed {
+        return val as i64;
+    }
+
+    // 符号扩展
+    let shift = (8 - data.len()) * 8;
+    ((val << shift) as i64) >> shift
+}
+
 /// 从 UTF-16LE 字节读取字符串
 fn read_utf16le(data: &[u8]) -> String {
     let u16_slice: Vec<u16> = data
@@ -714,7 +955,91 @@ fn read_utf16le(data: &[u8]) -> String {
     String::from_utf16_lossy(&u16_slice)
 }
 
+/// 应用 MFT 记录 fixup（update sequence）。
+/// NTFS 将每个 512 字节扇区最后 2 字节替换为 fixup signature；
+/// 本函数从记录头读取 fixup array 并恢复原始值。返回 false 表示校验失败。
+fn apply_mft_fixup(data: &mut [u8]) -> bool {
+    if data.len() < 0x34 {
+        return false;
+    }
+
+    let update_sequence_offset = u16_from_le(&data[0x04..0x06]) as usize;
+    let update_sequence_count = u16_from_le(&data[0x06..0x08]) as usize;
+
+    if update_sequence_offset < 0x30
+        || update_sequence_offset + update_sequence_count * 2 > data.len()
+        || update_sequence_count == 0
+    {
+        return false;
+    }
+
+    let signature = u16_from_le(&data[update_sequence_offset..update_sequence_offset + 2]);
+    let sectors = update_sequence_count.saturating_sub(1);
+    if sectors == 0 {
+        return true;
+    }
+
+    let sector_size = 512usize;
+    for i in 0..sectors {
+        let pos = (i + 1) * sector_size - 2;
+        if pos + 2 > data.len() {
+            return false;
+        }
+        let current = u16_from_le(&data[pos..pos + 2]);
+        if current != signature {
+            // fixup signature 不匹配，记录可能损坏；但仍尝试恢复
+            return false;
+        }
+        let original_offset = update_sequence_offset + 2 + i * 2;
+        let original = u16_from_le(&data[original_offset..original_offset + 2]);
+        data[pos..pos + 2].copy_from_slice(&original.to_le_bytes());
+    }
+
+    true
+}
+
 // ─── 公共接口 ──────────────────────────────────────────────
+
+/// 检测当前进程是否以管理员/提升权限运行（Windows）
+#[cfg(target_os = "windows")]
+pub fn is_admin() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: isize = INVALID_HANDLE_VALUE;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+
+        let mut elevation: TOKEN_ELEVATION = std::mem::zeroed();
+        let mut return_length: u32 = 0;
+        let buffer_size = std::mem::size_of::<TOKEN_ELEVATION>() as u32;
+
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut _ as *mut _,
+            buffer_size,
+            &mut return_length,
+        );
+
+        CloseHandle(token);
+
+        if ok == 0 {
+            return false;
+        }
+
+        elevation.TokenIsElevated != 0
+    }
+}
+
+/// 非 Windows 平台始终返回 false
+#[cfg(not(target_os = "windows"))]
+pub fn is_admin() -> bool {
+    false
+}
 
 /// 快速检测 MFT 扫描是否可用（仅尝试打开卷，不读取数据）
 pub fn check_mft_available(path: &str) -> bool {
@@ -820,16 +1145,25 @@ pub fn try_mft_scan(root_path: &str) -> Option<MftScanResult> {
 }
 
 /// 从路径中提取盘符，如 "C:\Users" → 'C'
+/// 从路径中提取盘符，如 "C:\\Users" -> 'C'，支持 canonicalize 产生的 \\?\ 前缀。
 pub(crate) fn extract_drive_letter(path: &str) -> Option<char> {
     let path = path.trim();
-    if path.len() >= 2 {
-        let bytes = path.as_bytes();
+    let normalized = path.replace('\\', "/");
+    // 处理 canonicalize 产生的 \\?\C:\ 前缀（标准化后为 //?/C:/）
+    let trimmed = if normalized.starts_with("//?/") {
+        &normalized[4..]
+    } else {
+        normalized.as_str()
+    };
+
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
         if bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
             return Some(bytes[0] as char);
         }
     }
     // 尝试解析为绝对路径
-    let pb = PathBuf::from(path);
+    let pb = PathBuf::from(trimmed);
     if let Some(ancestor) = pb.ancestors().last() {
         if let Some(s) = ancestor.to_str() {
             let bytes = s.as_bytes();

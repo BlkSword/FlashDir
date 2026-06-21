@@ -161,6 +161,9 @@ watch(() => props.items, (newItems) => {
 
 // ─── Squarified Treemap 算法 ──────────────────────────────
 
+// 性能限制：超过此阈值的 items 只展示 Top N，避免 squarify O(n²) 卡死
+const MAX_TREEMAP_ITEMS = 2000
+
 const render = () => {
   if (!canvasRef.value || !canvasWrapperRef.value) return
 
@@ -178,15 +181,23 @@ const render = () => {
   ctx.scale(dpr, dpr)
   ctx.clearRect(0, 0, rect.width, rect.height)
 
-  const items = currentItems.value
-  if (items.length === 0) return
+  const allItems = currentItems.value
+  if (allItems.length === 0) return
 
-  // 构建布局数据
-  const layoutItems = items.map((item, idx) => ({
+  // 构建目录索引（加速后续点击钻入）
+  buildDirIndex(allItems)
+
+  // 构建布局数据 — 超过阈值时只取 Top N 最大的（小文件在 treemap 中不可见）
+  let sourceItems = allItems
+  if (allItems.length > MAX_TREEMAP_ITEMS) {
+    sourceItems = [...allItems].sort((a, b) => (b.size || 0) - (a.size || 0)).slice(0, MAX_TREEMAP_ITEMS)
+  }
+
+  const layoutItems = sourceItems.map((item, idx) => ({
     idx,
     name: item.name,
     path: item.path,
-    size: item.size || 1, // 最小 1 避免除零
+    size: item.size || 1,
     isDir: item.isDir,
     color: item.isDir ? '#d9d9d9' : getExtColor(item.name)
   }))
@@ -196,7 +207,7 @@ const render = () => {
 
   // Recursive squarified treemap
   layoutCache = []
-  squarify(layoutItems, 0, 0, rect.width, rect.height, ctx)
+  fastSquarify(layoutItems, 0, 0, rect.width, rect.height, ctx)
 
   // 绘制标签
   for (const cell of layoutCache) {
@@ -204,103 +215,40 @@ const render = () => {
   }
 }
 
-const squarify = (items, x, y, w, h, ctx) => {
-  if (items.length === 0) return
-  if (items.length === 1) {
-    layoutAndDraw(items, x, y, w, h, ctx)
-    return
-  }
+// O(n) treemap 布局：简单切片算法，水平/垂直交替分割
+const fastSquarify = (items, x, y, w, h, ctx, depth) => {
+  if (items.length === 0 || w <= 1 || h <= 1) return
+  depth = depth || 0
 
-  const total = items.reduce((s, i) => s + i.size, 0)
+  // 计算总大小
+  let total = 0
+  for (let i = 0; i < items.length; i++) total += items[i].size
   if (total === 0) return
 
-  // 用最短边策略：保持较好的长宽比
-  const area = w * h
-  let row = []
-  let rowArea = 0
-  let bestAspect = Infinity
-  let bestSplit = 0
+  const horizontal = (depth % 2 === 0) // 偶数层水平切，奇数层垂直切
+
+  let pos = horizontal ? x : y
+  const size = horizontal ? w : h
+  let remainingTotal = total
 
   for (let i = 0; i < items.length; i++) {
-    const itemArea = (items[i].size / total) * area
-    const testRow = [...row, items[i]]
-    const testRowArea = rowArea + itemArea
-    const aspect = worstAspectRatio(testRow, testRowArea, w, h)
-    if (aspect < bestAspect) {
-      bestAspect = aspect
-      row = testRow
-      rowArea = testRowArea
-      bestSplit = i
-    }
-  }
+    const item = items[i]
+    const frac = item.size / remainingTotal
+    const itemSize = Math.max(1, size * frac)
 
-  // 如果加起来还没到合理比例，继续加
-  if (bestSplit < items.length - 1 && bestAspect > 4) {
-    row = items
-    rowArea = area
-  }
-
-  // 布局当前行
-  const remaining = items.slice(row.length)
-  if (w >= h) {
-    const rowWidth = rowArea / h
-    layoutAndDrawSlice(row, x, y, rowWidth, h, true, ctx)
-    if (remaining.length > 0) {
-      squarify(remaining, x + rowWidth, y, w - rowWidth, h, ctx)
-    }
-  } else {
-    const rowHeight = rowArea / w
-    layoutAndDrawSlice(row, x, y, w, rowHeight, false, ctx)
-    if (remaining.length > 0) {
-      squarify(remaining, x, y + rowHeight, w, h - rowHeight, ctx)
-    }
-  }
-}
-
-const worstAspectRatio = (items, totalArea, w, h) => {
-  const side = totalArea / Math.min(w, h)
-  let worst = 0
-  for (const item of items) {
-    const area = (item.size / items.reduce((s, i) => s + i.size, 0)) * totalArea
-    const aspect = Math.max(side * side / area, area / (side * side))
-    worst = Math.max(worst, aspect)
-  }
-  return worst
-}
-
-const layoutAndDraw = (items, x, y, w, h, ctx) => {
-  const total = items.reduce((s, i) => s + i.size, 0)
-  if (total === 0) return
-
-  const isVertical = w >= h
-  let pos = isVertical ? x : y
-
-  for (const item of items) {
-    const frac = item.size / total
-    let cellW, cellH
-    if (isVertical) {
-      cellW = w * frac
-      cellH = h
+    let cell
+    if (horizontal) {
+      cell = { x: pos, y, w: itemSize, h, item }
     } else {
-      cellW = w
-      cellH = h * frac
+      cell = { x, y: pos, w, h: itemSize, item }
     }
 
-    const cell = {
-      x: isVertical ? pos : x,
-      y: isVertical ? y : pos,
-      w: cellW,
-      h: cellH,
-      item
-    }
     layoutCache.push(cell)
     drawCell(ctx, cell)
-    pos += isVertical ? cellW : cellH
-  }
-}
 
-const layoutAndDrawSlice = (items, x, y, w, h, isVertical, ctx) => {
-  layoutAndDraw(items, x, y, w, h, ctx)
+    pos += itemSize
+    remainingTotal -= item.size
+  }
 }
 
 const drawCell = (ctx, cell) => {
@@ -381,7 +329,7 @@ const handleMouseMove = (e) => {
       visible: true,
       x: e.clientX - rect.left + 12,
       y: e.clientY - rect.top + 12,
-      name: item.isDir ? `📁 ${item.name}` : `📄 ${item.name}`,
+      name: item.isDir ? `[DIR] ${item.name}` : `[FILE] ${item.name}`,
       size: formatSize(item.size)
     }
   } else {
@@ -393,6 +341,20 @@ const handleMouseLeave = () => {
   tooltip.value.visible = false
 }
 
+// 按父目录路径索引 items，加速钻入操作
+let dirIndex = new Map()
+
+const buildDirIndex = (items) => {
+  dirIndex.clear()
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]
+    const lastSlash = item.path.lastIndexOf('/')
+    const parent = lastSlash > 0 ? item.path.substring(0, lastSlash) : ''
+    if (!dirIndex.has(parent)) dirIndex.set(parent, [])
+    dirIndex.get(parent).push(item)
+  }
+}
+
 const handleClick = (e) => {
   if (!canvasRef.value) return
   const rect = canvasRef.value.getBoundingClientRect()
@@ -402,14 +364,11 @@ const handleClick = (e) => {
   const cell = findCellAtPos(mx, my)
   if (!cell || !cell.item.isDir) return
 
-  // 钻入目录
+  // 钻入目录 — 使用预建索引 O(1) 查找子项
   const dirPath = cell.item.path
-  const dirItems = currentItems.value.filter(item =>
-    item.path.startsWith(dirPath + '/') && item.path !== dirPath
-  )
+  const dirItems = dirIndex.get(dirPath) || []
 
   if (dirItems.length === 0) {
-    // 空目录，不钻入
     return
   }
 

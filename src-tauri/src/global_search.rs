@@ -74,7 +74,7 @@ pub struct GlobalIndex {
 }
 
 impl GlobalIndex {
-    fn new() -> Self {
+    fn new(load_persisted: bool) -> Self {
         let index = GlobalIndex {
             entries: RwLock::new(HashMap::new()),
             name_index: RwLock::new(HashMap::new()),
@@ -83,13 +83,15 @@ impl GlobalIndex {
         };
 
         // 尝试从 SQLite 磁盘缓存恢复持久化索引，实现“启动即用”
-        if let Ok(entries) = crate::disk_cache::DiskCache::instance().load_global_index() {
-            if !entries.is_empty() {
-                eprintln!("[GlobalIndex] 从磁盘恢复 {} 条索引", entries.len());
-                for entry in entries {
-                    index.upsert_internal(entry);
+        if load_persisted {
+            if let Ok(entries) = crate::disk_cache::DiskCache::instance().load_global_index() {
+                if !entries.is_empty() {
+                    eprintln!("[GlobalIndex] 从磁盘恢复 {} 条索引", entries.len());
+                    for entry in entries {
+                        index.upsert_internal(entry);
+                    }
+                    index.update_ready_state();
                 }
-                index.update_ready_state();
             }
         }
 
@@ -786,11 +788,17 @@ pub(crate) fn normalize_abs_path(drive: char, path: &str) -> String {
 }
 
 lazy_static::lazy_static! {
-    static ref GLOBAL_INDEX: GlobalIndex = GlobalIndex::new();
+    static ref GLOBAL_INDEX: GlobalIndex = GlobalIndex::new(true);
 }
 
 pub fn instance() -> &'static GlobalIndex {
     &GLOBAL_INDEX
+}
+
+/// 创建一个不加载磁盘持久化索引的空实例，仅用于测试。
+#[cfg(test)]
+pub fn empty_instance_for_test() -> GlobalIndex {
+    GlobalIndex::new(false)
 }
 
 // ─── NTFS 盘枚举 ──────────────────────────────────────────
@@ -911,7 +919,7 @@ mod tests {
 
     #[test]
     fn test_global_index_upsert_and_search() {
-        let idx = GlobalIndex::new();
+        let idx = empty_instance_for_test();
         idx.upsert(IndexEntry {
             path: "C:/a.txt".to_string(),
             name: "a.txt".to_string(),

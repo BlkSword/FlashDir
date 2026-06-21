@@ -1,6 +1,6 @@
 <template>
   <div class="snapshot-panel">
-    <div class="snapshot-panel-header">📸 快照对比</div>
+    <div class="snapshot-panel-header">快照对比</div>
     <div class="snapshot-panel-content">
       <!-- 操作区 -->
       <div class="snapshot-actions">
@@ -11,14 +11,14 @@
           :disabled="!props.items || props.items.length === 0"
           @click="handleSaveSnapshot"
         >
-          💾 保存当前快照
+          保存当前快照
         </a-button>
         <a-button
           size="small"
           :disabled="snapshots.length < 2"
           @click="handleQuickCompare"
         >
-          ⚡ 对比最近两次
+          对比最近两次
         </a-button>
       </div>
 
@@ -42,7 +42,9 @@
               class="snapshot-checkbox"
               :class="{ checked: selectedIds.includes(snap.id) }"
             >
-              <span v-if="selectedIds.includes(snap.id)">✓</span>
+              <svg v-if="selectedIds.includes(snap.id)" class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" />
+              </svg>
             </div>
           </div>
           <div class="snapshot-info">
@@ -130,7 +132,7 @@
               class="diff-item"
             >
               <span class="diff-item-name" :title="item.path">
-                {{ item.isDir ? '📁' : '📄' }} {{ item.name.length > 40 ? item.name.substring(0, 40) + '...' : item.name }}
+                {{ item.isDir ? '[DIR]' : '[FILE]' }} {{ item.name.length > 40 ? item.name.substring(0, 40) + '...' : item.name }}
               </span>
               <span class="diff-item-size diff-grow-text">{{ item.sizeFormatted }}</span>
             </div>
@@ -152,7 +154,7 @@
               class="diff-item"
             >
               <span class="diff-item-name" :title="item.path">
-                {{ item.isDir ? '📁' : '📄' }} {{ item.name.length > 40 ? item.name.substring(0, 40) + '...' : item.name }}
+                {{ item.isDir ? '[DIR]' : '[FILE]' }} {{ item.name.length > 40 ? item.name.substring(0, 40) + '...' : item.name }}
               </span>
               <span class="diff-item-size diff-shrink-text">{{ item.sizeFormatted }}</span>
             </div>
@@ -174,7 +176,7 @@
               class="diff-item"
             >
               <span class="diff-item-name" :title="item.path">
-                {{ item.isDir ? '📁' : '📄' }} {{ item.name.length > 35 ? item.name.substring(0, 35) + '...' : item.name }}
+                {{ item.isDir ? '[DIR]' : '[FILE]' }} {{ item.name.length > 35 ? item.name.substring(0, 35) + '...' : item.name }}
               </span>
               <span class="diff-item-delta" :class="item.delta >= 0 ? 'diff-grow-text' : 'diff-shrink-text'">
                 {{ item.deltaFormatted }}

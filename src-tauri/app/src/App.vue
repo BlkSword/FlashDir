@@ -1,79 +1,62 @@
 <template>
-  <div class="app-container">
+  <a-config-provider :theme="antTheme">
+    <div class="h-screen flex flex-col overflow-hidden" :class="isDark ? 'bg-slate-950 text-slate-200' : 'bg-slate-100 text-slate-800'">
     <Toolbar
       :path="currentPath"
       :can-go-back="canGoBack"
       :can-go-forward="canGoForward"
       :can-go-up="canGoUp"
       :loading="loading"
+      :filter-keyword="searchKeyword"
+      :is-dark="isDark"
       @scan="handleScan"
       @browse="handleBrowse"
       @navigate="handleNavigate"
       @show-history="historyVisible = true"
       @search="handleSearchInput"
+      @open-global-search="globalSearchVisible = true"
+      @toggle-sidebar="sidebarCollapsed = !sidebarCollapsed"
+      @toggle-theme="toggleTheme"
     />
 
-    <div class="main-container">
+    <div class="flex-1 flex min-h-0">
       <Sidebar
         :tree-data="treeData"
         :selected-path="currentPath"
+        :history="history"
+        :collapsed="sidebarCollapsed"
+        :is-dark="isDark"
         @select="handleSelectPath"
+        @quick-access="handleQuickAccess"
       />
 
-      <div class="content-area">
+      <main class="flex-1 flex min-w-0" :class="isDark ? 'bg-slate-900' : 'bg-white'">
         <FileList
           :items="displayItems"
           :loading="loading || sortWorker.isProcessing.value"
+          :total-size="totalSize"
+          :current-path="currentPath"
           :sort-config="sortConfig"
+          :current-page="currentPage"
+          :page-size="pageSize"
+          :total-items="filteredTotalItems"
+          :is-dark="isDark"
           @sort="handleSort"
           @select="handleSelectItem"
+          @page-change="handlePageChange"
+          @size-change="handleSizeChange"
         />
 
-        <div class="pagination-wrapper">
-          <a-pagination
-            :current="currentPage"
-            :page-size="pageSize"
-            :total="filteredTotalItems"
-            :show-size-changer="true"
-            :show-quick-jumper="true"
-            :page-size-options="['50', '100', '200', '500', '1000']"
-            size="small"
-            show-total
-            @change="handlePageChange"
-            @showSizeChange="handleSizeChange"
-          />
-        </div>
-      </div>
-
-      <div class="right-panel">
-        <a-tabs v-model:activeKey="rightPanelTab" size="small" class="panel-tabs">
-          <a-tab-pane key="charts" tab="📊 统计">
-            <Charts
-              :items="allItems"
-              :total-size="totalSize"
-            />
-          </a-tab-pane>
-          <a-tab-pane key="dev" tab="🛠️ 开发者">
-            <DevAnalyzer
-              :items="allItems"
-              :total-size="totalSize"
-            />
-          </a-tab-pane>
-          <a-tab-pane key="snapshots" tab="📸 快照">
-            <SnapshotCompare
-              :items="allItems"
-              :total-size="totalSize"
-              :current-path="currentPath"
-            />
-          </a-tab-pane>
-          <a-tab-pane key="treemap" tab="🗺️ 热图">
-            <Treemap
-              :items="allItems"
-              :total-size="totalSize"
-            />
-          </a-tab-pane>
-        </a-tabs>
-      </div>
+        <RightPanel
+          :items="allItems"
+          :total-size="totalSize"
+          :current-path="currentPath"
+          :active-tab="rightPanelTab"
+          :scan-time="scanTime"
+          :is-dark="isDark"
+          @update:active-tab="rightPanelTab = $event"
+        />
+      </main>
     </div>
 
     <StatusBar
@@ -82,6 +65,10 @@
       :total-size="totalSize"
       :scan-time="scanTime"
       :backend-time="backendTime"
+      :loading="loading"
+      :mft-available="mftAvailable"
+      :is-admin="isAdmin"
+      :is-dark="isDark"
     />
 
     <a-modal
@@ -89,6 +76,7 @@
       title="历史记录"
       width="800px"
       :footer="null"
+      :class="isDark ? 'dark-modal' : ''"
       @cancel="historyVisible = false"
     >
       <HistoryList
@@ -97,29 +85,42 @@
         @clear="handleClearHistory"
       />
     </a-modal>
-  </div>
+
+    <GlobalSearchModal
+      v-model:visible="globalSearchVisible"
+      :is-dark="isDark"
+      @open-dir="handleOpenDirFromSearch"
+    />
+    </div>
+  </a-config-provider>
 </template>
 
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, shallowRef, triggerRef } from 'vue'
-import { message } from 'ant-design-vue'
+import { message, theme } from 'ant-design-vue'
 import { listen } from '@tauri-apps/api/event'
 import Toolbar from './components/Toolbar.vue'
 import Sidebar from './components/Sidebar.vue'
 import FileList from './components/FileList.vue'
-import Charts from './components/Charts.vue'
-import DevAnalyzer from './components/DevAnalyzer.vue'
-import SnapshotCompare from './components/SnapshotCompare.vue'
-import Treemap from './components/Treemap.vue'
+import RightPanel from './components/RightPanel.vue'
 import StatusBar from './components/StatusBar.vue'
 import HistoryList from './components/HistoryList.vue'
+import GlobalSearchModal from './components/GlobalSearchModal.vue'
 import { useTauri } from './composables/useTauri'
 import { useSortWorker } from './composables/useSortWorker'
+import { useTheme } from './composables/useTheme'
 import { debounce, getParentPath } from './utils/format.js'
-import { applySmartFilter, getFilterHints } from './utils/smartFilter.js'
+import { applySmartFilter } from './utils/smartFilter.js'
+import { homeDir, join } from '@tauri-apps/api/path'
 
 const { invoke, openDialog } = useTauri()
 const sortWorker = useSortWorker()
+const { isDark, toggleTheme } = useTheme()
+const { defaultAlgorithm, darkAlgorithm } = theme
+
+const antTheme = computed(() => ({
+  algorithm: isDark.value ? darkAlgorithm : defaultAlgorithm,
+}))
 
 // 渐进式流式传输：scan-batch 事件监听器
 let unlistenScanBatch = null
@@ -132,6 +133,8 @@ const scanTime = ref(0)
 const backendTime = ref(0)
 const treeData = shallowRef([])
 const history = shallowRef([])
+const mftAvailable = ref(false)
+const isAdmin = ref(false)
 
 const navigationHistory = ref([])
 const navigationIndex = ref(-1)
@@ -146,10 +149,12 @@ const sortConfig = ref({
 
 const searchKeyword = ref('')
 const historyVisible = ref(false)
-const rightPanelTab = ref('charts')
+const globalSearchVisible = ref(false)
+const rightPanelTab = ref('stats')
+const sidebarCollapsed = ref(false)
 
-const sortedItemsCache = shallowRef([])
 const lastSortKey = ref('')
+const presortedAllItems = shallowRef([])
 
 const canGoBack = computed(() => navigationIndex.value > 0)
 const canGoForward = computed(() => navigationIndex.value < navigationHistory.value.length - 1)
@@ -160,47 +165,21 @@ const canGoUp = computed(() => {
 })
 
 const totalItems = computed(() => allItems.value.length)
-
-const totalSize = computed(() => {
-  let sum = 0
-  const items = allItems.value
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i]
-    if (!item.isDir) {
-      sum += item.size || 0
-    }
-  }
-  return sum
-})
+const backendTotalSize = ref(0)
+const totalSize = computed(() => backendTotalSize.value)
 
 const filteredItems = computed(() => {
   const keyword = searchKeyword.value.trim()
-  if (!keyword) return allItems.value
-  // Everything-style smart filter: supports ext:zip size:>100MB type:dir etc.
-  return applySmartFilter(allItems.value, keyword)
+  if (!keyword) return presortedAllItems.value
+  return applySmartFilter(presortedAllItems.value, keyword)
 })
 
 const filteredTotalItems = computed(() => filteredItems.value.length)
 
 const displayItems = computed(() => {
-  const items = filteredItems.value
-  const sortColumn = sortConfig.value.column
-  const sortDirection = sortConfig.value.direction
-
-  const newSortKey = `${sortColumn}-${sortDirection}-${items.length}`
-
-  let sorted
-  if (newSortKey !== lastSortKey.value) {
-    sorted = sortWorker.sortItemsSync(items, sortColumn, sortDirection)
-    lastSortKey.value = newSortKey
-    sortedItemsCache.value = sorted
-  } else {
-    sorted = sortedItemsCache.value
-  }
-
   const start = (currentPage.value - 1) * pageSize.value
   const end = start + pageSize.value
-  return sorted.slice(start, end)
+  return filteredItems.value.slice(start, end)
 })
 
 const handleScan = async (path, addToHistory = true) => {
@@ -213,22 +192,25 @@ const handleScan = async (path, addToHistory = true) => {
   scanTime.value = 0
   backendTime.value = 0
   streamedItemCount.value = 0
+  backendTotalSize.value = 0
 
-  // 清除旧数据
   allItems.value = []
   treeData.value = []
 
-  // 注册流式事件监听器（在发起扫描前）
   if (unlistenScanBatch) {
     unlistenScanBatch()
   }
   unlistenScanBatch = await listen('scan-batch', (event) => {
     const batch = event.payload
     if (Array.isArray(batch) && batch.length > 0) {
-      // 使用 push + triggerRef 避免 O(n²) 的数组展开拷贝
       allItems.value.push(...batch)
       triggerRef(allItems)
       streamedItemCount.value = allItems.value.length
+      for (let i = 0; i < batch.length; i++) {
+        if (!batch[i].isDir) {
+          backendTotalSize.value += batch[i].size || 0
+        }
+      }
     }
   })
 
@@ -242,11 +224,15 @@ const handleScan = async (path, addToHistory = true) => {
 
     backendTime.value = typeof result.scanTime === 'number' ? result.scanTime : 0
 
-    // 始终以最终结果为权威（流式数据仅作预览，最终结果保证一致性和排序）
     allItems.value = result.items || []
+    backendTotalSize.value = result.totalSize || 0
+    presortedAllItems.value = sortWorker.sortItemsSync(result.items || [], sortConfig.value.column, sortConfig.value.direction)
+    lastSortKey.value = `${sortConfig.value.column}-${sortConfig.value.direction}`
 
     currentPath.value = path
     lastSortKey.value = ''
+
+    mftAvailable.value = result.mftAvailable || false
 
     if ('requestIdleCallback' in window) {
       requestIdleCallback(() => buildTreeData(), { timeout: 100 })
@@ -263,13 +249,16 @@ const handleScan = async (path, addToHistory = true) => {
     const fullEndTime = performance.now()
     scanTime.value = parseFloat(((fullEndTime - fullStartTime) / 1000).toFixed(2))
 
+    try {
+      await invoke('global_search_add_scan', { path: path.trim(), items: result.items })
+    } catch {}
+
     message.success(`扫描完成 (总计: ${scanTime.value}s，找到 ${allItems.value.length} 个项目)`)
   } catch (error) {
     console.error('扫描失败:', error)
     message.error('扫描失败: ' + error)
   } finally {
     loading.value = false
-    // 清理事件监听器
     if (unlistenScanBatch) {
       unlistenScanBatch()
       unlistenScanBatch = null
@@ -317,27 +306,76 @@ const handleSearchInput = debounce((keyword) => {
   lastSortKey.value = ''
 }, 200)
 
-const handleSelectPath = (path) => {
-  handleScan(path)
+const handleSelectPath = async (path) => {
+  if (!path) return
+
+  try {
+    const isDir = await invoke('is_directory', { path })
+    if (isDir) {
+      await handleScan(path)
+    } else {
+      await invoke('open_path', { path })
+    }
+  } catch (error) {
+    console.error('选择路径失败:', error)
+    message.error('选择路径失败: ' + error)
+  }
 }
 
-const handleSelectItem = (item) => {
+const handleQuickAccess = async (action) => {
+  if (action === 'computer') {
+    await handleBrowse()
+    return
+  }
+  try {
+    const home = await homeDir()
+    if (!home) {
+      message.warning('无法获取用户目录')
+      return
+    }
+    let target = home
+    if (action === 'downloads') {
+      target = await join(home, 'Downloads')
+    } else if (action === 'desktop') {
+      target = await join(home, 'Desktop')
+    }
+    await handleScan(target)
+  } catch (error) {
+    console.error('快速访问失败:', error)
+    message.error('快速访问失败: ' + error)
+  }
+}
+
+const handleSelectItem = async (item) => {
   if (item.isDir) {
-    const fullPath = currentPath.value + '/' + item.path
-    handleScan(fullPath)
+    await handleScan(item.path)
   } else {
-    message.info(`文件: ${item.name}`)
+    try {
+      await invoke('open_path', { path: item.path })
+    } catch (error) {
+      console.error('打开文件失败:', error)
+      message.error('打开文件失败: ' + error)
+    }
   }
 }
 
-const handleSort = (column) => {
-  if (sortConfig.value.column === column) {
-    sortConfig.value.direction = sortConfig.value.direction === 'asc' ? 'desc' : 'asc'
-  } else {
-    sortConfig.value.column = column
-    sortConfig.value.direction = column === 'name' ? 'asc' : 'desc'
+const handleSort = (column, direction) => {
+  let newDirection = direction
+  if (!newDirection) {
+    newDirection = sortConfig.value.column === column
+      ? (sortConfig.value.direction === 'asc' ? 'desc' : 'asc')
+      : (column === 'name' ? 'asc' : 'desc')
   }
+  sortConfig.value.column = column
+  sortConfig.value.direction = newDirection
   lastSortKey.value = ''
+  if (allItems.value.length > 0) {
+    const newSortKey = `${sortConfig.value.column}-${sortConfig.value.direction}`
+    if (newSortKey !== lastSortKey.value) {
+      presortedAllItems.value = sortWorker.sortItemsSync(allItems.value, sortConfig.value.column, sortConfig.value.direction)
+      lastSortKey.value = newSortKey
+    }
+  }
 }
 
 const handleSelectHistory = async (path) => {
@@ -422,6 +460,10 @@ const buildTreeData = () => {
   treeData.value = topLevelNodes
 }
 
+const handleOpenDirFromSearch = (path) => {
+  if (path) handleScan(path)
+}
+
 const loadHistory = async () => {
   try {
     const historyData = await invoke('get_history_summary')
@@ -431,8 +473,21 @@ const loadHistory = async () => {
   }
 }
 
-onMounted(() => {
+const onGlobalSearchKeydown = (e) => {
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
+    e.preventDefault()
+    globalSearchVisible.value = true
+  }
+}
+
+onMounted(async () => {
   loadHistory()
+  document.addEventListener('keydown', onGlobalSearchKeydown)
+  try {
+    isAdmin.value = await invoke('is_admin')
+  } catch {
+    isAdmin.value = false
+  }
 })
 
 onUnmounted(() => {
@@ -440,6 +495,7 @@ onUnmounted(() => {
     unlistenScanBatch()
     unlistenScanBatch = null
   }
+  document.removeEventListener('keydown', onGlobalSearchKeydown)
 })
 
 watch(historyVisible, (isOpen) => {
@@ -454,74 +510,16 @@ watch(() => allItems.value.length, () => {
 })
 </script>
 
-<style scoped>
-.app-container {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
-  overflow: hidden;
-  contain: strict;
+<style>
+.dark-modal .ant-modal-content,
+.dark-modal .ant-modal-header {
+  background-color: #0f172a;
+  color: #e2e8f0;
 }
-
-.main-container {
-  display: flex;
-  flex: 1;
-  overflow: hidden;
-  contain: content;
+.dark-modal .ant-modal-title {
+  color: #e2e8f0;
 }
-
-.content-area {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  padding-left: 16px;
-  contain: content;
-}
-
-.pagination-wrapper {
-  padding: 8px 16px;
-  background: white;
-  border-top: 1px solid #f0f0f0;
-  display: flex;
-  justify-content: flex-end;
-  align-items: center;
-  contain: content;
-}
-
-.right-panel {
-  width: 320px;
-  display: flex;
-  flex-direction: column;
-  border-left: 1px solid #f0f0f0;
-  background: #fafafa;
-  overflow: hidden;
-}
-
-.panel-tabs {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-}
-
-.panel-tabs :deep(.ant-tabs-nav) {
-  margin: 0;
-  padding: 0 12px;
-  background: white;
-  border-bottom: 1px solid #f0f0f0;
-}
-
-.panel-tabs :deep(.ant-tabs-content-holder) {
-  flex: 1;
-  overflow: hidden;
-}
-
-.panel-tabs :deep(.ant-tabs-content) {
-  height: 100%;
-}
-
-.panel-tabs :deep(.ant-tabs-tabpane) {
-  height: 100%;
-  overflow-y: auto;
+.dark-modal .ant-modal-close {
+  color: #94a3b8;
 }
 </style>

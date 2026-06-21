@@ -43,7 +43,11 @@ async fn main() {
             commands::clear_disk_cache,
             commands::get_memory_cache_stats,
             commands::get_system_info,
+            commands::is_admin,
             commands::check_mft_available,
+            commands::get_scan_status,
+            commands::open_path,
+            commands::is_directory,
             commands::restart_as_admin,
             commands::analyze_dev_disk,
             commands::save_snapshot,
@@ -51,6 +55,11 @@ async fn main() {
             commands::compare_snapshots,
             commands::delete_snapshot,
             commands::compare_with_latest_snapshot,
+            commands::global_search_status,
+            commands::global_search_ensure_index,
+            commands::global_search,
+            commands::global_search_refresh,
+            commands::global_search_add_scan,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
