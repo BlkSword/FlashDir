@@ -426,6 +426,3 @@ CLI（`cli.exe`）和桌面端（`flashdir.exe`）共用同一个 Rust 后端库
 
 ---
 
-## License
-
-MIT © [BlkSword](https://github.com/BlkSword)
