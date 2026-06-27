@@ -1,63 +1,54 @@
 <template>
-  <a-config-provider :theme="antTheme">
-    <div class="h-screen flex flex-col overflow-hidden" :class="isDark ? 'bg-slate-950 text-slate-200' : 'bg-slate-100 text-slate-800'">
+  <div class="fd-app" :class="{ 'fd-sidebar-collapsed': sidebarCollapsed }">
     <Toolbar
       :path="currentPath"
       :can-go-back="canGoBack"
       :can-go-forward="canGoForward"
       :can-go-up="canGoUp"
       :loading="loading"
-      :filter-keyword="searchKeyword"
-      :is-dark="isDark"
       @scan="handleScan"
       @browse="handleBrowse"
       @navigate="handleNavigate"
       @show-history="historyVisible = true"
-      @search="handleSearchInput"
       @open-global-search="globalSearchVisible = true"
       @toggle-sidebar="sidebarCollapsed = !sidebarCollapsed"
-      @toggle-theme="toggleTheme"
     />
 
-    <div class="flex-1 flex min-h-0">
-      <Sidebar
-        :tree-data="treeData"
-        :selected-path="currentPath"
-        :history="history"
-        :collapsed="sidebarCollapsed"
-        :is-dark="isDark"
-        @select="handleSelectPath"
-        @quick-access="handleQuickAccess"
+    <Sidebar
+      :tree-data="treeData"
+      :selected-path="currentPath"
+      :history="history"
+      :collapsed="sidebarCollapsed"
+      @select="handleSelectPath"
+      @quick-access="handleQuickAccess"
+    />
+
+    <main class="fd-main">
+      <FileList
+        :items="displayItems"
+        :loading="loading || sortWorker.isProcessing.value"
+        :total-size="totalSize"
+        :current-path="currentPath"
+        :sort-config="sortConfig"
+        :current-page="currentPage"
+        :page-size="pageSize"
+        :total-items="filteredTotalItems"
+        @sort="handleSort"
+        @select="handleSelectItem"
+        @page-change="handlePageChange"
+        @size-change="handleSizeChange"
+        @filter="handleSearchInput"
       />
+    </main>
 
-      <main class="flex-1 flex min-w-0" :class="isDark ? 'bg-slate-900' : 'bg-white'">
-        <FileList
-          :items="displayItems"
-          :loading="loading || sortWorker.isProcessing.value"
-          :total-size="totalSize"
-          :current-path="currentPath"
-          :sort-config="sortConfig"
-          :current-page="currentPage"
-          :page-size="pageSize"
-          :total-items="filteredTotalItems"
-          :is-dark="isDark"
-          @sort="handleSort"
-          @select="handleSelectItem"
-          @page-change="handlePageChange"
-          @size-change="handleSizeChange"
-        />
-
-        <RightPanel
-          :items="allItems"
-          :total-size="totalSize"
-          :current-path="currentPath"
-          :active-tab="rightPanelTab"
-          :scan-time="scanTime"
-          :is-dark="isDark"
-          @update:active-tab="rightPanelTab = $event"
-        />
-      </main>
-    </div>
+    <RightPanel
+      :items="allItems"
+      :total-size="totalSize"
+      :current-path="currentPath"
+      :active-tab="rightPanelTab"
+      :scan-time="scanTime"
+      @update:active-tab="rightPanelTab = $event"
+    />
 
     <StatusBar
       :path="currentPath"
@@ -68,15 +59,13 @@
       :loading="loading"
       :mft-available="mftAvailable"
       :is-admin="isAdmin"
-      :is-dark="isDark"
     />
 
     <a-modal
-      :visible="historyVisible"
+      :open="historyVisible"
       title="历史记录"
       width="800px"
       :footer="null"
-      :class="isDark ? 'dark-modal' : ''"
       @cancel="historyVisible = false"
     >
       <HistoryList
@@ -88,16 +77,14 @@
 
     <GlobalSearchModal
       v-model:visible="globalSearchVisible"
-      :is-dark="isDark"
       @open-dir="handleOpenDirFromSearch"
     />
-    </div>
-  </a-config-provider>
+  </div>
 </template>
 
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, shallowRef, triggerRef } from 'vue'
-import { message, theme } from 'ant-design-vue'
+import { message } from 'ant-design-vue'
 import { listen } from '@tauri-apps/api/event'
 import Toolbar from './components/Toolbar.vue'
 import Sidebar from './components/Sidebar.vue'
@@ -108,21 +95,13 @@ import HistoryList from './components/HistoryList.vue'
 import GlobalSearchModal from './components/GlobalSearchModal.vue'
 import { useTauri } from './composables/useTauri'
 import { useSortWorker } from './composables/useSortWorker'
-import { useTheme } from './composables/useTheme'
 import { debounce, getParentPath } from './utils/format.js'
 import { applySmartFilter } from './utils/smartFilter.js'
 import { homeDir, join } from '@tauri-apps/api/path'
 
 const { invoke, openDialog } = useTauri()
 const sortWorker = useSortWorker()
-const { isDark, toggleTheme } = useTheme()
-const { defaultAlgorithm, darkAlgorithm } = theme
 
-const antTheme = computed(() => ({
-  algorithm: isDark.value ? darkAlgorithm : defaultAlgorithm,
-}))
-
-// 渐进式流式传输：scan-batch 事件监听器
 let unlistenScanBatch = null
 const streamedItemCount = ref(0)
 
@@ -510,16 +489,25 @@ watch(() => allItems.value.length, () => {
 })
 </script>
 
-<style>
-.dark-modal .ant-modal-content,
-.dark-modal .ant-modal-header {
-  background-color: #0f172a;
-  color: #e2e8f0;
+<style scoped>
+.fd-app {
+  display: grid;
+  grid-template-rows: 38px 1fr 24px;
+  grid-template-columns: 220px 1fr 300px;
+  height: 100vh;
+  background: var(--fd-bg-0);
+  color: var(--fd-text-1);
 }
-.dark-modal .ant-modal-title {
-  color: #e2e8f0;
+.fd-app.fd-sidebar-collapsed {
+  grid-template-columns: 0px 1fr 300px;
 }
-.dark-modal .ant-modal-close {
-  color: #94a3b8;
+.fd-main {
+  grid-row: 2 / 3;
+  grid-column: 2 / 3;
+  display: flex;
+  flex-direction: column;
+  background: var(--fd-bg-0);
+  min-width: 0;
+  overflow: hidden;
 }
 </style>

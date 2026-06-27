@@ -1,65 +1,47 @@
 <template>
   <div>
     <button
-      class="w-full flex items-center gap-1 px-2 py-1 rounded text-xs text-left transition-colors"
-      :class="[
-        isSelected
-          ? (isDark ? 'bg-blue-900/40 text-blue-300' : 'bg-blue-50 text-blue-700')
-          : (isDark ? 'hover:bg-slate-800 text-slate-300' : 'hover:bg-slate-100 text-slate-700')
-      ]"
+      class="fd-tree-item"
+      :class="{ 'fd-tree-selected': isSelected }"
       :style="{ paddingLeft: `${level * 12 + 8}px` }"
       @click="handleClick"
     >
       <span
         v-if="hasChildren"
-        class="w-3 h-3 flex items-center justify-center text-[10px] transition-transform"
-        :class="expanded ? 'rotate-90' : ''"
+        class="fd-tree-toggle"
+        :class="{ 'fd-tree-expanded': expanded }"
         @click.stop="toggleExpand"
       >
-        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
         </svg>
       </span>
-      <span v-else class="w-3"></span>
+      <span v-else class="fd-tree-spacer"></span>
       <svg
-        class="w-4 h-4 shrink-0"
-        :class="node.isLeaf ? (isDark ? 'text-slate-500' : 'text-slate-400') : 'text-blue-500'"
-        fill="none"
-        stroke="currentColor"
+        class="fd-tree-icon"
+        :class="node.isLeaf ? 'fd-tree-file' : 'fd-tree-folder'"
+        fill="currentColor"
         viewBox="0 0 24 24"
       >
         <path
           v-if="node.isLeaf"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          stroke-width="2"
           d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
         />
         <path
           v-else
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          stroke-width="2"
           d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"
         />
       </svg>
       <span class="truncate">{{ node.title }}</span>
-      <span
-        v-if="node.sizeFormatted"
-        class="ml-auto text-2xs shrink-0"
-        :class="isDark ? 'text-slate-500' : 'text-slate-400'"
-      >
-        {{ node.sizeFormatted }}
-      </span>
+      <span v-if="node.sizeFormatted" class="fd-tree-size">{{ node.sizeFormatted }}</span>
     </button>
 
-    <div v-if="expanded && hasChildren" class="mt-0.5">
+    <div v-if="expanded && hasChildren">
       <TreeNode
         v-for="child in node.children"
         :key="child.key"
         :node="child"
         :selected-path="selectedPath"
-        :is-dark="isDark"
         :level="level + 1"
         @select="$emit('select', $event)"
       />
@@ -73,7 +55,6 @@ import { ref, computed } from 'vue'
 const props = defineProps({
   node: { type: Object, required: true },
   selectedPath: { type: String, default: '' },
-  isDark: { type: Boolean, default: false },
   level: { type: Number, default: 0 },
 })
 
@@ -98,3 +79,43 @@ const handleClick = () => {
 
 const emit = defineEmits(['select'])
 </script>
+
+<style scoped>
+.fd-tree-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border: none;
+  background: transparent;
+  color: var(--fd-text-1);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.fd-tree-item:hover { background: var(--fd-bg-2); }
+.fd-tree-selected { background: var(--fd-selected) !important; color: #fff; }
+.fd-tree-toggle {
+  width: 12px;
+  height: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fd-text-2);
+  transition: transform 0.1s;
+}
+.fd-tree-toggle svg { width: 12px; height: 12px; }
+.fd-tree-expanded { transform: rotate(90deg); }
+.fd-tree-spacer { width: 12px; }
+.fd-tree-icon { width: 14px; height: 14px; flex-shrink: 0; }
+.fd-tree-folder { color: var(--fd-folder); }
+.fd-tree-file { color: var(--fd-file); }
+.fd-tree-size {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--fd-text-2);
+  flex-shrink: 0;
+}
+.fd-tree-selected .fd-tree-size { color: rgba(255,255,255,0.7); }
+</style>

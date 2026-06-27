@@ -1,166 +1,113 @@
 <template>
-  <div class="flex-1 flex flex-col min-h-0">
-    <!-- Header info -->
-    <div
-      class="flex items-center justify-between px-3 py-2 border-b"
-      :class="isDark ? 'bg-slate-900/50 border-slate-700' : 'bg-slate-50 border-slate-200'"
-    >
-      <div class="text-xs" :class="isDark ? 'text-slate-400' : 'text-slate-500'">
-        {{ currentPath || '未选择目录' }}
+  <div class="fd-filelist">
+    <div class="fd-filter-bar">
+      <div class="fd-filter-input-wrap">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+        <input
+          v-model="localFilter"
+          type="text"
+          placeholder="过滤当前目录…  支持 ext:zip  size:>1MB  dir:node_modules"
+          @input="$emit('filter', localFilter)"
+        />
       </div>
-      <div class="flex items-center gap-2">
-        <select
-          :value="sortKey"
-          class="text-xs rounded border px-2 py-1 outline-none transition-colors"
-          :class="isDark ? 'bg-slate-800 border-slate-600 text-slate-200' : 'bg-white border-slate-300 text-slate-700'"
-          @change="handleSortChange"
-        >
-          <option value="size-desc">大小降序</option>
-          <option value="size-asc">大小升序</option>
-          <option value="name-asc">名称升序</option>
-          <option value="name-desc">名称降序</option>
-          <option value="mtime-desc">修改时间降序</option>
-        </select>
-      </div>
+      <span class="fd-filter-hint" @click="applyHint('ext:zip')">ext:zip</span>
+      <span class="fd-filter-hint" @click="applyHint('size:>100MB')">size:>100MB</span>
+      <span class="fd-filter-hint" @click="applyHint('type:dir')">type:dir</span>
     </div>
 
-    <!-- Table -->
-    <div class="flex-1 overflow-auto">
-      <table class="w-full text-left border-collapse">
-        <thead
-          class="sticky top-0 z-10"
-          :class="isDark ? 'bg-slate-800 text-slate-400' : 'bg-slate-50 text-slate-500'"
-        >
-          <tr class="text-xs border-b" :class="isDark ? 'border-slate-700' : 'border-slate-200'">
-            <th class="px-3 py-2 font-medium w-10 cursor-pointer" @click="handleSort('name')">
-              <div class="flex items-center gap-1">
-                名称
-                <SortIcon :active="sortConfig.column === 'name'" :direction="sortConfig.direction" />
-              </div>
-            </th>
-            <th class="px-3 py-2 font-medium w-20 cursor-pointer" @click="handleSort('size')">
-              <div class="flex items-center gap-1">
-                大小
-                <SortIcon :active="sortConfig.column === 'size'" :direction="sortConfig.direction" />
-              </div>
-            </th>
-            <th class="px-3 py-2 font-medium w-24 text-right">占比</th>
-            <th class="px-3 py-2 font-medium w-36">修改时间</th>
+    <div class="fd-table-wrap">
+      <table class="fd-table">
+        <thead>
+          <tr>
+            <th
+              class="fd-col-name"
+              :class="{ sort: sortConfig.column === 'name', asc: sortConfig.column === 'name' && sortConfig.direction === 'asc' }"
+              @click="handleSort('name')"
+            >名称</th>
+            <th
+              class="fd-col-size"
+              :class="{ sort: sortConfig.column === 'size', asc: sortConfig.column === 'size' && sortConfig.direction === 'asc' }"
+              @click="handleSort('size')"
+            >大小</th>
+            <th class="fd-col-pct">占比</th>
+            <th
+              class="fd-col-date"
+              :class="{ sort: sortConfig.column === 'mtime', asc: sortConfig.column === 'mtime' && sortConfig.direction === 'asc' }"
+              @click="handleSort('mtime')"
+            >修改时间</th>
           </tr>
         </thead>
-        <tbody class="text-xs">
+        <tbody>
           <tr v-if="loading && items.length === 0">
-            <td colspan="4" class="px-3 py-8 text-center" :class="isDark ? 'text-slate-500' : 'text-slate-400'">
-              <div class="flex items-center justify-center gap-2">
-                <svg class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+            <td colspan="4" class="fd-empty-cell">
+              <div class="fd-loading">
+                <svg class="animate-spin" width="14" height="14" fill="none" viewBox="0 0 24 24">
                   <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
                   <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                 </svg>
-                扫描中...
+                扫描中…
               </div>
             </td>
           </tr>
           <tr v-else-if="items.length === 0">
-            <td colspan="4" class="px-3 py-8 text-center" :class="isDark ? 'text-slate-500' : 'text-slate-400'">
-              选择目录并开始扫描
-            </td>
+            <td colspan="4" class="fd-empty-cell">选择目录并开始扫描</td>
           </tr>
           <tr
             v-for="(item, index) in items"
             :key="index"
-            class="border-b cursor-pointer transition-colors"
-            :class="[
-              isDark ? 'border-slate-800 hover:bg-slate-800/50' : 'border-slate-100 hover:bg-slate-50',
-              item.isDir ? '' : ''
-            ]"
-            @click="$emit('select', item)"
+            :class="{ selected: selectedIndex === index }"
+            @click="selectItem(index)"
+            @dblclick="$emit('select', item)"
           >
-            <td class="px-3 py-1.5">
-              <div class="flex items-center gap-2">
+            <td>
+              <div class="fd-cell-name">
                 <svg
-                  class="w-4 h-4 shrink-0"
-                  :class="item.isDir ? 'text-blue-500' : (isDark ? 'text-slate-500' : 'text-slate-400')"
-                  fill="none"
-                  stroke="currentColor"
+                  class="fd-cell-icon"
+                  :class="item.isDir ? 'fd-folder' : 'fd-file'"
+                  fill="currentColor"
                   viewBox="0 0 24 24"
                 >
                   <path
                     v-if="item.isDir"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    stroke-width="2"
                     d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"
                   />
                   <path
                     v-else
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    stroke-width="2"
                     d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
                   />
                 </svg>
-                <span
-                  class="font-medium truncate"
-                  :class="item.isDir ? (isDark ? 'text-slate-300' : 'text-slate-700') : (isDark ? 'text-slate-400' : 'text-slate-600')"
-                >
-                  {{ item.name }}
-                </span>
+                <span class="truncate">{{ item.name }}</span>
               </div>
             </td>
-            <td
-              class="px-3 py-1.5 text-right mono font-medium"
-              :class="isDark ? 'text-slate-300' : 'text-slate-700'"
-            >
-              {{ item.sizeFormatted || formatSize(item.size) }}
+            <td class="fd-cell-size">{{ item.sizeFormatted || formatSize(item.size) }}</td>
+            <td class="fd-cell-pct">
+              <span>{{ getPercent(item.size) }}</span>
+              <span class="fd-pct-bar"><span class="fd-pct-fill" :style="{ width: getBarWidth(item.size) }"></span></span>
             </td>
-            <td class="px-3 py-1.5 text-right">
-              <div class="flex items-center justify-end gap-2">
-                <span class="text-2xs" :class="isDark ? 'text-slate-500' : 'text-slate-500'">{{ getPercent(item.size) }}</span>
-                <div class="w-16 h-1.5 rounded-full overflow-hidden" :class="isDark ? 'bg-slate-700' : 'bg-slate-200'">
-                  <div
-                    class="h-full rounded-full"
-                    :class="item.isDir ? 'bg-blue-500' : 'bg-slate-400'"
-                    :style="{ width: getBarWidth(item.size) }"
-                  ></div>
-                </div>
-              </div>
-            </td>
-            <td class="px-3 py-1.5 text-2xs" :class="isDark ? 'text-slate-500' : 'text-slate-500'">
-              {{ item.mtime ? formatTime(item.mtime * 1000) : '-' }}
-            </td>
+            <td class="fd-cell-date">{{ item.mtime ? formatTime(item.mtime * 1000) : '-' }}</td>
           </tr>
         </tbody>
       </table>
     </div>
 
-    <!-- Pagination -->
-    <div
-      v-if="totalItems > pageSize"
-      class="px-3 py-2 border-t flex items-center justify-between shrink-0"
-      :class="isDark ? 'bg-slate-900/50 border-slate-700' : 'bg-slate-50 border-slate-200'"
-    >
-      <span class="text-xs" :class="isDark ? 'text-slate-400' : 'text-slate-500'">
-        共 {{ totalItems.toLocaleString() }} 项
-      </span>
-      <div class="flex items-center gap-2">
-        <a-pagination
-          :current="currentPage"
-          :page-size="pageSize"
-          :total="totalItems"
-          :page-size-options="['50', '100', '200', '500', '1000']"
-          show-size-changer
-          size="small"
-          @change="$emit('page-change', $event)"
-          @showSizeChange="(current, size) => $emit('size-change', current, size)"
-        />
-      </div>
+    <div v-if="totalItems > pageSize" class="fd-pagination">
+      <span class="fd-paging-info">共 {{ totalItems.toLocaleString() }} 项</span>
+      <a-pagination
+        :current="currentPage"
+        :page-size="pageSize"
+        :total="totalItems"
+        :page-size-options="['50', '100', '200', '500', '1000']"
+        show-size-changer
+        size="small"
+        @change="$emit('page-change', $event)"
+        @showSizeChange="(current, size) => $emit('size-change', current, size)"
+      />
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed } from 'vue'
-import SortIcon from './SortIcon.vue'
+import { ref, watch } from 'vue'
 
 const props = defineProps({
   items: { type: Array, default: () => [] },
@@ -171,20 +118,27 @@ const props = defineProps({
   currentPage: { type: Number, default: 1 },
   pageSize: { type: Number, default: 100 },
   totalItems: { type: Number, default: 0 },
-  isDark: { type: Boolean, default: false },
+  filterKeyword: { type: String, default: '' },
 })
 
-const emit = defineEmits(['sort', 'select', 'page-change', 'size-change'])
+const emit = defineEmits(['sort', 'select', 'page-change', 'size-change', 'filter'])
 
-const sortKey = computed(() => `${props.sortConfig.column}-${props.sortConfig.direction}`)
+const localFilter = ref(props.filterKeyword)
+watch(() => props.filterKeyword, (v) => { localFilter.value = v })
+
+const selectedIndex = ref(-1)
+
+const selectItem = (index) => {
+  selectedIndex.value = index
+}
 
 const handleSort = (column) => {
   emit('sort', column)
 }
 
-const handleSortChange = (e) => {
-  const [column, direction] = e.target.value.split('-')
-  emit('sort', column, direction)
+const applyHint = (hint) => {
+  localFilter.value = hint
+  emit('filter', hint)
 }
 
 const getPercent = (size) => {
@@ -217,3 +171,114 @@ const formatTime = (ts) => {
   })
 }
 </script>
+
+<style scoped>
+.fd-filelist {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.fd-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--fd-bg-1);
+  border-bottom: 1px solid var(--fd-border);
+  flex-shrink: 0;
+}
+.fd-filter-input-wrap {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  background: var(--fd-bg-0);
+  border: 1px solid var(--fd-border);
+  border-radius: 3px;
+}
+.fd-filter-input-wrap svg { width: 13px; height: 13px; color: var(--fd-text-2); }
+.fd-filter-input-wrap input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--fd-text-0);
+  font-size: 12px;
+}
+.fd-filter-input-wrap input::placeholder { color: var(--fd-text-3); }
+.fd-filter-hint {
+  font-size: 11px;
+  color: var(--fd-text-2);
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: var(--fd-bg-2);
+  cursor: pointer;
+}
+.fd-filter-hint:hover { color: var(--fd-text-1); }
+.fd-table-wrap { flex: 1; overflow: auto; min-height: 0; }
+.fd-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.fd-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--fd-bg-1);
+  color: var(--fd-text-2);
+  font-weight: 600;
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--fd-border);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.fd-table thead th.sort::after { content: " ▼"; font-size: 9px; }
+.fd-table thead th.sort.asc::after { content: " ▲"; }
+.fd-table tbody td {
+  padding: 4px 10px;
+  border-bottom: 1px solid transparent;
+  color: var(--fd-text-1);
+  white-space: nowrap;
+}
+.fd-table tbody tr:hover td { background: var(--fd-bg-2); }
+.fd-table tbody tr.selected td { background: var(--fd-selected); color: #fff; }
+.fd-cell-name { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.fd-cell-icon { width: 16px; height: 16px; flex-shrink: 0; }
+.fd-cell-icon.fd-folder { color: var(--fd-folder); }
+.fd-cell-icon.fd-file { color: var(--fd-file); }
+.fd-cell-size { text-align: right; font-family: Consolas, 'JetBrains Mono', monospace; }
+.fd-cell-pct { text-align: right; }
+.fd-cell-date { text-align: right; color: var(--fd-text-2); }
+.fd-table tbody tr.selected .fd-cell-date { color: rgba(255,255,255,0.7); }
+.fd-pct-bar {
+  display: inline-block;
+  width: 50px;
+  height: 3px;
+  background: var(--fd-bg-3);
+  border-radius: 2px;
+  overflow: hidden;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+.fd-pct-fill { display: block; height: 100%; background: var(--fd-accent); border-radius: 2px; }
+.fd-empty-cell {
+  text-align: center;
+  padding: 40px 0;
+  color: var(--fd-text-2);
+}
+.fd-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.fd-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 10px;
+  background: var(--fd-bg-1);
+  border-top: 1px solid var(--fd-border);
+  flex-shrink: 0;
+}
+.fd-paging-info { font-size: 12px; color: var(--fd-text-2); }
+</style>

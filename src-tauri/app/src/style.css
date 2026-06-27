@@ -4,6 +4,25 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --fd-bg-0: #1e1e1e;
+  --fd-bg-1: #252526;
+  --fd-bg-2: #2d2d30;
+  --fd-bg-3: #3e3e42;
+  --fd-border: #3e3e42;
+  --fd-text-0: #ffffff;
+  --fd-text-1: #cccccc;
+  --fd-text-2: #858585;
+  --fd-text-3: #5c5c5c;
+  --fd-accent: #007acc;
+  --fd-accent-hover: #1177bb;
+  --fd-selected: #094771;
+  --fd-folder: #dcb67a;
+  --fd-file: #a0a0a0;
+  --fd-success: #89d185;
+  --fd-danger: #f48771;
+}
+
 * {
   margin: 0;
   padding: 0;
@@ -16,37 +35,118 @@ html, body, #app {
 }
 
 body {
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
-}
-
-/* 滚动条样式 */
-::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-
-::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-::-webkit-scrollbar-thumb {
-  background: #cbd5e1;
-  border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: #94a3b8;
-}
-
-.dark ::-webkit-scrollbar-thumb {
-  background: #475569;
-}
-
-.dark ::-webkit-scrollbar-thumb:hover {
-  background: #64748b;
-}
-
-/* 暗色模式基础 */
-.dark {
+  font-family: 'Inter', "Microsoft YaHei UI", system-ui, -apple-system, sans-serif;
+  background: var(--fd-bg-0);
+  color: var(--fd-text-1);
   color-scheme: dark;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--fd-bg-0);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--fd-bg-3);
+  border: 2px solid var(--fd-bg-0);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
+
+/* Ant Design Vue overrides - minimal, flat dark */
+.ant-modal-content,
+.ant-modal-header {
+  background: var(--fd-bg-1) !important;
+  border-color: var(--fd-border) !important;
+  color: var(--fd-text-1) !important;
+}
+.ant-modal-title {
+  color: var(--fd-text-0) !important;
+}
+.ant-modal-close {
+  color: var(--fd-text-2) !important;
+}
+.ant-input,
+.ant-input-search .ant-input {
+  background: var(--fd-bg-0) !important;
+  border-color: var(--fd-border) !important;
+  color: var(--fd-text-1) !important;
+}
+.ant-input::placeholder {
+  color: var(--fd-text-3) !important;
+}
+.ant-btn {
+  border-color: var(--fd-border) !important;
+  background: var(--fd-bg-2) !important;
+  color: var(--fd-text-1) !important;
+}
+.ant-btn-primary {
+  background: var(--fd-accent) !important;
+  border-color: var(--fd-accent) !important;
+  color: #fff !important;
+}
+.ant-btn-primary:hover {
+  background: var(--fd-accent-hover) !important;
+  border-color: var(--fd-accent-hover) !important;
+}
+.ant-pagination-item,
+.ant-pagination-item-link {
+  background: var(--fd-bg-2) !important;
+  border-color: var(--fd-border) !important;
+  color: var(--fd-text-1) !important;
+}
+.ant-pagination-item-active {
+  border-color: var(--fd-accent) !important;
+  color: var(--fd-accent) !important;
+}
+.ant-select-selector {
+  background: var(--fd-bg-2) !important;
+  border-color: var(--fd-border) !important;
+  color: var(--fd-text-1) !important;
+}
+.ant-select-arrow {
+  color: var(--fd-text-2) !important;
+}
+.ant-empty-description {
+  color: var(--fd-text-2) !important;
+}
+
+/* Message / Notification */
+.ant-message-notice-content,
+.ant-notification-notice {
+  background: var(--fd-bg-2) !important;
+  border: 1px solid var(--fd-border) !important;
+  color: var(--fd-text-1) !important;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.4) !important;
+}
+.ant-message-custom-content {
+  color: var(--fd-text-1) !important;
+}
+
+/* Dropdown / Select */
+.ant-select-dropdown {
+  background: var(--fd-bg-2) !important;
+  border: 1px solid var(--fd-border) !important;
+}
+.ant-select-item {
+  color: var(--fd-text-1) !important;
+}
+.ant-select-item-option-active,
+.ant-select-item-option-selected {
+  background: var(--fd-bg-3) !important;
+}
+
+/* Tooltip */
+.ant-tooltip-inner {
+  background: var(--fd-bg-3) !important;
+  color: var(--fd-text-1) !important;
+  border: 1px solid var(--fd-border);
+}
+.ant-tooltip-arrow::before {
+  background: var(--fd-bg-3) !important;
 }

@@ -5,65 +5,67 @@
     :width="660"
     :footer="null"
     :destroy-on-close="false"
-    :class="['global-search-modal', isDark ? 'dark-modal' : '']"
+    class="fd-global-search"
     @cancel="close"
   >
-    <!-- 搜索框 -->
-    <a-input-search
-      ref="inputRef"
-      v-model:value="query"
-      :placeholder="ready ? '输入文件名，跨所有盘搜索…' : '索引未就绪'"
-      :disabled="!ready"
-      :loading="searching"
-      allow-clear
-      @change="onQueryChange"
-      @search="onQueryChange"
-    />
+    <div class="fd-search-input-wrap">
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+      <a-input-search
+        ref="inputRef"
+        v-model:value="query"
+        :placeholder="ready ? '输入文件名，跨所有盘搜索…' : '索引未就绪'"
+        :disabled="!ready"
+        :loading="searching"
+        allow-clear
+        @change="onQueryChange"
+        @search="onQueryChange"
+      />
+    </div>
 
-    <!-- 索引未就绪 / 加载中 / 失败 -->
-    <div v-if="!ready" class="index-state">
-      <div v-if="stateKind === 'notLoaded'" class="state-box">
+    <div v-if="!ready" class="fd-index-state">
+      <div v-if="stateKind === 'notLoaded'" class="fd-state-box">
         <p>首次使用需建立全盘文件索引（扫描所有 NTFS 盘的 MFT，约几秒至几十秒）。</p>
         <a-button type="primary" :loading="loading" @click="ensureIndex">建立索引</a-button>
       </div>
-      <div v-else-if="stateKind === 'loading'" class="state-box">
+      <div v-else-if="stateKind === 'loading'" class="fd-state-box">
         <a-spin />
-        <span class="state-text">
+        <span class="fd-state-text">
           正在扫描 {{ progress?.drive || stateData?.drive || '…' }}
           · 已索引 {{ (progress?.scanned ?? stateData?.scanned ?? 0) }} 项
         </span>
       </div>
-      <div v-else-if="stateKind === 'failed'" class="state-box failed">
+      <div v-else-if="stateKind === 'failed'" class="fd-state-box failed">
         <p>{{ failedReason }}</p>
         <a-button :loading="loading" @click="ensureIndex">重试</a-button>
       </div>
     </div>
 
-    <!-- 结果 -->
-    <div v-else class="results">
-      <div class="results-meta" v-if="query && results.length > 0">
+    <div v-else class="fd-results">
+      <div v-if="query && results.length > 0" class="fd-results-meta">
         找到 {{ results.length }} 项
       </div>
-      <a-list :data-source="displayResults" size="small" :split="false">
-        <template #renderItem="{ item }">
-          <a-list-item class="result-item" @click="openTarget(item)">
-            <a-list-item-meta>
-              <template #avatar>
-                <FolderOutlined v-if="item.isDir" class="ic-folder" />
-                <FileOutlined v-else class="ic-file" />
-              </template>
-              <template #title>
-                <span class="result-name" v-html="highlight(item.name)"></span>
-              </template>
-              <template #description>
-                <span class="result-path">{{ item.path }}</span>
-                <span class="result-size" v-if="!item.isDir"> · {{ formatSize(item.size) }}</span>
-                <span class="result-mtime" v-if="item.mtime"> · {{ formatTime(item.mtime * 1000) }}</span>
-              </template>
-            </a-list-item-meta>
-          </a-list-item>
-        </template>
-      </a-list>
+      <div class="fd-result-list">
+        <div
+          v-for="(item, index) in displayResults"
+          :key="index"
+          class="fd-result-item"
+          @click="openTarget(item)"
+        >
+          <div class="fd-result-icon">
+            <svg v-if="item.isDir" fill="currentColor" viewBox="0 0 24 24"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
+            <svg v-else fill="currentColor" viewBox="0 0 24 24"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+          </div>
+          <div class="fd-result-main">
+            <div class="fd-result-name" v-html="highlight(item.name)"></div>
+            <div class="fd-result-meta">
+              <span class="fd-result-path">{{ item.path }}</span>
+              <span v-if="!item.isDir"> · {{ formatSize(item.size) }}</span>
+              <span v-if="item.mtime"> · {{ formatTime(item.mtime * 1000) }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <a-pagination
         v-if="query && results.length > pageSize"
         v-model:current="currentPage"
@@ -72,8 +74,9 @@
         :page-size-options="['50', '100', '200', '500']"
         show-size-changer
         size="small"
-        class="results-pagination"
+        class="fd-results-pagination"
       />
+
       <a-empty
         v-if="ready && query && results.length === 0 && !searching"
         :description="lastNoResultMsg"
@@ -81,15 +84,14 @@
       />
     </div>
 
-    <!-- 底部 -->
-    <div class="modal-footer" v-if="ready">
-      <span class="footer-meta" v-if="indexMeta">
+    <div v-if="ready" class="fd-modal-footer">
+      <span v-if="indexMeta" class="fd-footer-meta">
         已索引 {{ (indexMeta.fileCount || 0) + (indexMeta.dirCount || 0) }} 项 · {{ indexMeta.driveCount || 0 }} 个盘
-        <span v-if="indexMeta.failedDrives?.length" class="footer-warn">
+        <span v-if="indexMeta.failedDrives?.length" class="fd-footer-warn">
           （{{ indexMeta.failedDrives.join(', ') }} 跳过）
         </span>
       </span>
-      <span class="footer-spacer"></span>
+      <span class="fd-footer-spacer"></span>
       <a-button size="small" :loading="loading" @click="refreshIndex">刷新索引</a-button>
     </div>
   </a-modal>
@@ -98,7 +100,6 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { Empty } from 'ant-design-vue'
-import { FolderOutlined, FileOutlined } from '@ant-design/icons-vue'
 import { listen } from '@tauri-apps/api/event'
 import { useTauri } from '../composables/useTauri'
 import { formatSize, debounce, getParentPath } from '../utils/format.js'
@@ -109,7 +110,6 @@ const lastNoResultMsg = ref('无匹配文件')
 
 const props = defineProps({
   visible: { type: Boolean, default: false },
-  isDark: { type: Boolean, default: false }
 })
 const emit = defineEmits(['update:visible', 'open-dir'])
 
@@ -178,7 +178,6 @@ const ensureIndex = async () => {
   try {
     await invoke('global_search_ensure_index')
     await fetchStatus()
-    // 触发自动提权：仅索引完全失败时(scan_directory 会保证正常数据)
     const s = state.value
     const needUac = s?.kind === 'failed'
     if (needUac) {
@@ -224,14 +223,12 @@ const highlight = (name) => {
   const q = query.value.trim()
   if (!q) return escapeHtml(name)
 
-  // 提取纯文本 token（忽略 ext:zip 这类过滤关键字），用于高亮
   const tokens = q
     .split(/\s+/)
     .filter((t) => t && !t.includes(':') && !['AND', 'OR', 'NOT'].includes(t.toUpperCase()))
     .map((t) => t.toLowerCase())
   if (tokens.length === 0) return escapeHtml(name)
 
-  // 收集所有匹配区间
   const intervals = []
   const lower = name.toLowerCase()
   for (const token of tokens) {
@@ -243,7 +240,6 @@ const highlight = (name) => {
   }
   if (intervals.length === 0) return escapeHtml(name)
 
-  // 合并重叠区间
   intervals.sort((a, b) => a[0] - b[0])
   const merged = [intervals[0]]
   for (let i = 1; i < intervals.length; i++) {
@@ -256,7 +252,6 @@ const highlight = (name) => {
     }
   }
 
-  // 构建 HTML
   let html = ''
   let last = 0
   for (const [start, end] of merged) {
@@ -266,6 +261,11 @@ const highlight = (name) => {
   }
   html += escapeHtml(name.slice(last))
   return html
+}
+
+const formatTime = (ts) => {
+  const d = new Date(ts)
+  return d.toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
 }
 
 onMounted(async () => {
@@ -298,138 +298,108 @@ watch(
 )
 </script>
 
-<style scoped>
-.index-state {
-  padding: 24px 0;
-  text-align: center;
+<style>
+.fd-global-search .ant-modal-content {
+  background: var(--fd-bg-1) !important;
+  border: 1px solid var(--fd-border);
 }
-.state-box {
+.fd-global-search .ant-modal-header {
+  background: var(--fd-bg-1) !important;
+  border-bottom: 1px solid var(--fd-border);
+}
+.fd-global-search .ant-modal-title { color: var(--fd-text-0); }
+.fd-global-search .ant-modal-close { color: var(--fd-text-2); }
+.fd-global-search .ant-input {
+  background: var(--fd-bg-0) !important;
+  border-color: var(--fd-border) !important;
+  color: var(--fd-text-0) !important;
+  padding: 8px 12px !important;
+}
+.fd-global-search .ant-input::placeholder { color: var(--fd-text-3) !important; }
+</style>
+
+<style scoped>
+.fd-search-input-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.fd-search-input-wrap svg {
+  width: 16px;
+  height: 16px;
+  color: var(--fd-text-2);
+  flex-shrink: 0;
+}
+.fd-search-input-wrap :deep(.ant-input) {
+  flex: 1;
+  font-size: 14px;
+}
+.fd-index-state { padding: 24px 0; text-align: center; }
+.fd-state-box {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 12px;
-  color: #595959;
+  color: var(--fd-text-2);
   font-size: 13px;
 }
-.state-box p {
-  margin: 0;
-  max-width: 440px;
-}
-.state-text {
-  margin-left: 8px;
-  color: #595959;
-}
-.failed {
-  color: #cf1322;
-}
+.fd-state-box p { margin: 0; max-width: 440px; }
+.fd-state-text { margin-left: 8px; color: var(--fd-text-2); }
+.fd-state-box.failed { color: var(--fd-danger); }
 
-.results {
-  margin-top: 12px;
-  max-height: 52vh;
-  overflow-y: auto;
-}
-.results-meta {
+.fd-results { margin-top: 12px; max-height: 52vh; overflow-y: auto; }
+.fd-results-meta {
   font-size: 12px;
-  color: #8c8c8c;
+  color: var(--fd-text-2);
   margin-bottom: 6px;
 }
-.result-item {
-  cursor: pointer;
-  padding: 6px 8px !important;
+.fd-result-list { display: flex; flex-direction: column; gap: 2px; }
+.fd-result-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 6px 8px;
   border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.1s;
 }
-.result-item:hover {
-  background: #f5f5f5;
+.fd-result-item:hover { background: var(--fd-bg-2); }
+.fd-result-icon {
+  width: 18px;
+  height: 18px;
+  color: var(--fd-folder);
+  flex-shrink: 0;
+  margin-top: 1px;
 }
-.ic-folder {
-  color: #faad14;
-  font-size: 18px;
-}
-.ic-file {
-  color: #8c8c8c;
-  font-size: 18px;
-}
-.result-name {
+.fd-result-main { flex: 1; min-width: 0; }
+.fd-result-name {
   font-size: 13px;
-  color: #262626;
+  color: var(--fd-text-0);
+  word-break: break-all;
 }
-.result-name :deep(mark) {
-  background: #fff7be;
-  color: #d4380d;
+.fd-result-name :deep(mark) {
+  background: rgba(0,122,204,0.35);
+  color: var(--fd-text-0);
   border-radius: 2px;
   padding: 0 1px;
 }
-.result-path {
-  font-family: 'Consolas', 'Monaco', monospace;
+.fd-result-meta {
+  font-family: Consolas, 'JetBrains Mono', monospace;
   font-size: 11px;
-  color: #8c8c8c;
+  color: var(--fd-text-2);
   word-break: break-all;
+  margin-top: 2px;
 }
-.result-size {
-  font-size: 11px;
-  color: #bfbfbf;
-}
-.result-mtime {
-  font-size: 11px;
-  color: #bfbfbf;
-}
+.fd-results-pagination { margin-top: 12px; }
 
-.results-pagination {
-  margin-top: 12px;
-}
-
-.modal-footer {
+.fd-modal-footer {
   display: flex;
   align-items: center;
   margin-top: 12px;
   padding-top: 10px;
-  border-top: 1px solid #f0f0f0;
+  border-top: 1px solid var(--fd-border);
 }
-.footer-meta {
-  font-size: 11px;
-  color: #8c8c8c;
-}
-.footer-spacer {
-  flex: 1;
-}
-
-/* Dark mode overrides */
-.global-search-modal.dark-modal .ant-modal-content,
-.global-search-modal.dark-modal .ant-modal-header {
-  background-color: #0f172a;
-  color: #e2e8f0;
-}
-.global-search-modal.dark-modal .ant-modal-title {
-  color: #e2e8f0;
-}
-.global-search-modal.dark-modal .ant-modal-close {
-  color: #94a3b8;
-}
-.global-search-modal.dark-modal .ant-input {
-  background-color: #1e293b;
-  border-color: #334155;
-  color: #e2e8f0;
-}
-.global-search-modal.dark-modal .ant-input::placeholder {
-  color: #64748b;
-}
-.global-search-modal.dark-modal .result-item {
-  border-bottom-color: #1e293b;
-}
-.global-search-modal.dark-modal .result-item:hover {
-  background-color: #1e293b;
-}
-.global-search-modal.dark-modal .result-path {
-  color: #64748b;
-}
-.global-search-modal.dark-modal .result-size,
-.global-search-modal.dark-modal .result-mtime {
-  color: #475569;
-}
-.global-search-modal.dark-modal .modal-footer {
-  border-top-color: #1e293b;
-}
-.global-search-modal.dark-modal .footer-meta {
-  color: #64748b;
-}
+.fd-footer-meta { font-size: 11px; color: var(--fd-text-2); }
+.fd-footer-spacer { flex: 1; }
+.fd-footer-warn { color: var(--fd-danger); }
 </style>

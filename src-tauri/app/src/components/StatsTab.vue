@@ -1,80 +1,29 @@
 <template>
-  <div class="space-y-4">
-    <div>
-      <div
-        class="text-2xs font-semibold uppercase tracking-wider mb-2"
-        :class="isDark ? 'text-slate-500' : 'text-slate-500'"
-      >
-        总览
-      </div>
-      <div class="grid grid-cols-2 gap-2">
-        <div
-          class="border rounded p-2"
-          :class="isDark ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-200'"
-        >
-          <div class="text-2xs" :class="isDark ? 'text-slate-400' : 'text-slate-500'">总大小</div>
-          <div class="text-base font-semibold mono" :class="isDark ? 'text-slate-200' : 'text-slate-800'">{{ formatSize(totalSize) }}</div>
+  <div class="fd-stats">
+    <div class="fd-stats-section">
+      <div class="fd-stats-title">概览</div>
+      <div class="fd-stat-row"><span class="fd-stat-label">总大小</span><span class="fd-stat-value">{{ formatSize(totalSize) }}</span></div>
+      <div class="fd-stat-row"><span class="fd-stat-label">文件数</span><span class="fd-stat-value">{{ fileCount }}</span></div>
+      <div class="fd-stat-row"><span class="fd-stat-label">目录数</span><span class="fd-stat-value">{{ dirCount }}</span></div>
+      <div class="fd-stat-row"><span class="fd-stat-label">扫描耗时</span><span class="fd-stat-value">{{ scanTime.toFixed(2) }}s</span></div>
+    </div>
+
+    <div class="fd-stats-section">
+      <div class="fd-stats-title">扩展名分布</div>
+      <div v-for="(ext, index) in extStats" :key="index" class="fd-ext-row">
+        <div class="fd-ext-head">
+          <span>{{ ext.name }}</span>
+          <span class="fd-ext-size">{{ ext.sizeFormatted }}</span>
         </div>
-        <div
-          class="border rounded p-2"
-          :class="isDark ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-200'"
-        >
-          <div class="text-2xs" :class="isDark ? 'text-slate-400' : 'text-slate-500'">文件数</div>
-          <div class="text-base font-semibold mono" :class="isDark ? 'text-slate-200' : 'text-slate-800'">{{ fileCount }}</div>
-        </div>
-        <div
-          class="border rounded p-2"
-          :class="isDark ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-200'"
-        >
-          <div class="text-2xs" :class="isDark ? 'text-slate-400' : 'text-slate-500'">目录数</div>
-          <div class="text-base font-semibold mono" :class="isDark ? 'text-slate-200' : 'text-slate-800'">{{ dirCount }}</div>
-        </div>
-        <div
-          class="border rounded p-2"
-          :class="isDark ? 'bg-slate-800 border-slate-700' : 'bg-slate-50 border-slate-200'"
-        >
-          <div class="text-2xs" :class="isDark ? 'text-slate-400' : 'text-slate-500'">扫描耗时</div>
-          <div class="text-base font-semibold mono" :class="isDark ? 'text-slate-200' : 'text-slate-800'">{{ scanTime.toFixed(2) }}s</div>
-        </div>
+        <div class="fd-ext-bar"><div class="fd-ext-fill" :style="{ width: ext.percent + '%', background: ext.color }"></div></div>
       </div>
     </div>
 
-    <div>
-      <div
-        class="text-2xs font-semibold uppercase tracking-wider mb-2"
-        :class="isDark ? 'text-slate-500' : 'text-slate-500'"
-      >
-        扩展名分布
-      </div>
-      <div class="space-y-1.5">
-        <div v-for="(ext, index) in extStats" :key="index">
-          <div class="flex items-center justify-between text-xs">
-            <span :class="isDark ? 'text-slate-300' : 'text-slate-600'">{{ ext.name }}</span>
-            <span class="mono" :class="isDark ? 'text-slate-400' : 'text-slate-500'">{{ ext.sizeFormatted }}</span>
-          </div>
-          <div class="w-full h-1.5 rounded-full overflow-hidden" :class="isDark ? 'bg-slate-700' : 'bg-slate-200'">
-            <div
-              class="h-full rounded-full"
-              :class="ext.color"
-              :style="{ width: ext.percent + '%' }"
-            ></div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div>
-      <div
-        class="text-2xs font-semibold uppercase tracking-wider mb-2"
-        :class="isDark ? 'text-slate-500' : 'text-slate-500'"
-      >
-        Top 5 大文件
-      </div>
-      <div class="space-y-1">
-        <div v-for="(file, index) in topFiles" :key="index" class="flex justify-between text-xs">
-          <span class="truncate w-32" :class="isDark ? 'text-slate-300' : 'text-slate-700'">{{ file.name }}</span>
-          <span class="mono" :class="isDark ? 'text-slate-400' : 'text-slate-500'">{{ file.sizeFormatted }}</span>
-        </div>
+    <div class="fd-stats-section">
+      <div class="fd-stats-title">Top 5 大文件</div>
+      <div v-for="(file, index) in topFiles" :key="index" class="fd-stat-row">
+        <span class="truncate" style="max-width: 140px" :title="file.name">{{ file.name }}</span>
+        <span class="fd-stat-value">{{ file.sizeFormatted }}</span>
       </div>
     </div>
   </div>
@@ -87,7 +36,6 @@ const props = defineProps({
   items: { type: Array, default: () => [] },
   totalSize: { type: Number, default: 0 },
   scanTime: { type: Number, default: 0 },
-  isDark: { type: Boolean, default: false },
 })
 
 const fileCount = computed(() => props.items.filter(i => !i.isDir).length)
@@ -113,7 +61,7 @@ const extStats = computed(() => {
     map.set(key, cur)
   }
 
-  const colors = ['bg-blue-500', 'bg-yellow-500', 'bg-green-500', 'bg-purple-500', 'bg-slate-400']
+  const colors = ['#007acc', '#dcb67a', '#89d185', '#c586c0', '#a0a0a0']
   return Array.from(map.entries())
     .sort((a, b) => b[1].size - a[1].size)
     .slice(0, 5)
@@ -137,3 +85,41 @@ const formatSize = (bytes) => {
   return (bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 2) + ' ' + units[i]
 }
 </script>
+
+<style scoped>
+.fd-stats { display: flex; flex-direction: column; gap: 14px; }
+.fd-stats-section { display: flex; flex-direction: column; gap: 4px; }
+.fd-stats-title {
+  font-size: 11px;
+  color: var(--fd-text-2);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 2px;
+}
+.fd-stat-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--fd-border);
+  font-size: 12px;
+}
+.fd-stat-label { color: var(--fd-text-2); }
+.fd-stat-value { font-family: Consolas, 'JetBrains Mono', monospace; color: var(--fd-text-0); }
+.fd-ext-row { margin-bottom: 6px; }
+.fd-ext-head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  margin-bottom: 3px;
+}
+.fd-ext-size { color: var(--fd-text-2); font-family: Consolas, 'JetBrains Mono', monospace; }
+.fd-ext-bar {
+  width: 100%;
+  height: 4px;
+  background: var(--fd-bg-3);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.fd-ext-fill { height: 100%; border-radius: 2px; }
+</style>

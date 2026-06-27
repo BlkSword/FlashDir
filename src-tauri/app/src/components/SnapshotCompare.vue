@@ -362,7 +362,7 @@ onMounted(() => {
 /* 快照列表 */
 .snapshot-section-title {
   font-size: 11px;
-  color: #8c8c8c;
+  color: var(--fd-text-2);
   margin-bottom: 8px;
   text-transform: uppercase;
 }
@@ -376,25 +376,25 @@ onMounted(() => {
   align-items: flex-start;
   padding: 8px;
   margin-bottom: 4px;
-  background: white;
-  border: 1px solid #f0f0f0;
+  background: var(--fd-bg-0);
+  border: 1px solid var(--fd-border);
   border-radius: 6px;
   cursor: pointer;
   transition: all 0.15s;
 }
 
 .snapshot-item:hover {
-  border-color: #1890ff;
-  background: #f0f5ff;
+  border-color: var(--fd-accent);
+  background: var(--fd-bg-2);
 }
 
 .snapshot-selected {
-  border-color: #1890ff;
-  background: #e6f7ff;
+  border-color: var(--fd-accent);
+  background: var(--fd-selected);
 }
 
 .snapshot-latest {
-  border-left: 3px solid #1890ff;
+  border-left: 3px solid var(--fd-accent);
 }
 
 .snapshot-select {
@@ -405,7 +405,7 @@ onMounted(() => {
 .snapshot-checkbox {
   width: 16px;
   height: 16px;
-  border: 2px solid #d9d9d9;
+  border: 2px solid var(--fd-text-2);
   border-radius: 3px;
   display: flex;
   align-items: center;
@@ -416,8 +416,8 @@ onMounted(() => {
 }
 
 .snapshot-checkbox.checked {
-  background: #1890ff;
-  border-color: #1890ff;
+  background: var(--fd-accent);
+  border-color: var(--fd-accent);
 }
 
 .snapshot-info {
@@ -428,7 +428,7 @@ onMounted(() => {
 .snapshot-path {
   font-size: 12px;
   font-weight: 600;
-  color: #262626;
+  color: var(--fd-text-0);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -436,13 +436,13 @@ onMounted(() => {
 
 .snapshot-meta {
   font-size: 10px;
-  color: #8c8c8c;
+  color: var(--fd-text-2);
   margin-top: 2px;
 }
 
 .snapshot-size {
   font-weight: 500;
-  color: #595959;
+  color: var(--fd-text-1);
 }
 
 .snapshot-dot {
@@ -451,7 +451,7 @@ onMounted(() => {
 
 .snapshot-time {
   font-size: 10px;
-  color: #bfbfbf;
+  color: var(--fd-text-2);
   margin-top: 2px;
 }
 
@@ -471,7 +471,7 @@ onMounted(() => {
 /* 空状态 */
 .snapshot-empty {
   text-align: center;
-  color: #bfbfbf;
+  color: var(--fd-text-2);
   font-size: 12px;
   padding: 32px 0;
 }
@@ -494,8 +494,8 @@ onMounted(() => {
 
 .diff-stat {
   flex: 1;
-  background: white;
-  border: 1px solid #f0f0f0;
+  background: var(--fd-bg-0);
+  border: 1px solid var(--fd-border);
   border-radius: 6px;
   padding: 8px;
   text-align: center;
@@ -508,40 +508,40 @@ onMounted(() => {
 
 .diff-stat-label {
   font-size: 10px;
-  color: #8c8c8c;
+  color: var(--fd-text-2);
   margin-top: 2px;
 }
 
-.diff-grow .diff-stat-value { color: #52c41a; }
-.diff-shrink .diff-stat-value { color: #f5222d; }
+.diff-grow .diff-stat-value { color: var(--fd-success); }
+.diff-shrink .diff-stat-value { color: var(--fd-danger); }
 .diff-modify .diff-stat-value { color: #faad14; }
 
 /* 增长条 */
 .diff-growth-bar {
   margin-bottom: 12px;
   padding: 8px;
-  background: white;
+  background: var(--fd-bg-0);
   border-radius: 6px;
-  border: 1px solid #f0f0f0;
+  border: 1px solid var(--fd-border);
 }
 
 .diff-growth-label {
   font-size: 11px;
-  color: #595959;
+  color: var(--fd-text-2);
   margin-bottom: 4px;
   text-align: center;
 }
 
 .diff-bar-track {
   height: 6px;
-  background: #f5f5f5;
+  background: var(--fd-bg-3);
   border-radius: 3px;
   overflow: hidden;
 }
 
 .diff-bar-grow {
   height: 100%;
-  background: linear-gradient(90deg, #52c41a, #f5222d);
+  background: linear-gradient(90deg, var(--fd-success), var(--fd-danger));
   border-radius: 3px;
   transition: width 0.3s;
 }
@@ -559,9 +559,9 @@ onMounted(() => {
   border-radius: 4px;
 }
 
-.diff-title-grow { background: #f6ffed; color: #52c41a; }
-.diff-title-shrink { background: #fff1f0; color: #f5222d; }
-.diff-title-modify { background: #fffbe6; color: #faad14; }
+.diff-title-grow { background: rgba(137,209,133,0.15); color: var(--fd-success); }
+.diff-title-shrink { background: rgba(244,135,113,0.15); color: var(--fd-danger); }
+.diff-title-modify { background: rgba(250,173,20,0.15); color: #faad14; }
 
 .diff-items {
   max-height: 300px;
@@ -577,7 +577,7 @@ onMounted(() => {
 }
 
 .diff-item:hover {
-  background: #fafafa;
+  background: var(--fd-bg-2);
 }
 
 .diff-item-name {
@@ -586,7 +586,7 @@ onMounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: #595959;
+  color: var(--fd-text-1);
 }
 
 .diff-item-size {
@@ -601,12 +601,12 @@ onMounted(() => {
   font-weight: 500;
 }
 
-.diff-grow-text { color: #52c41a; }
-.diff-shrink-text { color: #f5222d; }
+.diff-grow-text { color: var(--fd-success); }
+.diff-shrink-text { color: var(--fd-danger); }
 
 .diff-more {
   font-size: 11px;
-  color: #bfbfbf;
+  color: var(--fd-text-2);
   text-align: center;
   padding: 4px;
 }

@@ -1,29 +1,23 @@
 <template>
-  <aside
-    class="w-80 shrink-0 flex flex-col border-l"
-    :class="isDark ? 'bg-slate-900 border-slate-700' : 'bg-white border-slate-300'"
-  >
-    <div class="flex border-b" :class="isDark ? 'border-slate-700' : 'border-slate-200'">
+  <aside class="fd-right-panel">
+    <div class="fd-panel-tabs">
       <button
         v-for="tab in tabs"
         :key="tab.key"
-        class="flex-1 px-2 py-2 text-xs font-medium transition-colors"
-        :class="activeTab === tab.key
-          ? (isDark ? 'text-blue-400 border-b-2 border-blue-500 bg-blue-900/20' : 'text-blue-600 border-b-2 border-blue-600 bg-blue-50/50')
-          : (isDark ? 'text-slate-400 hover:bg-slate-800' : 'text-slate-500 hover:bg-slate-50')"
+        class="fd-panel-tab"
+        :class="{ active: activeTab === tab.key }"
         @click="$emit('update:activeTab', tab.key)"
       >
         {{ tab.label }}
       </button>
     </div>
 
-    <div class="flex-1 overflow-auto p-3">
+    <div class="fd-panel-body">
       <StatsTab
         v-if="activeTab === 'stats'"
         :items="items"
         :total-size="totalSize"
         :scan-time="scanTime"
-        :is-dark="isDark"
       />
       <Treemap
         v-else-if="activeTab === 'treemap'"
@@ -65,8 +59,46 @@ defineProps({
   currentPath: { type: String, default: '' },
   activeTab: { type: String, default: 'stats' },
   scanTime: { type: Number, default: 0 },
-  isDark: { type: Boolean, default: false },
 })
 
 defineEmits(['update:activeTab'])
 </script>
+
+<style scoped>
+.fd-right-panel {
+  grid-row: 2 / 3;
+  grid-column: 3 / 4;
+  background: var(--fd-bg-1);
+  border-left: 1px solid var(--fd-border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.fd-panel-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--fd-border);
+  flex-shrink: 0;
+}
+.fd-panel-tab {
+  flex: 1;
+  padding: 6px 0;
+  border: none;
+  background: transparent;
+  color: var(--fd-text-2);
+  font-size: 12px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+.fd-panel-tab:hover { color: var(--fd-text-1); }
+.fd-panel-tab.active {
+  color: var(--fd-text-0);
+  border-bottom-color: var(--fd-accent);
+  background: var(--fd-bg-2);
+}
+.fd-panel-body {
+  flex: 1;
+  overflow: auto;
+  padding: 10px;
+}
+</style>

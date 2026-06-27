@@ -126,6 +126,8 @@ const formatTime = (timestamp) => {
 .history-list {
   max-height: 400px;
   overflow-y: auto;
+  background: var(--fd-bg-1);
+  color: var(--fd-text-1);
 }
 
 .history-item {
@@ -134,28 +136,30 @@ const formatTime = (timestamp) => {
   border-radius: 4px;
   margin-bottom: 4px;
   transition: background-color 0.2s;
+  border-bottom: 1px solid var(--fd-border);
 }
 
 .history-item:hover {
-  background: #f5f5f5;
+  background: var(--fd-bg-2);
 }
 
 .history-path {
   font-family: 'Consolas', 'Monaco', monospace;
   font-size: 13px;
   word-break: break-all;
+  color: var(--fd-text-0);
 }
 
 .history-meta {
   display: flex;
   gap: 16px;
   font-size: 12px;
-  color: #8c8c8c;
+  color: var(--fd-text-2);
 }
 
 .history-actions {
   padding: 12px;
-  border-top: 1px solid #f0f0f0;
+  border-top: 1px solid var(--fd-border);
   display: flex;
   justify-content: center;
 }

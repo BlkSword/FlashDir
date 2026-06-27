@@ -436,8 +436,8 @@ watch(() => props.items, () => {
 
 .treemap-toolbar {
   padding: 8px 12px;
-  background: white;
-  border-bottom: 1px solid #f0f0f0;
+  background: var(--fd-bg-1);
+  border-bottom: 1px solid var(--fd-border);
 }
 
 .treemap-breadcrumb {
@@ -450,7 +450,7 @@ watch(() => props.items, () => {
 .treemap-current-dir {
   font-size: 12px;
   font-weight: 600;
-  color: #262626;
+  color: var(--fd-text-0);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -458,7 +458,7 @@ watch(() => props.items, () => {
 
 .treemap-dir-stats {
   font-size: 11px;
-  color: #8c8c8c;
+  color: var(--fd-text-2);
   margin-left: 8px;
 }
 
@@ -470,7 +470,7 @@ watch(() => props.items, () => {
 
 .treemap-legend-item {
   font-size: 10px;
-  color: #595959;
+  color: var(--fd-text-2);
   display: flex;
   align-items: center;
   gap: 3px;
@@ -488,6 +488,7 @@ watch(() => props.items, () => {
   overflow: hidden;
   position: relative;
   cursor: crosshair;
+  background: var(--fd-bg-0);
 }
 
 .treemap-canvas-wrapper canvas {
@@ -496,8 +497,9 @@ watch(() => props.items, () => {
 
 .treemap-tooltip {
   position: absolute;
-  background: rgba(0, 0, 0, 0.8);
-  color: white;
+  background: var(--fd-bg-2);
+  color: var(--fd-text-0);
+  border: 1px solid var(--fd-border);
   padding: 6px 10px;
   border-radius: 4px;
   font-size: 12px;
@@ -515,7 +517,7 @@ watch(() => props.items, () => {
 }
 
 .tooltip-size {
-  color: #bfbfbf;
+  color: var(--fd-text-2);
   font-size: 11px;
   margin-top: 2px;
 }
@@ -525,7 +527,7 @@ watch(() => props.items, () => {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #bfbfbf;
+  color: var(--fd-text-2);
   font-size: 13px;
 }
 </style>
