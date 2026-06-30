@@ -59,6 +59,9 @@
       :loading="loading"
       :mft-available="mftAvailable"
       :is-admin="isAdmin"
+      :global-search-loading="globalSearchLoading"
+      :global-search-failed="globalSearchFailed"
+      :global-search-status="globalSearchStatusText"
     />
 
     <a-modal
@@ -131,6 +134,30 @@ const historyVisible = ref(false)
 const globalSearchVisible = ref(false)
 const rightPanelTab = ref('stats')
 const sidebarCollapsed = ref(false)
+const globalSearchState = ref({ kind: 'notLoaded' })
+const globalSearchProgress = ref(null)
+
+let unlistenGlobalSearchProgress = null
+
+const globalSearchLoading = computed(() => globalSearchState.value?.kind === 'loading')
+const globalSearchFailed = computed(() => globalSearchState.value?.kind === 'failed')
+const globalSearchStatusText = computed(() => {
+  const kind = globalSearchState.value?.kind
+  if (kind === 'loading') {
+    const drive = globalSearchProgress.value?.drive || globalSearchState.value?.data?.drive || '…'
+    const scanned = globalSearchProgress.value?.scanned ?? globalSearchState.value?.data?.scanned ?? 0
+    return `全局索引：正在扫描 ${drive} · ${scanned.toLocaleString()} 项`
+  }
+  if (kind === 'failed') {
+    return `全局索引失败：${globalSearchState.value?.data?.reason || '未知错误'}`
+  }
+  if (kind === 'ready') {
+    const data = globalSearchState.value?.data
+    const total = (data?.fileCount || 0) + (data?.dirCount || 0)
+    return `全局索引就绪 · ${total.toLocaleString()} 项`
+  }
+  return ''
+})
 
 const lastSortKey = ref('')
 const presortedAllItems = shallowRef([])
@@ -443,6 +470,14 @@ const handleOpenDirFromSearch = (path) => {
   if (path) handleScan(path)
 }
 
+const fetchGlobalSearchStatus = async () => {
+  try {
+    globalSearchState.value = await invoke('global_search_status')
+  } catch (error) {
+    console.error('获取全局搜索状态失败:', error)
+  }
+}
+
 const loadHistory = async () => {
   try {
     const historyData = await invoke('get_history_summary')
@@ -462,17 +497,36 @@ const onGlobalSearchKeydown = (e) => {
 onMounted(async () => {
   loadHistory()
   document.addEventListener('keydown', onGlobalSearchKeydown)
+
+  unlistenGlobalSearchProgress = await listen('global-search-progress', (event) => {
+    globalSearchProgress.value = event.payload
+    if (event.payload?.phase === 'done') {
+      fetchGlobalSearchStatus()
+    } else {
+      globalSearchState.value = {
+        kind: 'loading',
+        data: { drive: event.payload?.drive || '', scanned: event.payload?.scanned || 0 }
+      }
+    }
+  })
+
   try {
     isAdmin.value = await invoke('is_admin')
   } catch {
     isAdmin.value = false
   }
+
+  await fetchGlobalSearchStatus()
 })
 
 onUnmounted(() => {
   if (unlistenScanBatch) {
     unlistenScanBatch()
     unlistenScanBatch = null
+  }
+  if (unlistenGlobalSearchProgress) {
+    unlistenGlobalSearchProgress()
+    unlistenGlobalSearchProgress = null
   }
   document.removeEventListener('keydown', onGlobalSearchKeydown)
 })

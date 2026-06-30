@@ -1,15 +1,16 @@
 <template>
   <a-modal
     :open="visible"
-    title="全局搜索"
-    :width="660"
+    :title="expanded ? null : '全局搜索'"
+    :width="expanded ? '80vw' : 660"
     :footer="null"
     :destroy-on-close="false"
-    class="fd-global-search"
+    :closable="!expanded"
+    :class="['fd-global-search', { 'fd-global-search-expanded': expanded }]"
     @cancel="close"
   >
-    <div class="fd-search-input-wrap">
-      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+    <div class="fd-search-input-wrap" :class="{ expanded: expanded }">
+      <svg class="fd-search-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
       <a-input-search
         ref="inputRef"
         v-model:value="query"
@@ -20,6 +21,14 @@
         @change="onQueryChange"
         @search="onQueryChange"
       />
+      <button
+        class="fd-expand-btn"
+        :title="expanded ? '收缩窗口' : '展开为半屏（Everything 风格）'"
+        @click="toggleExpanded"
+      >
+        <svg v-if="expanded" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 4H5v4M5 4l4 4m6-4h4v4M19 4l-4 4M9 20H5v-4M5 20l4-4m6 4h4v-4M19 20l-4-4" /></svg>
+        <svg v-else fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" /></svg>
+      </button>
     </div>
 
     <div v-if="!ready" class="fd-index-state">
@@ -34,7 +43,7 @@
           · 已索引 {{ (progress?.scanned ?? stateData?.scanned ?? 0) }} 项
         </span>
       </div>
-      <div v-else-if="stateKind === 'failed'" class="fd-state-box failed">
+      <div v-else-if="stateKind === 'failed'" class="fd-state-box">
         <p>{{ failedReason }}</p>
         <a-button :loading="loading" @click="ensureIndex">重试</a-button>
       </div>
@@ -45,25 +54,41 @@
         找到 {{ results.length }} 项
       </div>
       <div class="fd-result-list">
-        <div
+        <a-dropdown
           v-for="(item, index) in displayResults"
           :key="index"
-          class="fd-result-item"
-          @click="openTarget(item)"
+          :trigger="['contextmenu']"
+          overlay-class-name="fd-result-context-menu"
         >
-          <div class="fd-result-icon">
-            <svg v-if="item.isDir" fill="currentColor" viewBox="0 0 24 24"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
-            <svg v-else fill="currentColor" viewBox="0 0 24 24"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-          </div>
-          <div class="fd-result-main">
-            <div class="fd-result-name" v-html="highlight(item.name)"></div>
-            <div class="fd-result-meta">
-              <span class="fd-result-path">{{ item.path }}</span>
-              <span v-if="!item.isDir"> · {{ formatSize(item.size) }}</span>
-              <span v-if="item.mtime"> · {{ formatTime(item.mtime * 1000) }}</span>
+          <div
+            class="fd-result-item"
+            :title="item.path"
+            @click="openTarget(item)"
+          >
+            <div class="fd-result-icon">
+              <svg v-if="item.isDir" fill="currentColor" viewBox="0 0 24 24"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
+              <svg v-else fill="currentColor" viewBox="0 0 24 24"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+            </div>
+            <div class="fd-result-main">
+              <div class="fd-result-name" v-html="highlight(item.name)"></div>
+              <div class="fd-result-meta">
+                <span class="fd-result-path">{{ item.path }}</span>
+                <span v-if="!item.isDir"> · {{ formatSize(item.size) }}</span>
+                <span v-if="item.mtime"> · {{ formatTime(item.mtime * 1000) }}</span>
+              </div>
             </div>
           </div>
-        </div>
+          <template #overlay>
+            <a-menu @click="({ key }) => onContextMenuClick(key, item)">
+              <a-menu-item key="open">打开</a-menu-item>
+              <a-menu-item key="open-folder">打开所在文件夹</a-menu-item>
+              <a-menu-item key="scan-dir">在主界面打开所在目录</a-menu-item>
+              <a-menu-divider />
+              <a-menu-item key="copy-path">复制完整路径</a-menu-item>
+              <a-menu-item key="copy-name">复制文件名</a-menu-item>
+            </a-menu>
+          </template>
+        </a-dropdown>
       </div>
 
       <a-pagination
@@ -84,7 +109,7 @@
       />
     </div>
 
-    <div v-if="ready" class="fd-modal-footer">
+    <div v-if="ready" class="fd-modal-footer" :class="{ 'fd-modal-footer-inline': expanded }">
       <span v-if="indexMeta" class="fd-footer-meta">
         已索引 {{ (indexMeta.fileCount || 0) + (indexMeta.dirCount || 0) }} 项 · {{ indexMeta.driveCount || 0 }} 个盘
         <span v-if="indexMeta.failedDrives?.length" class="fd-footer-warn">
@@ -99,7 +124,7 @@
 
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
-import { Empty } from 'ant-design-vue'
+import { Empty, message } from 'ant-design-vue'
 import { listen } from '@tauri-apps/api/event'
 import { useTauri } from '../composables/useTauri'
 import { formatSize, debounce, getParentPath } from '../utils/format.js'
@@ -122,6 +147,7 @@ const progress = ref(null)
 const inputRef = ref(null)
 const currentPage = ref(1)
 const pageSize = ref(100)
+const expanded = ref(false)
 
 let unlistenProgress = null
 
@@ -135,6 +161,11 @@ const displayResults = computed(() => {
   const start = (currentPage.value - 1) * pageSize.value
   return results.value.slice(start, start + pageSize.value)
 })
+
+const toggleExpanded = () => {
+  expanded.value = !expanded.value
+  nextTick(() => inputRef.value?.focus?.())
+}
 
 const fetchStatus = async () => {
   try {
@@ -212,6 +243,63 @@ const openTarget = (item) => {
   const target = item.isDir ? item.path : getParentPath(item.path)
   emit('open-dir', target)
   close()
+}
+
+const openItem = async (item) => {
+  try {
+    await invoke('open_path', { path: item.path })
+  } catch (e) {
+    console.error('打开失败', e)
+    message.error('打开失败: ' + e)
+  }
+}
+
+const openParentFolder = async (item) => {
+  const target = item.isDir ? item.path : getParentPath(item.path)
+  try {
+    await invoke('open_path', { path: target })
+  } catch (e) {
+    console.error('打开失败', e)
+    message.error('打开失败: ' + e)
+  }
+}
+
+const scanItemDir = (item) => {
+  const target = item.isDir ? item.path : getParentPath(item.path)
+  emit('open-dir', target)
+  close()
+}
+
+const copyToClipboard = async (text, label) => {
+  try {
+    await navigator.clipboard.writeText(text)
+    message.success(`${label}已复制`)
+  } catch (e) {
+    console.error('复制失败', e)
+    message.error('复制失败')
+  }
+}
+
+const onContextMenuClick = (key, item) => {
+  switch (key) {
+    case 'open':
+      openItem(item)
+      break
+    case 'open-folder':
+      openParentFolder(item)
+      break
+    case 'scan-dir':
+      scanItemDir(item)
+      break
+    case 'copy-path':
+      copyToClipboard(item.path, '路径')
+      break
+    case 'copy-name':
+      copyToClipboard(item.name, '文件名')
+      break
+    default:
+      break
+  }
 }
 
 const close = () => emit('update:visible', false)
@@ -293,6 +381,8 @@ watch(
     if (v) {
       fetchStatus()
       nextTick(() => inputRef.value?.focus?.())
+    } else {
+      expanded.value = false
     }
   }
 )
@@ -316,6 +406,40 @@ watch(
   padding: 8px 12px !important;
 }
 .fd-global-search .ant-input::placeholder { color: var(--fd-text-3) !important; }
+
+/* 展开模式：顶部居中、更宽、更像 Everything */
+.fd-global-search-expanded .ant-modal {
+  top: 8vh !important;
+  padding-bottom: 0 !important;
+}
+.fd-global-search-expanded .ant-modal-content {
+  border-radius: 8px !important;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5) !important;
+}
+.fd-global-search-expanded .ant-modal-header {
+  display: none;
+}
+.fd-global-search-expanded .ant-modal-body {
+  padding: 16px 20px 12px !important;
+}
+
+/* 右键菜单暗色主题 */
+.fd-result-context-menu .ant-dropdown-menu {
+  background: var(--fd-bg-2) !important;
+  border: 1px solid var(--fd-border) !important;
+  border-radius: 4px !important;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4) !important;
+}
+.fd-result-context-menu .ant-dropdown-menu-item {
+  color: var(--fd-text-1) !important;
+  font-size: 13px !important;
+}
+.fd-result-context-menu .ant-dropdown-menu-item:hover {
+  background: var(--fd-bg-3) !important;
+}
+.fd-result-context-menu .ant-dropdown-menu-item-divider {
+  background-color: var(--fd-border) !important;
+}
 </style>
 
 <style scoped>
@@ -324,15 +448,56 @@ watch(
   align-items: center;
   gap: 8px;
 }
-.fd-search-input-wrap svg {
+.fd-search-input-wrap.expanded {
+  gap: 12px;
+  padding: 4px 0 8px;
+}
+.fd-search-icon {
   width: 16px;
   height: 16px;
   color: var(--fd-text-2);
   flex-shrink: 0;
 }
+.fd-search-input-wrap.expanded .fd-search-icon {
+  width: 22px;
+  height: 22px;
+}
 .fd-search-input-wrap :deep(.ant-input) {
   flex: 1;
   font-size: 14px;
+}
+.fd-search-input-wrap.expanded :deep(.ant-input) {
+  font-size: 18px;
+  padding: 10px 14px !important;
+}
+.fd-expand-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--fd-border);
+  background: var(--fd-bg-2);
+  color: var(--fd-text-2);
+  border-radius: 4px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.fd-expand-btn:hover {
+  background: var(--fd-bg-3);
+  color: var(--fd-text-0);
+}
+.fd-expand-btn svg {
+  width: 14px;
+  height: 14px;
+}
+.fd-search-input-wrap.expanded .fd-expand-btn {
+  width: 32px;
+  height: 32px;
+}
+.fd-search-input-wrap.expanded .fd-expand-btn svg {
+  width: 18px;
+  height: 18px;
 }
 .fd-index-state { padding: 24px 0; text-align: center; }
 .fd-state-box {
@@ -348,6 +513,10 @@ watch(
 .fd-state-box.failed { color: var(--fd-danger); }
 
 .fd-results { margin-top: 12px; max-height: 52vh; overflow-y: auto; }
+.fd-global-search-expanded .fd-results {
+  max-height: 58vh;
+  margin-top: 16px;
+}
 .fd-results-meta {
   font-size: 12px;
   color: var(--fd-text-2);
@@ -398,6 +567,10 @@ watch(
   margin-top: 12px;
   padding-top: 10px;
   border-top: 1px solid var(--fd-border);
+}
+.fd-modal-footer-inline {
+  margin-top: 10px;
+  padding-top: 8px;
 }
 .fd-footer-meta { font-size: 11px; color: var(--fd-text-2); }
 .fd-footer-spacer { flex: 1; }

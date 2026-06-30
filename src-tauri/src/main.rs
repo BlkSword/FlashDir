@@ -12,6 +12,8 @@ use parking_lot::Mutex;
 mod commands;
 
 use flashdir::scan;
+use flashdir::global_search;
+use tauri::Emitter;
 
 struct AppState {
     history: Mutex<VecDeque<scan::HistoryItem>>,
@@ -27,6 +29,78 @@ async fn main() {
         .plugin(tauri_plugin_fs::init())
         .manage(AppState {
             history: Mutex::new(commands::load_history_from_file_sync()),
+        })
+        .setup(|app| {
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let idx = global_search::instance();
+
+                // 若已从磁盘持久化缓存恢复，则不再重复构建
+                if matches!(idx.state(), global_search::IndexState::Ready(..)) {
+                    let _ = app_handle.emit(
+                        "global-search-progress",
+                        serde_json::json!({ "drive": "", "scanned": 0, "phase": "done" }),
+                    );
+                    return;
+                }
+
+                idx.set_loading();
+                let drives = global_search::list_ntfs_drives();
+                if drives.is_empty() {
+                    idx.set_failed("未检测到可扫描的 NTFS 卷".to_string());
+                    let _ = app_handle.emit(
+                        "global-search-progress",
+                        serde_json::json!({ "drive": "", "scanned": 0, "phase": "done" }),
+                    );
+                    return;
+                }
+
+                let mut ok_drives: Vec<char> = Vec::new();
+                for &drive in &drives {
+                    let _ = app_handle.emit(
+                        "global-search-progress",
+                        serde_json::json!({ "drive": drive.to_string(), "scanned": 0, "phase": "scanning" }),
+                    );
+
+                    let root = format!("{}:\\", drive);
+                    let app_h = app_handle.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        scan::scan_lite(&root).map(|items| {
+                            let count = items.len();
+                            global_search::instance().append_scan(drive, &items);
+                            (drive, count)
+                        })
+                    })
+                    .await;
+
+                    match result {
+                        Ok(Some((drive, count))) => {
+                            ok_drives.push(drive);
+                            let _ = app_h.emit(
+                                "global-search-progress",
+                                serde_json::json!({ "drive": drive.to_string(), "scanned": count, "phase": "ok (lite)" }),
+                            );
+                        }
+                        _ => {
+                            let _ = app_h.emit(
+                                "global-search-progress",
+                                serde_json::json!({ "drive": drive.to_string(), "scanned": 0, "phase": "skipped" }),
+                            );
+                        }
+                    }
+                }
+
+                if ok_drives.is_empty() {
+                    idx.set_failed("需要管理员权限才能读取 NTFS MFT".to_string());
+                } else {
+                    idx.finish_building(&ok_drives);
+                }
+                let _ = app_handle.emit(
+                    "global-search-progress",
+                    serde_json::json!({ "drive": "", "scanned": 0, "phase": "done" }),
+                );
+            });
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             commands::scan_directory,

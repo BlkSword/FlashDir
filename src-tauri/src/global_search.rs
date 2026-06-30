@@ -241,6 +241,11 @@ impl GlobalIndex {
         *self.meta.write() = IndexMeta::default();
     }
 
+    /// 标记索引构建失败（例如启动时无管理员权限读取 MFT）
+    pub fn set_failed(&self, reason: String) {
+        *self.state.write() = IndexState::Failed { reason };
+    }
+
     /// 批量追加 MFT 全卷扫描结果（轻量路径，跳过聚合/format/排序）
     pub fn extend_entries(&self, drive: char, mft_files: &[crate::fs::MftFileInfo]) {
         for f in mft_files {
