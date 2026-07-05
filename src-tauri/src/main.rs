@@ -35,8 +35,18 @@ async fn main() {
             tauri::async_runtime::spawn(async move {
                 let idx = global_search::instance();
 
-                // 若已从磁盘持久化缓存恢复，则不再重复构建
-                if matches!(idx.state(), global_search::IndexState::Ready(..)) {
+                // 1. 后台加载持久化索引，避免阻塞启动路径
+                let _ = app_handle.emit(
+                    "global-search-progress",
+                    serde_json::json!({ "drive": "", "scanned": 0, "phase": "loading-persisted" }),
+                );
+                let load_result = tokio::task::spawn_blocking(move || {
+                    global_search::instance().load_persisted();
+                    global_search::instance().state()
+                })
+                .await;
+
+                if let Ok(global_search::IndexState::Ready(..)) = load_result {
                     let _ = app_handle.emit(
                         "global-search-progress",
                         serde_json::json!({ "drive": "", "scanned": 0, "phase": "done" }),
@@ -44,6 +54,7 @@ async fn main() {
                     return;
                 }
 
+                // 2. 没有可用持久化缓存，继续走轻量扫描构建索引
                 idx.set_loading();
                 let drives = global_search::list_ntfs_drives();
                 if drives.is_empty() {
@@ -57,11 +68,6 @@ async fn main() {
 
                 let mut ok_drives: Vec<char> = Vec::new();
                 for &drive in &drives {
-                    let _ = app_handle.emit(
-                        "global-search-progress",
-                        serde_json::json!({ "drive": drive.to_string(), "scanned": 0, "phase": "scanning" }),
-                    );
-
                     let root = format!("{}:\\", drive);
                     let app_h = app_handle.clone();
                     let result = tokio::task::spawn_blocking(move || {
@@ -76,15 +82,16 @@ async fn main() {
                     match result {
                         Ok(Some((drive, count))) => {
                             ok_drives.push(drive);
+                            let total = global_search::instance().entries_len();
                             let _ = app_h.emit(
                                 "global-search-progress",
-                                serde_json::json!({ "drive": drive.to_string(), "scanned": count, "phase": "ok (lite)" }),
+                                serde_json::json!({ "drive": drive.to_string(), "scanned": total, "phase": "ok (lite)", "count": count }),
                             );
                         }
                         _ => {
                             let _ = app_h.emit(
                                 "global-search-progress",
-                                serde_json::json!({ "drive": drive.to_string(), "scanned": 0, "phase": "skipped" }),
+                                serde_json::json!({ "drive": drive.to_string(), "scanned": global_search::instance().entries_len(), "phase": "skipped" }),
                             );
                         }
                     }
@@ -97,7 +104,7 @@ async fn main() {
                 }
                 let _ = app_handle.emit(
                     "global-search-progress",
-                    serde_json::json!({ "drive": "", "scanned": 0, "phase": "done" }),
+                    serde_json::json!({ "drive": "", "scanned": global_search::instance().entries_len(), "phase": "done" }),
                 );
             });
             Ok(())

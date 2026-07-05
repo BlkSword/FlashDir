@@ -51,14 +51,10 @@
       />
     </div>
 
-    <div class="fd-search-box">
-      <input
-        type="text"
-        placeholder="全局搜索 (Ctrl+K)"
-        @focus="$emit('open-global-search')"
-      />
-      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
-    </div>
+    <GlobalSearchDropdown
+      ref="globalSearchRef"
+      @open-dir="$emit('open-dir', $event)"
+    />
 
     <button class="fd-icon-btn" title="历史记录" @click="$emit('show-history')">
       <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
@@ -71,6 +67,9 @@
 </template>
 
 <script setup>
+import { ref } from 'vue'
+import GlobalSearchDropdown from './GlobalSearchDropdown.vue'
+
 defineProps({
   path: { type: String, default: '' },
   canGoBack: { type: Boolean, default: false },
@@ -79,19 +78,29 @@ defineProps({
   loading: { type: Boolean, default: false },
 })
 
+const globalSearchRef = ref(null)
+
+const focusGlobalSearch = () => {
+  globalSearchRef.value?.focusSearch?.()
+}
+
 defineEmits([
   'scan',
   'browse',
   'navigate',
   'show-history',
-  'open-global-search',
+  'open-dir',
   'toggle-sidebar',
 ])
+
+defineExpose({ focusGlobalSearch })
 </script>
 
 <style scoped>
 .fd-toolbar {
   grid-column: 1 / -1;
+  position: relative;
+  z-index: 100;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -163,28 +172,4 @@ defineEmits([
   min-width: 0;
 }
 .fd-path-prefix { color: var(--fd-text-2); user-select: none; }
-.fd-search-box {
-  position: relative;
-  width: 220px;
-}
-.fd-search-box input {
-  width: 100%;
-  padding: 5px 24px 5px 8px;
-  background: var(--fd-bg-0);
-  border: 1px solid var(--fd-border);
-  border-radius: 3px;
-  color: var(--fd-text-1);
-  font-size: 12px;
-  outline: none;
-}
-.fd-search-box input:focus { border-color: var(--fd-accent); }
-.fd-search-box svg {
-  position: absolute;
-  right: 6px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 13px;
-  height: 13px;
-  color: var(--fd-text-2);
-}
 </style>

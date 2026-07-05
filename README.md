@@ -7,12 +7,12 @@
 **磁盘可观测性平台 —— 不止于"谁占了我的磁盘"，而是"我的磁盘在过去一周发生了什么变化"**
 
 直接读取 NTFS 主文件表（$MFT），全盘 64 万+文件约 6 秒扫描完成。
-USN Journal 增量刷新、开发者工具自动识别、多版本快照对比、Everything 式智能过滤。
+USN Journal 增量刷新、开发者工具自动识别、多版本快照对比、Everything 式智能过滤，以及跨盘全局文件搜索。
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%2B-orange.svg)](https://www.rust-lang.org)
 [![Tauri](https://img.shields.io/badge/tauri-2.0-blue.svg)](https://tauri.app)
-[![Version](https://img.shields.io/badge/version-3.3.0-green.svg)](src-tauri/Cargo.toml)
+[![Version](https://img.shields.io/badge/version-3.4.0-green.svg)](src-tauri/Cargo.toml)
 
 </div>
 
@@ -30,6 +30,7 @@ USN Journal 增量刷新、开发者工具自动识别、多版本快照对比�
 | 开发者目录识别 | ❌ | ❌ | ❌ | ✅ |
 | 快照对比 / 增长追踪 | ❌ | ❌ | ❌ | ✅ |
 | Everything 式过滤 | ✅ | ❌ | ❌ | ✅ |
+| 跨盘全局搜索 | ✅ | ❌ | ❌ | ✅ |
 | 开源 | ❌ | ❌ | ❌ | ✅ |
 
 ### 性能
@@ -59,8 +60,12 @@ USN Journal 增量刷新、开发者工具自动识别、多版本快照对比�
    - **🗺️ 热图** — Squarified Treemap，点击钻入子目录
    - **🛠️ 开发者** — 自动识别 18 类开发工具目录的空间占用
    - **📸 快照** — 保存扫描历史、对比任意两次扫描的增长变化
+4. 点击顶部工具栏的搜索框，或使用 **Ctrl+K** 打开**全局搜索**：
+   - 跨盘搜索所有已索引文件
+   - 支持 `*.pdf`、`report*`、`*2024`、`ext:zip`、`size:>1GB` 等语法
+   - 首次使用需建立全盘索引（约几秒至几十秒）
 
-> 💡 以**管理员身份运行**可启用 MFT 直读模式，扫描速度通常提升 **30-60 倍**。
+> 💡 以**管理员身份运行**可启用 MFT 直读模式，扫描速度通常提升 **30-60 倍**，同时全局搜索也能索引所有 NTFS 卷。
 
 ### 命令行工具（CLI）
 
@@ -108,9 +113,32 @@ SIZE     TYPE       NAME
 
 ## 核心功能
 
-### 🔍 Everything 式智能过滤
+### 🔎 全局文件搜索
 
-在搜索框输入 Everything 风格的查询语法，实时过滤扫描结果：
+工具栏内置 Everything 风格的**跨盘全局搜索**。首次启动时后台构建一次全盘索引（读取各 NTFS 卷的 $MFT），之后常驻内存，搜索仅为内存过滤，毫秒级返回结果。
+
+| 语法 | 示例 | 效果 |
+|------|------|------|
+| 扩展名简写 | `*.pdf` / `.pdf` | 仅显示 .pdf 文件 |
+| 前缀匹配 | `report*` | 文件名以 report 开头 |
+| 后缀匹配 | `*2024` | 文件名以 2024 结尾 |
+| 包含匹配 | `*mid*` | 文件名包含 mid |
+| `ext:zip` | `ext:zip` | 按扩展名过滤 |
+| `name:report` | `name:annual` | 文件名包含关键字 |
+| `size:>100MB` | `size:>1GB` | 按大小过滤 |
+| `mtime:>7d` | `mtime:<1h` | 按修改时间过滤 |
+| `type:file` | `type:dir` | 仅文件或仅目录 |
+| `dir:Downloads` | `dir:"Program Files"` | 路径包含指定目录 |
+| 否定 | `NOT *.tmp` | 排除 .tmp 文件 |
+| 组合 | `report *.pdf size:>1MB` | 多条件同时满足 |
+
+- 索引支持 SQLite 持久化缓存，重启后可秒级恢复
+- 主界面扫描完成后自动将结果追加到全局索引
+- 结果支持打开文件、打开所在文件夹、复制路径/文件名
+
+### 🔍 本地智能过滤
+
+在主界面文件列表的搜索框中，也可使用 Everything 风格的查询语法实时过滤当前目录结果：
 
 | 语法 | 示例 | 效果 |
 |------|------|------|
@@ -120,7 +148,9 @@ SIZE     TYPE       NAME
 | `type:dir` | `type:dir` | 仅显示目录 |
 | `type:file` | `type:file ext:mp4` | 组合过滤 |
 | `dir:node_modules` | `dir:node_modules` | 路径中包含 node_modules |
-| 纯文本 | `年报` | 按文件名搜索 |
+| `mtime:>7d` | `mtime:<1h` | 按修改时间过滤 |
+| 纯文本 | `年报` | 按文件名或路径搜索 |
+| 否定 | `NOT .tmp` | 排除匹配项 |
 
 ### 🗺️ Squarified Treemap 热图
 
@@ -259,14 +289,15 @@ FlashDir/
 │   │   └── src/
 │   │       ├── App.vue               # 根布局（右侧四标签面板）
 │   │       ├── components/
-│   │       │   ├── Toolbar.vue       # 路径输入 + Everything 式搜索
+│   │       │   ├── Toolbar.vue       # 路径输入 + 全局搜索入口
+│   │       │   ├── GlobalSearchDropdown.vue # Everything 式跨盘全局搜索
 │   │       │   ├── FileList.vue      # 可排序虚拟列表
 │   │       │   ├── Charts.vue        # 文件类型分布图表
 │   │       │   ├── Treemap.vue       # Squarified Treemap 热图
 │   │       │   ├── DevAnalyzer.vue   # 开发者工具目录分析
 │   │       │   ├── SnapshotCompare.vue # 快照对比与增长追踪
 │   │       │   ├── Sidebar.vue       # 目录树导航
-│   │       │   ├── StatusBar.vue     # 状态栏（显示管理员/MFT模式）
+│   │       │   ├── StatusBar.vue     # 状态栏（显示管理员/MFT模式/全局索引状态）
 │   │       │   ├── RightPanel.vue    # 右侧面板容器
 │   │       │   ├── TreeNode.vue      # 树节点组件
 │   │       │   └── HistoryList.vue   # 扫描历史
@@ -286,6 +317,7 @@ FlashDir/
 │   │   ├── main.rs                   # Tauri GUI 入口
 │   │   ├── commands.rs               # Tauri IPC 命令
 │   │   ├── scan.rs                   # 核心扫描引擎 + USN 增量闭环
+│   │   ├── global_search.rs          # 跨盘全局文件搜索索引与过滤语法
 │   │   ├── disk_cache.rs             # SQLite 缓存（含多版本快照表）
 │   │   ├── dev_analyzer.rs           # 开发者目录识别引擎
 │   │   ├── diff_engine.rs            # 快照差异引擎
@@ -316,7 +348,7 @@ FlashDir/
 | 缓存 | DashMap + LRU（内存）· SQLite + bincode（磁盘 + 快照多版本） |
 | 分析引擎 | KnownPattern 分类器（18 类）· HashMap O(n) 差异引擎 |
 | 可视化 | Squarified Treemap (Canvas) · Chart.js 环形图/柱状图 |
-| 过滤搜索 | Everything-style 语法解析 · `ext:` `size:` `type:` `dir:` |
+| 过滤搜索 | Everything-style 语法解析 · 本地 `ext:`/`size:`/`type:`/`dir:` + 全局 `*.pdf`/`prefix*`/`*suffix`/`NOT` |
 | 内存优化 | mimalloc 分配器 · SmartString 栈存储 · Arc 共享 · ahash |
 | 排序卸载 | 三级回退：WASM（Rust）→ Web Worker（JS）→ 同步 JS |
 

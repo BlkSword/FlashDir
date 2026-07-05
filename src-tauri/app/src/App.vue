@@ -1,6 +1,7 @@
 <template>
   <div class="fd-app" :class="{ 'fd-sidebar-collapsed': sidebarCollapsed }">
     <Toolbar
+      ref="toolbarRef"
       :path="currentPath"
       :can-go-back="canGoBack"
       :can-go-forward="canGoForward"
@@ -10,7 +11,7 @@
       @browse="handleBrowse"
       @navigate="handleNavigate"
       @show-history="historyVisible = true"
-      @open-global-search="globalSearchVisible = true"
+      @open-dir="handleOpenDirFromSearch"
       @toggle-sidebar="sidebarCollapsed = !sidebarCollapsed"
     />
 
@@ -62,6 +63,7 @@
       :global-search-loading="globalSearchLoading"
       :global-search-failed="globalSearchFailed"
       :global-search-status="globalSearchStatusText"
+      :scan-phase="scanPhase"
     />
 
     <a-modal
@@ -77,11 +79,6 @@
         @clear="handleClearHistory"
       />
     </a-modal>
-
-    <GlobalSearchModal
-      v-model:visible="globalSearchVisible"
-      @open-dir="handleOpenDirFromSearch"
-    />
   </div>
 </template>
 
@@ -95,7 +92,6 @@ import FileList from './components/FileList.vue'
 import RightPanel from './components/RightPanel.vue'
 import StatusBar from './components/StatusBar.vue'
 import HistoryList from './components/HistoryList.vue'
-import GlobalSearchModal from './components/GlobalSearchModal.vue'
 import { useTauri } from './composables/useTauri'
 import { useSortWorker } from './composables/useSortWorker'
 import { debounce, getParentPath } from './utils/format.js'
@@ -107,6 +103,8 @@ const sortWorker = useSortWorker()
 
 let unlistenScanBatch = null
 const streamedItemCount = ref(0)
+const scanPhase = ref({ phase: '', message: '' })
+let unlistenScanPhase = null
 
 const currentPath = ref('')
 const allItems = shallowRef([])
@@ -131,7 +129,7 @@ const sortConfig = ref({
 
 const searchKeyword = ref('')
 const historyVisible = ref(false)
-const globalSearchVisible = ref(false)
+const toolbarRef = ref(null)
 const rightPanelTab = ref('stats')
 const sidebarCollapsed = ref(false)
 const globalSearchState = ref({ kind: 'notLoaded' })
@@ -144,8 +142,14 @@ const globalSearchFailed = computed(() => globalSearchState.value?.kind === 'fai
 const globalSearchStatusText = computed(() => {
   const kind = globalSearchState.value?.kind
   if (kind === 'loading') {
+    const phase = globalSearchProgress.value?.phase
+    if (phase === 'loading-persisted') {
+      return '全局索引：正在加载索引缓存…'
+    }
     const drive = globalSearchProgress.value?.drive || globalSearchState.value?.data?.drive || '…'
-    const scanned = globalSearchProgress.value?.scanned ?? globalSearchState.value?.data?.scanned ?? 0
+    const scanned = (globalSearchProgress.value?.scanned > 0
+      ? globalSearchProgress.value.scanned
+      : globalSearchState.value?.data?.scanned) || 0
     return `全局索引：正在扫描 ${drive} · ${scanned.toLocaleString()} 项`
   }
   if (kind === 'failed') {
@@ -199,6 +203,7 @@ const handleScan = async (path, addToHistory = true) => {
   backendTime.value = 0
   streamedItemCount.value = 0
   backendTotalSize.value = 0
+  scanPhase.value = { phase: '', message: '' }
 
   allItems.value = []
   treeData.value = []
@@ -270,6 +275,7 @@ const handleScan = async (path, addToHistory = true) => {
       unlistenScanBatch = null
     }
     streamedItemCount.value = 0
+    scanPhase.value = { phase: '', message: '' }
   }
 }
 
@@ -490,7 +496,7 @@ const loadHistory = async () => {
 const onGlobalSearchKeydown = (e) => {
   if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
     e.preventDefault()
-    globalSearchVisible.value = true
+    toolbarRef.value?.focusGlobalSearch?.()
   }
 }
 
@@ -510,6 +516,10 @@ onMounted(async () => {
     }
   })
 
+  unlistenScanPhase = await listen('scan-phase', (event) => {
+    scanPhase.value = event.payload || { phase: '', message: '' }
+  })
+
   try {
     isAdmin.value = await invoke('is_admin')
   } catch {
@@ -527,6 +537,10 @@ onUnmounted(() => {
   if (unlistenGlobalSearchProgress) {
     unlistenGlobalSearchProgress()
     unlistenGlobalSearchProgress = null
+  }
+  if (unlistenScanPhase) {
+    unlistenScanPhase()
+    unlistenScanPhase = null
   }
   document.removeEventListener('keydown', onGlobalSearchKeydown)
 })

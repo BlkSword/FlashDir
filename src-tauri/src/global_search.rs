@@ -74,28 +74,34 @@ pub struct GlobalIndex {
 }
 
 impl GlobalIndex {
-    fn new(load_persisted: bool) -> Self {
-        let index = GlobalIndex {
+    fn new() -> Self {
+        GlobalIndex {
             entries: RwLock::new(HashMap::new()),
             name_index: RwLock::new(HashMap::new()),
             state: RwLock::new(IndexState::NotLoaded),
             meta: RwLock::new(IndexMeta::default()),
-        };
+        }
+    }
 
-        // 尝试从 SQLite 磁盘缓存恢复持久化索引，实现“启动即用”
-        if load_persisted {
-            if let Ok(entries) = crate::disk_cache::DiskCache::instance().load_global_index() {
-                if !entries.is_empty() {
-                    eprintln!("[GlobalIndex] 从磁盘恢复 {} 条索引", entries.len());
-                    for entry in entries {
-                        index.upsert_internal(entry);
-                    }
-                    index.update_ready_state();
+    /// 从 SQLite 磁盘缓存异步恢复持久化索引。
+    /// 应在后台任务中调用，避免阻塞启动路径。
+    pub fn load_persisted(&self) {
+        if !matches!(self.state(), IndexState::NotLoaded) {
+            return;
+        }
+        self.set_loading();
+        match crate::disk_cache::DiskCache::instance().load_global_index() {
+            Ok(entries) if !entries.is_empty() => {
+                eprintln!("[GlobalIndex] 从磁盘恢复 {} 条索引", entries.len());
+                for entry in entries {
+                    self.upsert_internal(entry);
                 }
+                self.update_ready_state();
+            }
+            _ => {
+                *self.state.write() = IndexState::NotLoaded;
             }
         }
-
-        index
     }
 
     pub fn state(&self) -> IndexState {
@@ -458,8 +464,18 @@ impl GlobalIndex {
         let entries = self.entries.read();
 
         let mut candidates: Vec<IndexEntry> = if q_lower.is_empty() {
-            // 无文本条件：全量扫描（filter 仅命中少量结果时可能较慢，实际中少见）
-            entries.values().cloned().collect()
+            // 无文本条件：全量并行过滤（例如 *.pdf / size:>1GB 等纯 filter 查询）
+            let values: Vec<&IndexEntry> = entries.values().collect();
+            values
+                .par_iter()
+                .filter_map(|e| {
+                    if apply_filters(e, &filters) {
+                        Some((*e).clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
         } else if q_lower.chars().count() <= 2 {
             let values: Vec<&IndexEntry> = entries.values().collect();
             values
@@ -520,6 +536,8 @@ pub enum SearchFilterKind {
     Text(String),
     Name(String),
     Ext(String),
+    Prefix(String),
+    Suffix(String),
     Dir(String),
     Type { is_dir: bool },
     Size { op: FilterOp, bytes: i64 },
@@ -636,6 +654,25 @@ fn parse_mtime(value: &str) -> Option<(FilterOp, i64)> {
     Some((op, (num * multiplier as f64) as i64))
 }
 
+/// 解析通配符/后缀等简写语法。
+/// 支持 *.pdf / .pdf → Ext，prefix* → Prefix，*suffix → Suffix，
+/// *mid* → Text（包含）。
+fn parse_wildcard_filter(value: &str) -> Option<SearchFilterKind> {
+    if value.starts_with("*.") && value.len() > 2 && !value[2..].contains('*') {
+        Some(SearchFilterKind::Ext(value[2..].to_string()))
+    } else if value.starts_with('.') && value.len() > 1 && !value.contains('*') {
+        Some(SearchFilterKind::Ext(value[1..].to_string()))
+    } else if value.starts_with('*') && value.ends_with('*') && value.len() > 2 {
+        Some(SearchFilterKind::Text(value[1..value.len() - 1].to_string()))
+    } else if value.starts_with('*') && value.len() > 1 {
+        Some(SearchFilterKind::Suffix(value[1..].to_string()))
+    } else if value.ends_with('*') && value.len() > 1 {
+        Some(SearchFilterKind::Prefix(value[..value.len() - 1].to_string()))
+    } else {
+        None
+    }
+}
+
 fn split_filter_tokens(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -698,12 +735,15 @@ pub fn parse_search_filter(input: &str) -> Vec<SearchFilter> {
             }
         } else {
             let value = word.to_lowercase();
-            if negate_next {
+            let negate = negate_next;
+            negate_next = false;
+            if let Some(kind) = parse_wildcard_filter(&value) {
+                filters.push(SearchFilter { kind, negate });
+            } else if negate {
                 filters.push(SearchFilter {
                     kind: SearchFilterKind::Text(value),
                     negate: true,
                 });
-                negate_next = false;
             } else {
                 text_parts.push(value);
             }
@@ -725,6 +765,8 @@ fn apply_filters(entry: &IndexEntry, filters: &[SearchFilter]) -> bool {
         let matched = match &f.kind {
             SearchFilterKind::Text(t) => entry.name_lower.contains(t),
             SearchFilterKind::Name(n) => entry.name_lower.contains(n),
+            SearchFilterKind::Prefix(p) => entry.name_lower.starts_with(p),
+            SearchFilterKind::Suffix(s) => entry.name_lower.ends_with(s),
             SearchFilterKind::Ext(e) => {
                 if entry.is_dir {
                     false
@@ -793,17 +835,17 @@ pub(crate) fn normalize_abs_path(drive: char, path: &str) -> String {
 }
 
 lazy_static::lazy_static! {
-    static ref GLOBAL_INDEX: GlobalIndex = GlobalIndex::new(true);
+    static ref GLOBAL_INDEX: GlobalIndex = GlobalIndex::new();
 }
 
 pub fn instance() -> &'static GlobalIndex {
     &GLOBAL_INDEX
 }
 
-/// 创建一个不加载磁盘持久化索引的空实例，仅用于测试。
+/// 创建一个空实例，仅用于测试。
 #[cfg(test)]
 pub fn empty_instance_for_test() -> GlobalIndex {
-    GlobalIndex::new(false)
+    GlobalIndex::new()
 }
 
 // ─── NTFS 盘枚举 ──────────────────────────────────────────
@@ -867,6 +909,29 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_search_filter_wildcard() {
+        let filters = parse_search_filter("*.pdf");
+        assert_eq!(filters.len(), 1);
+        assert!(matches!(&filters[0].kind, SearchFilterKind::Ext(e) if e == "pdf"));
+
+        let filters = parse_search_filter(".pdf");
+        assert_eq!(filters.len(), 1);
+        assert!(matches!(&filters[0].kind, SearchFilterKind::Ext(e) if e == "pdf"));
+
+        let filters = parse_search_filter("report*");
+        assert_eq!(filters.len(), 1);
+        assert!(matches!(&filters[0].kind, SearchFilterKind::Prefix(p) if p == "report"));
+
+        let filters = parse_search_filter("*2024");
+        assert_eq!(filters.len(), 1);
+        assert!(matches!(&filters[0].kind, SearchFilterKind::Suffix(s) if s == "2024"));
+
+        let filters = parse_search_filter("NOT *.tmp");
+        assert_eq!(filters.len(), 1);
+        assert!(matches!(&filters[0].kind, SearchFilterKind::Ext(e) if e == "tmp" && filters[0].negate));
+    }
+
+    #[test]
     fn test_parse_search_filter_size() {
         let filters = parse_search_filter("size:>100MB");
         assert_eq!(filters.len(), 1);
@@ -889,7 +954,7 @@ mod tests {
     fn test_parse_search_filter_negate() {
         let filters = parse_search_filter("NOT .tmp");
         assert_eq!(filters.len(), 1);
-        assert!(matches!(&filters[0].kind, SearchFilterKind::Text(t) if t == ".tmp"));
+        assert!(matches!(&filters[0].kind, SearchFilterKind::Ext(e) if e == "tmp"));
         assert!(filters[0].negate);
     }
 
@@ -920,6 +985,94 @@ mod tests {
             negate: true,
         }];
         assert!(apply_filters(&entry, &neg));
+    }
+
+    #[test]
+    fn test_apply_filters_wildcard() {
+        let entry = IndexEntry {
+            path: "C:/docs/report_2024.pdf".to_string(),
+            name: "report_2024.pdf".to_string(),
+            name_lower: "report_2024.pdf".to_string(),
+            size: 1024,
+            is_dir: false,
+            mtime: 0,
+        };
+
+        assert!(apply_filters(
+            &entry,
+            &[SearchFilter {
+                kind: SearchFilterKind::Ext("pdf".to_string()),
+                negate: false,
+            }]
+        ));
+        assert!(!apply_filters(
+            &entry,
+            &[SearchFilter {
+                kind: SearchFilterKind::Ext("zip".to_string()),
+                negate: false,
+            }]
+        ));
+        assert!(apply_filters(
+            &entry,
+            &[SearchFilter {
+                kind: SearchFilterKind::Prefix("report".to_string()),
+                negate: false,
+            }]
+        ));
+        assert!(apply_filters(
+            &entry,
+            &[SearchFilter {
+                kind: SearchFilterKind::Suffix("2024.pdf".to_string()),
+                negate: false,
+            }]
+        ));
+        assert!(!apply_filters(
+            &entry,
+            &[SearchFilter {
+                kind: SearchFilterKind::Suffix("2023.pdf".to_string()),
+                negate: false,
+            }]
+        ));
+
+        // NOT *.tmp 应排除该文件
+        assert!(apply_filters(
+            &entry,
+            &[SearchFilter {
+                kind: SearchFilterKind::Ext("tmp".to_string()),
+                negate: true,
+            }]
+        ));
+    }
+
+    #[test]
+    fn test_search_with_filter_suffix_syntax() {
+        let idx = empty_instance_for_test();
+        for name in ["report_2024.pdf", "report_2023.pdf", "notes.txt", "archive.zip"] {
+            idx.upsert(IndexEntry {
+                path: format!("C:/docs/{}", name),
+                name: name.to_string(),
+                name_lower: name.to_string(),
+                size: 1024,
+                is_dir: false,
+                mtime: 0,
+            });
+        }
+
+        let r = idx.search_with_filter("*.pdf", 10);
+        assert_eq!(r.len(), 2);
+        assert!(r.iter().all(|e| e.name.ends_with(".pdf")));
+
+        let r = idx.search_with_filter("*2024.pdf", 10);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].name, "report_2024.pdf");
+
+        let r = idx.search_with_filter("report*", 10);
+        assert_eq!(r.len(), 2);
+        assert!(r.iter().all(|e| e.name.starts_with("report")));
+
+        let r = idx.search_with_filter("NOT *.pdf", 10);
+        assert_eq!(r.len(), 2);
+        assert!(r.iter().all(|e| !e.name.ends_with(".pdf")));
     }
 
     #[test]

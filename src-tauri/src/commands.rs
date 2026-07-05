@@ -509,10 +509,6 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
 
     for &drive in &drives {
         let root = format!("{}:\\", drive);
-        let _ = app.emit(
-            "global-search-progress",
-            serde_json::json!({ "drive": drive.to_string(), "scanned": 0, "phase": "scanning" }),
-        );
 
         // 1) 内存缓存命中：毫秒级（之前扫过该盘）
         if let Some(cached) = flashdir::scan::get_cached_items(&root) {
@@ -520,7 +516,7 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
             ok_drives.push(drive);
             let _ = app.emit(
                 "global-search-progress",
-                serde_json::json!({ "drive": drive.to_string(), "scanned": cached.len(), "phase": "ok (cache)" }),
+                serde_json::json!({ "drive": drive.to_string(), "scanned": idx.entries_len(), "phase": "ok (cache)", "count": cached.len() }),
             );
             continue;
         }
@@ -531,7 +527,7 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
             ok_drives.push(drive);
             let _ = app.emit(
                 "global-search-progress",
-                serde_json::json!({ "drive": drive.to_string(), "scanned": lite_items.len(), "phase": "ok (lite)" }),
+                serde_json::json!({ "drive": drive.to_string(), "scanned": idx.entries_len(), "phase": "ok (lite)", "count": lite_items.len() }),
             );
             continue;
         }
@@ -545,13 +541,13 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
                 ok_drives.push(drive);
                 let _ = app.emit(
                     "global-search-progress",
-                    serde_json::json!({ "drive": drive.to_string(), "scanned": result.items.len(), "phase": "ok" }),
+                    serde_json::json!({ "drive": drive.to_string(), "scanned": idx.entries_len(), "phase": "ok", "count": result.items.len() }),
                 );
             }
             Err(e) => {
                 let _ = app.emit(
                     "global-search-progress",
-                    serde_json::json!({ "drive": drive.to_string(), "scanned": 0, "phase": format!("skipped: {e}") }),
+                    serde_json::json!({ "drive": drive.to_string(), "scanned": idx.entries_len(), "phase": format!("skipped: {e}") }),
                 );
             }
         }
@@ -560,7 +556,7 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
     idx.finish_building(&ok_drives);
     let _ = app.emit(
         "global-search-progress",
-        serde_json::json!({ "drive": "", "scanned": 0, "phase": "done" }),
+        serde_json::json!({ "drive": "", "scanned": idx.entries_len(), "phase": "done" }),
     );
     Ok(())
 }
@@ -606,25 +602,35 @@ pub async fn global_search_refresh(app: tauri::AppHandle) -> Result<(), String> 
 
     for &drive in &drives {
         let root = format!("{}:\\", drive);
+
+        let mut count = 0usize;
         if let Some(cached) = flashdir::scan::get_cached_items(&root) {
             idx.append_scan(drive, &cached);
             ok_drives.push(drive);
-            continue;
-        }
-        if let Some(lite_items) = flashdir::scan::scan_lite(&root) {
+            count = cached.len();
+        } else if let Some(lite_items) = flashdir::scan::scan_lite(&root) {
             idx.append_scan(drive, &lite_items);
             ok_drives.push(drive);
-            continue;
-        }
-        if let Ok(result) = flashdir::scan::scan_directory(
+            count = lite_items.len();
+        } else if let Ok(result) = flashdir::scan::scan_directory(
             &root, false, std::sync::Arc::clone(&perf), Some(app.clone()),
         )
         .await
         {
             idx.append_scan(drive, &result.items);
             ok_drives.push(drive);
+            count = result.items.len();
         }
+
+        let _ = app.emit(
+            "global-search-progress",
+            serde_json::json!({ "drive": drive.to_string(), "scanned": idx.entries_len(), "phase": if count > 0 { "ok" } else { "skipped" }, "count": count }),
+        );
     }
     idx.finish_building(&ok_drives);
+    let _ = app.emit(
+        "global-search-progress",
+        serde_json::json!({ "drive": "", "scanned": idx.entries_len(), "phase": "done" }),
+    );
     Ok(())
 }

@@ -40,6 +40,15 @@ pub struct TimingInfo {
     pub total: f64,
 }
 
+/// 扫描阶段事件载荷（用于状态栏展示当前阶段）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanPhasePayload {
+    pub phase: String,
+    pub message: String,
+    pub progress: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Item {
@@ -338,6 +347,19 @@ pub fn format_size(bytes: i64) -> CompactString {
     }
 }
 
+fn emit_scan_phase(app_handle: &Option<tauri::AppHandle>, phase: &str, message: &str, progress: Option<f64>) {
+    if let Some(handle) = app_handle {
+        let _ = handle.emit(
+            "scan-phase",
+            ScanPhasePayload {
+                phase: phase.to_string(),
+                message: message.to_string(),
+                progress,
+            },
+        );
+    }
+}
+
 /// 主扫描函数 - 优化版
 /// 支持可选的渐进式流式传输：通过 app_handle 分批发送扫描结果
 pub async fn scan_directory(
@@ -390,6 +412,8 @@ pub async fn scan_directory(
     let mtime_datetime: chrono::DateTime<chrono::Local> = mtime.into();
     let mtime_timestamp = mtime_datetime.timestamp();
 
+    emit_scan_phase(&app_handle, "preparing", "准备扫描", None);
+
     // 1. 检查内存缓存
     if !force_refresh {
         let cache_check_start = std::time::Instant::now();
@@ -402,6 +426,7 @@ pub async fn scan_directory(
                 && crate::fs::check_mft_available(&root_dir);
 
             if cached.dir_mtime >= mtime_datetime && !can_upgrade_to_mft {
+                emit_scan_phase(&app_handle, "cache-hit-memory", "内存缓存命中", None);
                 let cache_read_time = cache_check_start.elapsed().as_millis() as u64;
                 perf_monitor.record_cache_hit(cache_read_time);
 
@@ -440,6 +465,7 @@ pub async fn scan_directory(
                 && crate::fs::check_mft_available(&root_dir);
 
             if !can_upgrade_to_mft {
+                emit_scan_phase(&app_handle, "cache-hit-disk", "磁盘缓存命中", None);
                 let cache_read_time = cache_check_start.elapsed().as_millis() as u64;
                 perf_monitor.record_cache_hit(cache_read_time);
 
@@ -480,6 +506,7 @@ pub async fn scan_directory(
     // 这样即使 mtime 不匹配，也能秒级刷新
     #[cfg(target_os = "windows")]
     if !force_refresh {
+        emit_scan_phase(&app_handle, "usn", "USN 增量刷新", None);
         if let Some(updated_result) = try_usn_incremental_update(
             &root_dir,
             &canonical_path,
@@ -499,7 +526,9 @@ pub async fn scan_directory(
     // 失败时自动回退到目录遍历
     let canonical_path_clone = canonical_path.clone();
     let perf_monitor_for_blocking = Arc::clone(&perf_monitor);
-    let app_handle_for_blocking = app_handle.map(Arc::new);
+    let app_handle_for_blocking = app_handle.clone().map(Arc::new);
+
+    emit_scan_phase(&app_handle, "mft", "MFT 直接读取", None);
 
     // 尝试 MFT 直接读取，失败则回退到目录遍历
     let mft_result = try_mft_scan_path(
@@ -510,15 +539,21 @@ pub async fn scan_directory(
     );
 
     let output = match mft_result {
-        Some(mft_output) => mft_output,
-        None => tokio::task::spawn_blocking(move || {
-            scan_directory_optimized_v4(
-                &canonical_path_clone,
-                &perf_monitor_for_blocking,
-                app_handle_for_blocking,
-            )
-        })
-        .await??,
+        Some(mft_output) => {
+            emit_scan_phase(&app_handle, "aggregating", "聚合目录大小", None);
+            mft_output
+        }
+        None => {
+            emit_scan_phase(&app_handle, "walking", "目录遍历", None);
+            tokio::task::spawn_blocking(move || {
+                scan_directory_optimized_v4(
+                    &canonical_path_clone,
+                    &perf_monitor_for_blocking,
+                    app_handle_for_blocking,
+                )
+            })
+            .await??
+        }
     };
 
     let scan_time = start_time.elapsed().as_secs_f64();
