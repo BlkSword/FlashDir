@@ -625,11 +625,14 @@ impl GlobalIndex {
 
         drop(entries);
 
-        // 按相关性排序：完全匹配 > 前缀匹配 > 包含匹配，同级按大小降序
+        // 按相关性排序：完全匹配 > 前缀匹配 > 包含匹配，同级按大小降序；
+        // 同分按名称/路径字典序兜底，保证同一查询多次搜索结果顺序稳定
         candidates.sort_unstable_by(|a, b| {
             let sa = relevance_score(a, &q_lower);
             let sb = relevance_score(b, &q_lower);
             sb.cmp(&sa)
+                .then_with(|| a.name_lower.cmp(&b.name_lower))
+                .then_with(|| a.path.cmp(&b.path))
         });
 
         candidates.into_iter().take(limit).collect()

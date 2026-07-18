@@ -62,43 +62,78 @@
           <span v-if="!expanded && results.length >= compactLimit" class="fd-results-meta-hint">· 仅显示前 {{ compactLimit }} 条</span>
         </div>
 
-        <div ref="listRef" class="fd-result-list" :class="{ empty: results.length === 0 }">
-          <div
-            v-for="(item, index) in displayResults"
-            :key="item.path"
-            class="fd-result-item"
-            :class="{ active: index === activeIndex }"
-            :title="item.path"
-            @click="openItem(item)"
-            @contextmenu.prevent="showContextMenu($event, item)"
-            @mousemove="activeIndex = index"
-          >
-            <div class="fd-result-icon">
-              <svg v-if="item.isDir" fill="currentColor" viewBox="0 0 24 24"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
-              <svg v-else fill="currentColor" viewBox="0 0 24 24"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-            </div>
-            <div class="fd-result-main">
-              <div class="fd-result-name" v-html="highlight(item.name)"></div>
-              <div class="fd-result-meta">
-                <span class="fd-result-path">{{ item.path }}</span>
-                <span v-if="!item.isDir"> · {{ formatSize(item.size) }}</span>
-                <span v-if="item.mtime"> · {{ formatTime(item.mtime * 1000) }}</span>
+        <template v-if="results.length > 0">
+          <!-- 小框模式：紧凑列表 -->
+          <div v-if="!expanded" ref="listRef" class="fd-result-list">
+            <div
+              v-for="(item, index) in displayResults"
+              :key="item.path"
+              class="fd-result-item"
+              :class="{ active: index === activeIndex }"
+              :title="item.path"
+              @click="openItem(item)"
+              @contextmenu.prevent="showContextMenu($event, item)"
+              @mousemove="activeIndex = index"
+            >
+              <div class="fd-result-icon">
+                <svg v-if="item.isDir" fill="currentColor" viewBox="0 0 24 24"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
+                <svg v-else fill="currentColor" viewBox="0 0 24 24"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
               </div>
-            </div>
-            <div class="fd-inline-actions" @click.stop>
-              <button class="fd-action-btn" title="在主界面打开所在目录" @click="scanItemDir(item)">
-                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 14l6-6m0 0h-4m4 0v4" /></svg>
-              </button>
-              <button v-if="!item.isDir" class="fd-action-btn" title="打开所在文件夹" @click="openParentFolder(item)">
-                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h6a2 2 0 012 2v1M8 13h13l-2 6H10l-2-6z" /></svg>
-              </button>
-              <button class="fd-action-btn" title="复制完整路径" @click="copyToClipboard(item.path, '路径')">
-                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
-              </button>
+              <div class="fd-result-main">
+                <div class="fd-result-name" v-html="highlight(item.name)"></div>
+                <div class="fd-result-meta">
+                  <span class="fd-result-path">{{ item.path }}</span>
+                  <span v-if="!item.isDir"> · {{ formatSize(item.size) }}</span>
+                  <span v-if="item.mtime"> · {{ formatTime(item.mtime * 1000) }}</span>
+                </div>
+              </div>
+              <div class="fd-inline-actions" @click.stop>
+                <button class="fd-action-btn" title="在主界面打开所在目录" @click="scanItemDir(item)">
+                  <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 14l6-6m0 0h-4m4 0v4" /></svg>
+                </button>
+                <button v-if="!item.isDir" class="fd-action-btn" title="打开所在文件夹" @click="openParentFolder(item)">
+                  <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h6a2 2 0 012 2v1M8 13h13l-2 6H10l-2-6z" /></svg>
+                </button>
+                <button class="fd-action-btn" title="复制完整路径" @click="copyToClipboard(item.path, '路径')">
+                  <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+                </button>
+              </div>
             </div>
           </div>
 
-          <div v-if="ready && query && results.length === 0 && !searching" class="fd-empty">
+          <!-- 半屏模式：可排序表格 -->
+          <div v-else ref="listRef" class="fd-result-table-wrap">
+            <table class="fd-result-table">
+              <thead>
+                <tr>
+                  <th class="col-name" :class="{ sort: sortKey === 'name', asc: sortKey === 'name' && sortDir === 'asc' }" @click="toggleSort('name')">名称</th>
+                  <th class="col-path" :class="{ sort: sortKey === 'path', asc: sortKey === 'path' && sortDir === 'asc' }" @click="toggleSort('path')">路径</th>
+                  <th class="col-size" :class="{ sort: sortKey === 'size', asc: sortKey === 'size' && sortDir === 'asc' }" @click="toggleSort('size')">大小</th>
+                  <th class="col-mtime" :class="{ sort: sortKey === 'mtime', asc: sortKey === 'mtime' && sortDir === 'asc' }" @click="toggleSort('mtime')">修改时间</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="(item, index) in displayResults"
+                  :key="item.path"
+                  :class="{ active: index === activeIndex }"
+                  :title="item.path"
+                  @click="openItem(item)"
+                  @contextmenu.prevent="showContextMenu($event, item)"
+                  @mousemove="activeIndex = index"
+                >
+                  <td class="col-name"><span v-html="highlight(item.name)"></span></td>
+                  <td class="col-path mono">{{ item.path }}</td>
+                  <td class="col-size mono">{{ item.isDir ? '-' : formatSize(item.size) }}</td>
+                  <td class="col-mtime mono">{{ item.mtime ? formatTime(item.mtime * 1000) : '-' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </template>
+
+        <div v-else class="fd-result-list empty">
+          <div v-if="ready && query && !searching" class="fd-empty">
             <div class="fd-empty-title">{{ lastNoResultMsg }}</div>
             <div v-if="lastIndexSize > 0" class="fd-empty-sub">
               索引共 {{ lastIndexSize.toLocaleString() }} 项
@@ -142,7 +177,7 @@
               （{{ indexMeta.failedDrives.join(', ') }} 跳过）
             </span>
           </span>
-          <span v-else class="fd-footer-meta">↑↓ 选择 · Enter 打开 · Ctrl+Enter 半屏 · Esc 关闭</span>
+          <span v-else class="fd-footer-meta">↑↓ 选择 · Enter 打开 · Ctrl+Enter 所在文件夹 · Esc 关闭</span>
           <span class="fd-footer-spacer"></span>
           <button
             v-if="(!expanded && results.length >= compactLimit) || expanded"
@@ -192,13 +227,40 @@ const expandedLimit = 1000
 
 let blurTimer = null
 
+// 半屏表格排序（空串 = 保持后端相关性排序）
+const sortKey = ref('')
+const sortDir = ref('asc')
+
+const sortedResults = computed(() => {
+  if (!sortKey.value) return results.value
+  const k = sortKey.value
+  return [...results.value].sort((a, b) => {
+    let r
+    if (k === 'name') r = a.name.localeCompare(b.name, 'zh-CN')
+    else if (k === 'path') r = a.path.localeCompare(b.path, 'zh-CN')
+    else if (k === 'size') r = (a.size || 0) - (b.size || 0)
+    else r = (a.mtime || 0) - (b.mtime || 0)
+    return sortDir.value === 'asc' ? r : -r
+  })
+})
+
 const displayResults = computed(() => {
   if (expanded.value) {
     const start = (currentPage.value - 1) * pageSize.value
-    return results.value.slice(start, start + pageSize.value)
+    return sortedResults.value.slice(start, start + pageSize.value)
   }
   return results.value.slice(0, compactLimit)
 })
+
+const toggleSort = (key) => {
+  if (sortKey.value === key) {
+    sortDir.value = sortDir.value === 'asc' ? 'desc' : 'asc'
+  } else {
+    sortKey.value = key
+    sortDir.value = (key === 'name' || key === 'path') ? 'asc' : 'desc'
+  }
+  currentPage.value = 1
+}
 
 const open = () => {
   isOpen.value = true
@@ -206,8 +268,8 @@ const open = () => {
 
 const close = () => {
   isOpen.value = false
-  expanded.value = false
   activeIndex.value = -1
+  // 注意：不重置 expanded —— 记住用户上次选择的视图模式（本次会话内有效）
 }
 
 const focusSearch = () => {
@@ -231,9 +293,7 @@ const onFocus = () => {
 
 const onBlur = () => {
   blurTimer = setTimeout(() => {
-    if (!expanded.value) {
-      close()
-    }
+    close()
   }, 200)
 }
 
@@ -261,13 +321,14 @@ const onKeydown = (e) => {
     }
   } else if (e.key === 'Enter') {
     e.preventDefault()
-    // Ctrl+Enter：小框 ↔ 半屏完整视图切换
-    if (e.ctrlKey || e.metaKey) {
-      if (results.length > 0) toggleExpanded()
-      return
-    }
     const item = displayResults.value[activeIndex.value] || displayResults.value[0]
-    if (item) openItem(item)
+    if (!item) return
+    // Ctrl+Enter：打开所在文件夹；Enter：打开文件/目录本身
+    if (e.ctrlKey || e.metaKey) {
+      openParentFolder(item)
+    } else {
+      openItem(item)
+    }
   } else if (e.key === 'Escape') {
     if (expanded.value) {
       expanded.value = false
@@ -663,6 +724,57 @@ defineExpose({ focusSearch })
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/* 半屏模式：可排序结果表格 */
+.fd-result-table-wrap {
+  overflow: auto;
+  max-height: calc(60vh - 90px);
+}
+.fd-result-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  table-layout: fixed;
+}
+.fd-result-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--fd-bg-2);
+  color: var(--fd-text-2);
+  font-weight: 600;
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--fd-border);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.fd-result-table thead th.sort::after { content: " ▼"; font-size: 9px; }
+.fd-result-table thead th.sort.asc::after { content: " ▲"; }
+.fd-result-table tbody td {
+  padding: 4px 10px;
+  color: var(--fd-text-1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-bottom: 1px solid transparent;
+}
+.fd-result-table tbody tr { cursor: pointer; }
+.fd-result-table tbody tr:hover td,
+.fd-result-table tbody tr.active td { background: var(--fd-bg-2); }
+.fd-result-table .col-name { width: 32%; }
+.fd-result-table .col-path { width: 40%; }
+.fd-result-table .col-size { width: 12%; text-align: right; }
+.fd-result-table .col-mtime { width: 16%; text-align: right; }
+.fd-result-table .mono { font-family: Consolas, 'JetBrains Mono', monospace; }
+.fd-result-table td.col-name :deep(mark),
+.fd-result-name :deep(mark) {
+  background: rgba(0, 122, 204, 0.35);
+  color: var(--fd-text-0);
+  border-radius: 2px;
+  padding: 0 1px;
 }
 .fd-result-item {
   display: flex;

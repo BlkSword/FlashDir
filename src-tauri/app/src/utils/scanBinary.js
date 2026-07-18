@@ -14,7 +14,8 @@ import { formatSize } from './format.js'
 const MAGIC = 0x4644
 const DECODE_CHUNK = 50000
 
-// Tauri 2 把 ipc::Response 的字节交给 JS 时，不同小版本可能呈现为 ArrayBuffer 或 Uint8Array；
+// Tauri 2 把 ipc::Response 的字节交给 JS 时，随版本/平台 IPC 实现不同，
+// 可能呈现为 ArrayBuffer、Uint8Array、{ data: number[] } 或普通 number[]；
 // 这里统一归一为 ArrayBuffer，避免 DataView 构造报错。
 function toArrayBuffer(input) {
   if (input instanceof ArrayBuffer) return input
@@ -23,6 +24,9 @@ function toArrayBuffer(input) {
     return view.byteOffset === 0 && view.byteLength === view.buffer.byteLength
       ? view.buffer
       : view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength)
+  }
+  if (Array.isArray(input)) {
+    return new Uint8Array(input).buffer
   }
   if (input && typeof input === 'object' && Array.isArray(input.data)) {
     return new Uint8Array(input.data).buffer
