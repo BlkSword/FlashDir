@@ -59,6 +59,8 @@ pub struct Item {
     pub size_formatted: CompactString,
     #[serde(rename = "isDir")]
     pub is_dir: bool,
+    /// 修改时间（Unix 秒级时间戳，0 = 未知）
+    pub mtime: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,11 +275,12 @@ pub fn get_cached_items(path: &str) -> Option<Arc<Vec<Item>>> {
 /// 自定义紧凑二进制编码扫描结果，供前端经 Tauri 原始字节通道接收，
 /// 避免 serde_json 序列化百万级 items 的开销（无 key 名/引号/转义，size 用定宽整数）。
 /// 前端用 DataView + TextDecoder 顺序解析。布局（小端）:
-///   u32 magic=0x4644 | u8 version | u8 flags
+///   u32 magic=0x4644 | u8 version=2 | u8 flags (bit0 = mft_available)
 ///   i64 total_size | f64 scan_time | u32 item_count | u32 file_count | u32 dir_count
 ///   f64 io_ms | f64 compute_ms | f64 serialize_ms
 ///   u32 path_len | path_utf8                      （被扫描路径）
-///   逐项: u32 path_len|path_utf8 | u32 name_len|name_utf8 | i64 size | u8 is_dir
+///   逐项: u32 path_len|path_utf8 | u32 name_len|name_utf8 | i64 size | u8 is_dir | i64 mtime
+///   （version 1 的条目没有末尾的 i64 mtime）
 pub fn encode_scan_result(result: &ScanResult) -> Vec<u8> {
     let item_count = result.items.len();
     let (file_count, dir_count) = result.perf_metrics.as_ref().map(|m| (m.files_scanned, m.dirs_scanned)).unwrap_or_else(|| {
@@ -286,14 +289,14 @@ pub fn encode_scan_result(result: &ScanResult) -> Vec<u8> {
     });
 
     let path_str = result.path.as_str();
-    let est = result.items.iter().map(|i| i.path.len() + i.name.len() + 4 + 4 + 8 + 1).sum::<usize>()
+    let est = result.items.iter().map(|i| i.path.len() + i.name.len() + 4 + 4 + 8 + 1 + 8).sum::<usize>()
         + path_str.len() + 64;
     let mut buf = Vec::with_capacity(est);
 
     // header
     buf.extend_from_slice(&0x4644u32.to_le_bytes());
-    buf.push(1u8); // version
-    buf.push(0u8); // flags
+    buf.push(2u8); // version
+    buf.push(if result.mft_available { 1u8 } else { 0u8 }); // flags: bit0 = mft_available
 
     // metadata
     buf.extend_from_slice(&result.total_size.to_le_bytes());
@@ -316,6 +319,7 @@ pub fn encode_scan_result(result: &ScanResult) -> Vec<u8> {
         write_bin_str(&mut buf, item.name.as_str());
         buf.extend_from_slice(&item.size.to_le_bytes());
         buf.push(if item.is_dir { 1u8 } else { 0u8 });
+        buf.extend_from_slice(&item.mtime.to_le_bytes());
     }
 
     buf
@@ -672,6 +676,7 @@ pub fn scan_lite(path: &str) -> Option<Vec<Item>> {
             size: f.size as i64,
             size_formatted: CompactString::new(),
             is_dir: f.is_dir,
+            mtime: f.mtime,
         })
         .collect();
 
@@ -685,7 +690,7 @@ fn try_mft_scan_path(
     canonical_path: &Path,
     _root_dir: &str,
     perf_monitor: &Arc<PerformanceMonitor>,
-    app_handle: Option<&Arc<tauri::AppHandle>>,
+    _app_handle: Option<&Arc<tauri::AppHandle>>,
 ) -> Option<ScanOutput> {
     if is_mft_disabled() {
         return None;
@@ -710,8 +715,11 @@ fn try_mft_scan_path(
         .files
         .into_iter()
         .filter(|f| {
-            let p = f.path.to_lowercase();
-            normalized_root.is_empty() || p.starts_with(&normalized_root)
+            // 无分配前缀比较（原实现每条目 to_lowercase 一次，全盘 64 万次堆分配）
+            normalized_root.is_empty()
+                || f.path
+                    .get(..normalized_root.len())
+                    .is_some_and(|p| p.eq_ignore_ascii_case(normalized_root.as_str()))
         })
         .map(|f| Item {
             path: mft_path_to_abs(drive, &f.path),
@@ -719,6 +727,7 @@ fn try_mft_scan_path(
             size: f.size as i64,
             size_formatted: CompactString::new(), // 下面统一格式化
             is_dir: f.is_dir,
+            mtime: f.mtime,
         })
         .collect();
 
@@ -796,13 +805,6 @@ fn try_mft_scan_path(
 
     perf_monitor.update_memory_stats(memory_peak_mb, memory_peak_mb);
     perf_monitor.update_io_stats(file_count, dir_count, actual_total_size as u64, file_count + dir_count);
-
-    // 流式传输（与目录遍历保持一致的行为）
-    if let Some(app) = app_handle {
-        for chunk in items.chunks(500) {
-            let _ = app.emit("scan-batch", chunk.to_vec());
-        }
-    }
 
     eprintln!(
         "[MFT] 扫描完成: {} 文件, {} 目录, {:.2}s (filtered from {} total)",
@@ -1055,6 +1057,7 @@ fn try_usn_incremental_update(
 
     // ── 应用 USN 变更 ──
     // Phase 1: 处理删除和旧名称（先移除）
+    let mut removed_abs_paths: Vec<String> = Vec::new();
     for change in &changes {
         let reason = change.reason;
 
@@ -1077,14 +1080,18 @@ fn try_usn_incremental_update(
                 eprintln!("  [USN-{}] 移除: {}", action, cache_key);
             }
 
-            // 同步到全局索引与 SQLite
-            let abs_path = crate::global_search::normalize_abs_path(drive, &vol_path);
-            crate::global_search::instance().remove_by_path(&abs_path);
-            let _ = DiskCache::instance().remove_global_index_by_path(&abs_path);
+            removed_abs_paths.push(crate::global_search::normalize_abs_path(drive, &vol_path));
         }
     }
 
+    // 批量同步到全局索引与 SQLite（各一次锁临界区 / 单事务）
+    if !removed_abs_paths.is_empty() {
+        crate::global_search::instance().remove_paths_batch(&removed_abs_paths);
+        let _ = DiskCache::instance().remove_global_index_by_paths(&removed_abs_paths);
+    }
+
     // Phase 2: 处理创建、重命名新名称、数据变更
+    let mut upserted_entries: Vec<crate::global_search::IndexEntry> = Vec::new();
     for change in &changes {
         let reason = change.reason;
 
@@ -1106,17 +1113,16 @@ fn try_usn_incremental_update(
                 format!("{}/{}", parent_path, change.name)
             };
             let cache_key = normalize_to_cache_format(&vol_path);
-            let abs_path = crate::global_search::normalize_abs_path(drive, &vol_path);
             let mtime = filetime_to_unix(change.timestamp);
 
             if is_create || is_rename_new {
-                // 读取 MFT 获取文件大小和目录标志
-                let (file_size, is_dir) = match scanner.read_single_record(change.file_ref) {
-                    Ok(Some(record)) => (record.real_size as i64, record.is_dir),
+                // 读取 MFT 获取文件大小、目录标志和修改时间
+                let (file_size, is_dir, file_mtime) = match scanner.read_single_record(change.file_ref) {
+                    Ok(Some(record)) => (record.real_size as i64, record.is_dir, record.mtime),
                     _ => {
                         // 回退：用 USN attributes 判断目录标志
                         let is_dir_attr = (change.attributes & 0x10) != 0; // FILE_ATTRIBUTE_DIRECTORY
-                        (0i64, is_dir_attr)
+                        (0i64, is_dir_attr, mtime)
                     }
                 };
 
@@ -1126,6 +1132,7 @@ fn try_usn_incremental_update(
                     size: file_size,
                     size_formatted: format_size(file_size),
                     is_dir,
+                    mtime: file_mtime,
                 };
 
                 items_map.insert(cache_key.clone(), item);
@@ -1135,18 +1142,15 @@ fn try_usn_incremental_update(
                     action, cache_key, file_size, is_dir
                 );
 
-                // 同步到全局索引与 SQLite
                 let name = change.name.clone();
-                let entry = crate::global_search::IndexEntry {
-                    path: abs_path.clone(),
+                upserted_entries.push(crate::global_search::IndexEntry {
+                    path: crate::global_search::normalize_abs_path(drive, &vol_path),
                     name: name.clone(),
                     name_lower: name.to_lowercase(),
                     size: file_size,
                     is_dir,
-                    mtime,
-                };
-                crate::global_search::instance().upsert(entry.clone());
-                let _ = DiskCache::instance().upsert_global_index_entry(&entry);
+                    mtime: file_mtime,
+                });
             } else if is_data_change {
                 // 更新文件大小（从 MFT 读取最新值）
                 if let Some(item) = items_map.get_mut(&cache_key) {
@@ -1160,25 +1164,29 @@ fn try_usn_incremental_update(
                                 );
                                 item.size = new_size;
                                 item.size_formatted = format_size(new_size);
+                                item.mtime = record.mtime;
 
-                                // 同步到全局索引与 SQLite
                                 let name = item.name.to_string();
-                                let entry = crate::global_search::IndexEntry {
-                                    path: abs_path.clone(),
+                                upserted_entries.push(crate::global_search::IndexEntry {
+                                    path: crate::global_search::normalize_abs_path(drive, &vol_path),
                                     name: name.clone(),
                                     name_lower: name.to_lowercase(),
                                     size: new_size,
                                     is_dir: item.is_dir,
-                                    mtime,
-                                };
-                                crate::global_search::instance().upsert(entry.clone());
-                                let _ = DiskCache::instance().upsert_global_index_entry(&entry);
+                                    mtime: record.mtime,
+                                });
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    // 批量同步到全局索引与 SQLite（各一次锁临界区 / 单事务）
+    if !upserted_entries.is_empty() {
+        let _ = DiskCache::instance().upsert_global_index_entries(&upserted_entries);
+        crate::global_search::instance().upsert_batch(upserted_entries);
     }
 
     // 释放 MFT 扫描器
@@ -1297,11 +1305,11 @@ fn try_usn_incremental_update(
 }
 
 /// 优化的扫描实现 v4
-/// 集成：性能监控、内存优化、Windows 原生 I/O、渐进式流式传输
+/// 集成：性能监控、内存优化、Windows 原生 I/O
 fn scan_directory_optimized_v4(
     root_path: &Path,
     perf_monitor: &Arc<PerformanceMonitor>,
-    app_handle: Option<Arc<tauri::AppHandle>>,
+    _app_handle: Option<Arc<tauri::AppHandle>>,
 ) -> Result<ScanOutput, anyhow::Error> {
     use rayon::prelude::*;
 
@@ -1328,12 +1336,9 @@ fn scan_directory_optimized_v4(
             let dir_sender = dir_sender.clone();
             let dir_receiver = dir_receiver.clone();
             let item_sender = item_sender.clone();
-            let app_handle_for_worker = app_handle.clone();
 
             s.spawn(move |_| {
                 let mut idle_count = 0;
-                // 流式传输缓冲区：每 200 条 emit 一次
-                let mut stream_batch: Vec<Item> = Vec::with_capacity(200);
 
                 loop {
                     let dir_path = match dir_receiver.try_recv() {
@@ -1368,33 +1373,13 @@ fn scan_directory_optimized_v4(
                             }
 
                             let _ = item_sender.send(ItemInternal {
-                                path: abs_path.clone(),
+                                path: abs_path,
                                 name: CompactString::from(entry.name.as_str()),
                                 size,
                                 is_dir: entry.is_dir,
+                                mtime: entry.mtime,
                             });
-
-                            // 渐进式流式传输
-                            if let Some(app) = app_handle_for_worker.as_ref() {
-                                stream_batch.push(Item {
-                                    path: abs_path,
-                                    name: CompactString::from(entry.name),
-                                    size,
-                                    size_formatted: format_size(size),
-                                    is_dir: entry.is_dir,
-                                });
-                                if stream_batch.len() >= 200 {
-                                    let _ = app.emit("scan-batch", std::mem::take(&mut stream_batch));
-                                }
-                            }
                         }
-                    }
-                }
-
-                // 发送当前 worker 剩余的批次
-                if let Some(app) = app_handle_for_worker.as_ref() {
-                    if !stream_batch.is_empty() {
-                        let _ = app.emit("scan-batch", std::mem::take(&mut stream_batch));
                     }
                 }
             });
@@ -1484,6 +1469,7 @@ fn scan_directory_optimized_v4(
                 size,
                 size_formatted: format_size(size),
                 is_dir: internal.is_dir,
+                mtime: internal.mtime,
             }
         })
         .collect();
@@ -1527,6 +1513,7 @@ struct ItemInternal {
     name: CompactString,
     size: i64,
     is_dir: bool,
+    mtime: i64,
 }
 
 #[inline]

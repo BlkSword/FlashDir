@@ -5,7 +5,14 @@ export function formatSize(bytes) {
   const mb = kb / 1024
   if (mb < 1024) return `${mb.toFixed(1)} MB`
   const gb = mb / 1024
-  return `${gb.toFixed(1)} GB`
+  if (gb < 1024) return `${gb.toFixed(1)} GB`
+  return `${(gb / 1024).toFixed(1)} TB`
+}
+
+/** 统一错误对象格式化（Tauri 错误可能是字符串、Error 或任意对象） */
+export function formatError(e) {
+  if (typeof e === 'string') return e
+  return e?.message || String(e)
 }
 
 export function formatTime(timestamp) {

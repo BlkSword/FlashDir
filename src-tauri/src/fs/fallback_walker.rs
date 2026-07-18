@@ -45,10 +45,20 @@ pub fn read_dir_entries(dir_path: &Path) -> io::Result<Vec<FastDirEntry>> {
             .unwrap_or("?")
             .to_string();
 
-        let size = if is_dir {
-            0
+        let (size, mtime) = if is_dir {
+            (0, 0)
         } else {
-            entry.metadata().map(|m| m.len()).unwrap_or(0)
+            match entry.metadata() {
+                Ok(m) => (
+                    m.len(),
+                    m.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
+                ),
+                Err(_) => (0, 0),
+            }
         };
 
         entries.push(FastDirEntry {
@@ -57,6 +67,7 @@ pub fn read_dir_entries(dir_path: &Path) -> io::Result<Vec<FastDirEntry>> {
             size,
             is_dir,
             is_symlink,
+            mtime,
         });
     }
 

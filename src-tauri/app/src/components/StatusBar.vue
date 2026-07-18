@@ -34,6 +34,8 @@
 </template>
 
 <script setup>
+import { formatSize } from '../utils/format.js'
+
 defineProps({
   path: { type: String, default: '' },
   totalItems: { type: Number, default: 0 },
@@ -48,13 +50,6 @@ defineProps({
   globalSearchStatus: { type: String, default: '' },
   scanPhase: { type: Object, default: () => ({ phase: '', message: '' }) },
 })
-
-const formatSize = (bytes) => {
-  if (bytes === 0) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.floor(Math.log(bytes) / Math.log(1024))
-  return (bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 2) + ' ' + units[i]
-}
 </script>
 
 <style scoped>

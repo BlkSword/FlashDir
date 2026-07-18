@@ -8,9 +8,9 @@
         ref="inputRef"
         v-model="query"
         type="text"
-        :placeholder="ready ? '全局搜索 (Ctrl+K)' : '索引未就绪'"
-        :disabled="!ready"
+        :placeholder="ready ? '全局搜索 (Ctrl+K)' : '全局搜索（索引未就绪，点击展开）'"
         autocomplete="off"
+        spellcheck="false"
         @focus="onFocus"
         @blur="onBlur"
         @keydown="onKeydown"
@@ -19,12 +19,12 @@
         v-if="ready"
         class="fd-index-btn"
         title="刷新全局索引"
-        :disabled="loading"
+        :disabled="indexBuilding"
         @mousedown.prevent
         @click="refreshIndex"
       >
-        <svg :class="{ 'animate-spin': loading }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path v-if="!loading" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+        <svg :class="{ 'animate-spin': indexBuilding }" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path v-if="!indexBuilding" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
           <path v-else stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
         </svg>
       </button>
@@ -42,20 +42,17 @@
       @mousedown.prevent
     >
       <div v-if="!ready" class="fd-index-state">
-        <div v-if="stateKind === 'notLoaded'" class="fd-state-box">
+        <div v-if="kind === 'notLoaded'" class="fd-state-box">
           <p>首次使用需建立全盘文件索引（扫描所有 NTFS 盘的 MFT，约几秒至几十秒）。</p>
-          <button class="fd-btn fd-btn-primary" :disabled="loading" @click="ensureIndex">建立索引</button>
+          <button class="fd-btn fd-btn-primary" :disabled="indexBuilding" @click="ensureIndex">建立索引</button>
         </div>
-        <div v-else-if="stateKind === 'loading'" class="fd-state-box">
+        <div v-else-if="kind === 'loading'" class="fd-state-box">
           <span class="fd-spinner"></span>
-          <span class="fd-state-text">
-            正在扫描 {{ progress?.drive || stateData?.drive || '…' }}
-            · 已索引 {{ ((progress?.scanned > 0 ? progress.scanned : stateData?.scanned) || 0).toLocaleString() }} 项
-          </span>
+          <span class="fd-state-text">{{ statusText || '正在建立索引…' }}</span>
         </div>
-        <div v-else-if="stateKind === 'failed'" class="fd-state-box failed">
+        <div v-else-if="kind === 'failed'" class="fd-state-box failed">
           <p>{{ failedReason }}</p>
-          <button class="fd-btn" :disabled="loading" @click="ensureIndex">重试</button>
+          <button class="fd-btn" :disabled="indexBuilding" @click="ensureIndex">重试</button>
         </div>
       </div>
 
@@ -65,30 +62,39 @@
           <span v-if="!expanded && results.length >= compactLimit" class="fd-results-meta-hint">· 仅显示前 {{ compactLimit }} 条</span>
         </div>
 
-        <div class="fd-result-list" :class="{ empty: results.length === 0 }">
+        <div ref="listRef" class="fd-result-list" :class="{ empty: results.length === 0 }">
           <div
             v-for="(item, index) in displayResults"
-            :key="index"
-            class="fd-result-wrapper"
+            :key="item.path"
+            class="fd-result-item"
+            :class="{ active: index === activeIndex }"
+            :title="item.path"
+            @click="openItem(item)"
+            @contextmenu.prevent="showContextMenu($event, item)"
+            @mousemove="activeIndex = index"
           >
-            <div
-              class="fd-result-item"
-              :title="item.path"
-              @click="openTarget(item)"
-              @contextmenu.prevent="showContextMenu($event, item)"
-            >
-              <div class="fd-result-icon">
-                <svg v-if="item.isDir" fill="currentColor" viewBox="0 0 24 24"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
-                <svg v-else fill="currentColor" viewBox="0 0 24 24"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+            <div class="fd-result-icon">
+              <svg v-if="item.isDir" fill="currentColor" viewBox="0 0 24 24"><path d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /></svg>
+              <svg v-else fill="currentColor" viewBox="0 0 24 24"><path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
+            </div>
+            <div class="fd-result-main">
+              <div class="fd-result-name" v-html="highlight(item.name)"></div>
+              <div class="fd-result-meta">
+                <span class="fd-result-path">{{ item.path }}</span>
+                <span v-if="!item.isDir"> · {{ formatSize(item.size) }}</span>
+                <span v-if="item.mtime"> · {{ formatTime(item.mtime * 1000) }}</span>
               </div>
-              <div class="fd-result-main">
-                <div class="fd-result-name" v-html="highlight(item.name)"></div>
-                <div class="fd-result-meta">
-                  <span class="fd-result-path">{{ item.path }}</span>
-                  <span v-if="!item.isDir"> · {{ formatSize(item.size) }}</span>
-                  <span v-if="item.mtime"> · {{ formatTime(item.mtime * 1000) }}</span>
-                </div>
-              </div>
+            </div>
+            <div class="fd-inline-actions" @click.stop>
+              <button class="fd-action-btn" title="在主界面打开所在目录" @click="scanItemDir(item)">
+                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 14l6-6m0 0h-4m4 0v4" /></svg>
+              </button>
+              <button v-if="!item.isDir" class="fd-action-btn" title="打开所在文件夹" @click="openParentFolder(item)">
+                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h6a2 2 0 012 2v1M8 13h13l-2 6H10l-2-6z" /></svg>
+              </button>
+              <button class="fd-action-btn" title="复制完整路径" @click="copyToClipboard(item.path, '路径')">
+                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
+              </button>
             </div>
           </div>
 
@@ -97,6 +103,10 @@
             <div v-if="lastIndexSize > 0" class="fd-empty-sub">
               索引共 {{ lastIndexSize.toLocaleString() }} 项
             </div>
+          </div>
+          <div v-else-if="ready && !query" class="fd-empty">
+            <div class="fd-empty-title">输入关键字开始搜索</div>
+            <div class="fd-empty-sub">支持 *.pdf · ext:zip · size:&gt;100MB · mtime:&lt;7d · NOT 等语法</div>
           </div>
         </div>
 
@@ -132,6 +142,7 @@
               （{{ indexMeta.failedDrives.join(', ') }} 跳过）
             </span>
           </span>
+          <span v-else class="fd-footer-meta">↑↓ 选择 · Enter 打开 · Ctrl+Enter 半屏 · Esc 关闭</span>
           <span class="fd-footer-spacer"></span>
           <button
             v-if="(!expanded && results.length >= compactLimit) || expanded"
@@ -149,43 +160,37 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { message } from 'ant-design-vue'
-import { listen } from '@tauri-apps/api/event'
 import { useTauri } from '../composables/useTauri'
-import { formatSize, debounce, getParentPath } from '../utils/format.js'
+import { useGlobalSearch } from '../composables/useGlobalSearch'
+import { formatSize, formatTime, formatError, debounce, getParentPath } from '../utils/format.js'
 
 const { invoke } = useTauri()
-const lastNoResultMsg = ref('无匹配文件')
+const gs = useGlobalSearch()
+const { kind, ready, failedReason, indexMeta, statusText } = gs
 
 const emit = defineEmits(['open-dir'])
 
 const rootRef = ref(null)
 const inputRef = ref(null)
+const listRef = ref(null)
 
 const query = ref('')
 const results = ref([])
 const searching = ref(false)
-const loading = ref(false)
-const state = ref({ kind: 'notLoaded' })
-const progress = ref(null)
+const indexBuilding = ref(false)
 const isOpen = ref(false)
 const expanded = ref(false)
 const currentPage = ref(1)
 const pageSize = ref(100)
+const activeIndex = ref(-1)
 const contextMenu = ref({ visible: false, x: 0, y: 0, item: null })
 const lastIndexSize = ref(0)
+const lastNoResultMsg = ref('无匹配文件')
 
 const compactLimit = 50
 const expandedLimit = 1000
 
-let unlistenProgress = null
 let blurTimer = null
-let contextMenuCloseTimer = null
-
-const stateKind = computed(() => state.value?.kind)
-const stateData = computed(() => state.value?.data)
-const ready = computed(() => stateKind.value === 'ready')
-const indexMeta = computed(() => (ready.value ? state.value.data : null))
-const failedReason = computed(() => (stateKind.value === 'failed' ? state.value?.data?.reason : ''))
 
 const displayResults = computed(() => {
   if (expanded.value) {
@@ -202,6 +207,7 @@ const open = () => {
 const close = () => {
   isOpen.value = false
   expanded.value = false
+  activeIndex.value = -1
 }
 
 const focusSearch = () => {
@@ -220,7 +226,7 @@ const toggleExpanded = () => {
 
 const onFocus = () => {
   open()
-  fetchStatus()
+  gs.fetchStatus()
 }
 
 const onBlur = () => {
@@ -231,22 +237,44 @@ const onBlur = () => {
   }, 200)
 }
 
+const scrollActiveIntoView = () => {
+  nextTick(() => {
+    listRef.value
+      ?.querySelector('.fd-result-item.active')
+      ?.scrollIntoView({ block: 'nearest' })
+  })
+}
+
 const onKeydown = (e) => {
-  if (e.key === 'Escape') {
+  const count = displayResults.value.length
+  if (e.key === 'ArrowDown') {
+    e.preventDefault()
+    if (count > 0) {
+      activeIndex.value = activeIndex.value + 1 >= count ? 0 : activeIndex.value + 1
+      scrollActiveIntoView()
+    }
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault()
+    if (count > 0) {
+      activeIndex.value = activeIndex.value - 1 < 0 ? count - 1 : activeIndex.value - 1
+      scrollActiveIntoView()
+    }
+  } else if (e.key === 'Enter') {
+    e.preventDefault()
+    // Ctrl+Enter：小框 ↔ 半屏完整视图切换
+    if (e.ctrlKey || e.metaKey) {
+      if (results.length > 0) toggleExpanded()
+      return
+    }
+    const item = displayResults.value[activeIndex.value] || displayResults.value[0]
+    if (item) openItem(item)
+  } else if (e.key === 'Escape') {
     if (expanded.value) {
       expanded.value = false
     } else {
       close()
       inputRef.value?.blur?.()
     }
-  }
-}
-
-const fetchStatus = async () => {
-  try {
-    state.value = await invoke('global_search_status')
-  } catch (e) {
-    console.error('获取索引状态失败', e)
   }
 }
 
@@ -257,11 +285,11 @@ const doSearch = async (limit) => {
   }
   searching.value = true
   try {
-    const res = await invoke('global_search', { query: query.value, limit })
-    state.value = res.state
+    const res = await gs.search(query.value, limit)
     results.value = res.results || []
     lastIndexSize.value = res.indexSize || 0
     lastNoResultMsg.value = '无匹配文件'
+    activeIndex.value = results.value.length > 0 ? 0 : -1
   } catch (e) {
     console.error('搜索失败', e)
     results.value = []
@@ -277,6 +305,7 @@ const onQueryChange = debounce(async () => {
   if (!query.value.trim()) {
     results.value = []
     lastIndexSize.value = 0
+    activeIndex.value = -1
     return
   }
   await doSearch(expanded.value ? expandedLimit : compactLimit)
@@ -287,15 +316,13 @@ watch(query, () => {
 })
 
 const ensureIndex = async () => {
-  loading.value = true
+  indexBuilding.value = true
   try {
-    await invoke('global_search_ensure_index')
-    await fetchStatus()
-    const s = state.value
-    const needUac = s?.kind === 'failed'
-    if (needUac) {
+    const s = await gs.ensureIndex()
+    if (s?.kind === 'failed') {
+      // 建索引失败通常是权限不足，尝试以管理员身份重启
       try {
-        await invoke('restart_as_admin')
+        await gs.restartAsAdmin()
         setTimeout(() => window.close(), 500)
         return
       } catch {}
@@ -303,29 +330,22 @@ const ensureIndex = async () => {
   } catch (e) {
     console.error(e)
   } finally {
-    loading.value = false
+    indexBuilding.value = false
   }
 }
 
 const refreshIndex = async () => {
   if (!ready.value) return
-  loading.value = true
+  indexBuilding.value = true
   results.value = []
   query.value = ''
   try {
-    await invoke('global_search_refresh')
-    await fetchStatus()
+    await gs.refreshIndex()
   } catch (e) {
     console.error(e)
   } finally {
-    loading.value = false
+    indexBuilding.value = false
   }
-}
-
-const openTarget = (item) => {
-  const target = item.isDir ? item.path : getParentPath(item.path)
-  emit('open-dir', target)
-  close()
 }
 
 const openItem = async (item) => {
@@ -333,7 +353,7 @@ const openItem = async (item) => {
     await invoke('open_path', { path: item.path })
   } catch (e) {
     console.error('打开失败', e)
-    message.error('打开失败: ' + e)
+    message.error('打开失败: ' + formatError(e))
   }
 }
 
@@ -343,7 +363,7 @@ const openParentFolder = async (item) => {
     await invoke('open_path', { path: target })
   } catch (e) {
     console.error('打开失败', e)
-    message.error('打开失败: ' + e)
+    message.error('打开失败: ' + formatError(e))
   }
 }
 
@@ -351,6 +371,7 @@ const scanItemDir = (item) => {
   const target = item.isDir ? item.path : getParentPath(item.path)
   emit('open-dir', target)
   close()
+  inputRef.value?.blur?.()
 }
 
 const copyToClipboard = async (text, label) => {
@@ -359,7 +380,7 @@ const copyToClipboard = async (text, label) => {
     message.success(`${label}已复制`)
   } catch (e) {
     console.error('复制失败', e)
-    message.error('复制失败')
+    message.error('复制失败: ' + formatError(e))
   }
 }
 
@@ -457,44 +478,17 @@ const highlight = (name) => {
   return html
 }
 
-const formatTime = (ts) => {
-  const d = new Date(ts)
-  return d.toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
-}
-
 const onWindowClick = () => {
   closeContextMenu()
 }
 
-onMounted(async () => {
-  unlistenProgress = await listen('global-search-progress', (event) => {
-    progress.value = event.payload
-    if (event.payload?.phase === 'done') {
-      fetchStatus()
-      if (query.value.trim()) {
-        doSearch(expanded.value ? expandedLimit : compactLimit)
-      }
-    } else if (event.payload?.phase === 'loading-persisted') {
-      state.value = {
-        kind: 'loading',
-        data: { drive: '索引缓存', scanned: 0 }
-      }
-    } else {
-      state.value = {
-        kind: 'loading',
-        data: { drive: event.payload?.drive || '', scanned: event.payload?.scanned || 0 }
-      }
-    }
-  })
-  fetchStatus()
+onMounted(() => {
   window.addEventListener('click', onWindowClick)
   window.addEventListener('resize', closeContextMenu)
 })
 
 onUnmounted(() => {
-  if (unlistenProgress) unlistenProgress()
   if (blurTimer) clearTimeout(blurTimer)
-  if (contextMenuCloseTimer) clearTimeout(contextMenuCloseTimer)
   window.removeEventListener('click', onWindowClick)
   window.removeEventListener('resize', closeContextMenu)
 })
@@ -534,7 +528,7 @@ defineExpose({ focusSearch })
 <style scoped>
 .fd-global-search-dropdown {
   position: relative;
-  width: 260px;
+  width: 300px;
 }
 .fd-search-input-wrap {
   position: relative;
@@ -608,9 +602,8 @@ defineExpose({ focusSearch })
   position: absolute;
   top: calc(100% + 4px);
   right: 0;
-  width: 100%;
-  min-width: 260px;
-  max-height: 360px;
+  width: 520px;
+  max-height: 400px;
   overflow-y: auto;
   background: var(--fd-bg-1);
   border: 1px solid var(--fd-border);
@@ -619,8 +612,14 @@ defineExpose({ focusSearch })
   z-index: 2000;
 }
 .fd-search-dropdown.expanded {
-  max-height: 70vh;
-  width: 420px;
+  /* 半屏完整视图：脱离工具栏锚定，居中定宽 */
+  position: fixed;
+  top: 46px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 50vw;
+  min-width: 520px;
+  max-height: 60vh;
 }
 
 .fd-index-state {
@@ -665,9 +664,6 @@ defineExpose({ focusSearch })
   align-items: center;
   justify-content: center;
 }
-.fd-result-wrapper {
-  display: block;
-}
 .fd-result-item {
   display: flex;
   align-items: flex-start;
@@ -677,8 +673,13 @@ defineExpose({ focusSearch })
   cursor: pointer;
   transition: background 0.1s;
 }
-.fd-result-item:hover {
+.fd-result-item:hover,
+.fd-result-item.active {
   background: var(--fd-bg-2);
+}
+.fd-result-item.active {
+  outline: 1px solid var(--fd-accent);
+  outline-offset: -1px;
 }
 .fd-result-icon {
   width: 16px;
@@ -706,6 +707,36 @@ defineExpose({ focusSearch })
   word-break: break-all;
   margin-top: 2px;
 }
+
+/* 悬停/选中时显示的内联操作按钮 */
+.fd-inline-actions {
+  display: none;
+  align-items: center;
+  gap: 2px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.fd-result-item:hover .fd-inline-actions,
+.fd-result-item.active .fd-inline-actions {
+  display: inline-flex;
+}
+.fd-action-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+  border: none;
+  background: transparent;
+  color: var(--fd-text-2);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.fd-action-btn:hover {
+  color: var(--fd-text-0);
+  background: var(--fd-bg-3);
+}
+.fd-action-btn svg { width: 14px; height: 14px; }
 
 .fd-empty {
   display: flex;

@@ -94,8 +94,10 @@ import StatusBar from './components/StatusBar.vue'
 import HistoryList from './components/HistoryList.vue'
 import { useTauri } from './composables/useTauri'
 import { useSortWorker } from './composables/useSortWorker'
-import { debounce, getParentPath } from './utils/format.js'
+import { useGlobalSearch } from './composables/useGlobalSearch'
+import { debounce, getParentPath, formatError } from './utils/format.js'
 import { applySmartFilter } from './utils/smartFilter.js'
+import { decodeScanResult } from './utils/scanBinary.js'
 import { homeDir, join } from '@tauri-apps/api/path'
 
 const { invoke, openDialog } = useTauri()
@@ -130,36 +132,13 @@ const historyVisible = ref(false)
 const toolbarRef = ref(null)
 const rightPanelTab = ref('stats')
 const sidebarCollapsed = ref(false)
-const globalSearchState = ref({ kind: 'notLoaded' })
-const globalSearchProgress = ref(null)
 
-let unlistenGlobalSearchProgress = null
-
-const globalSearchLoading = computed(() => globalSearchState.value?.kind === 'loading')
-const globalSearchFailed = computed(() => globalSearchState.value?.kind === 'failed')
-const globalSearchStatusText = computed(() => {
-  const kind = globalSearchState.value?.kind
-  if (kind === 'loading') {
-    const phase = globalSearchProgress.value?.phase
-    if (phase === 'loading-persisted') {
-      return '全局索引：正在加载索引缓存…'
-    }
-    const drive = globalSearchProgress.value?.drive || globalSearchState.value?.data?.drive || '…'
-    const scanned = (globalSearchProgress.value?.scanned > 0
-      ? globalSearchProgress.value.scanned
-      : globalSearchState.value?.data?.scanned) || 0
-    return `全局索引：正在扫描 ${drive} · ${scanned.toLocaleString()} 项`
-  }
-  if (kind === 'failed') {
-    return `全局索引失败：${globalSearchState.value?.data?.reason || '未知错误'}`
-  }
-  if (kind === 'ready') {
-    const data = globalSearchState.value?.data
-    const total = (data?.fileCount || 0) + (data?.dirCount || 0)
-    return `全局索引就绪 · ${total.toLocaleString()} 项`
-  }
-  return ''
-})
+// 全局搜索状态（单源 composable，与 GlobalSearchDropdown 共享）
+const {
+  loading: globalSearchLoading,
+  failed: globalSearchFailed,
+  statusText: globalSearchStatusText,
+} = useGlobalSearch()
 
 const lastSortKey = ref('')
 const presortedAllItems = shallowRef([])
@@ -204,13 +183,19 @@ const handleScan = async (path, addToHistory = true) => {
 
   allItems.value = []
   treeData.value = []
+  presortedAllItems.value = []
+  lastSortKey.value = ''
 
   const fullStartTime = performance.now()
 
   try {
-    const result = await invoke('scan_directory', {
+    // 走二进制通道：避免百万级条目的 JSON 序列化/解析卡死渲染进程
+    const buffer = await invoke('scan_directory_binary', {
       path: path.trim(),
       forceRefresh: false
+    })
+    const result = await decodeScanResult(buffer, (decoded, total) => {
+      scanPhase.value = { phase: 'transfer', message: `加载结果 ${decoded.toLocaleString()}/${total.toLocaleString()}` }
     })
 
     backendTime.value = typeof result.scanTime === 'number' ? result.scanTime : 0
@@ -246,7 +231,7 @@ const handleScan = async (path, addToHistory = true) => {
     message.success(`扫描完成 (总计: ${scanTime.value}s，找到 ${allItems.value.length} 个项目)`)
   } catch (error) {
     console.error('扫描失败:', error)
-    message.error('扫描失败: ' + error)
+    message.error('扫描失败: ' + formatError(error))
   } finally {
     loading.value = false
     scanPhase.value = { phase: '', message: '' }
@@ -265,7 +250,7 @@ const handleBrowse = async () => {
     }
   } catch (error) {
     console.error('选择目录失败:', error)
-    message.error('选择目录失败: ' + error)
+    message.error('选择目录失败: ' + formatError(error))
   }
 }
 
@@ -304,7 +289,7 @@ const handleSelectPath = async (path) => {
     }
   } catch (error) {
     console.error('选择路径失败:', error)
-    message.error('选择路径失败: ' + error)
+    message.error('选择路径失败: ' + formatError(error))
   }
 }
 
@@ -328,7 +313,7 @@ const handleQuickAccess = async (action) => {
     await handleScan(target)
   } catch (error) {
     console.error('快速访问失败:', error)
-    message.error('快速访问失败: ' + error)
+    message.error('快速访问失败: ' + formatError(error))
   }
 }
 
@@ -340,7 +325,7 @@ const handleSelectItem = async (item) => {
       await invoke('open_path', { path: item.path })
     } catch (error) {
       console.error('打开文件失败:', error)
-      message.error('打开文件失败: ' + error)
+      message.error('打开文件失败: ' + formatError(error))
     }
   }
 }
@@ -374,7 +359,7 @@ const handleClearHistory = async () => {
     history.value = []
     message.success('历史记录已清除')
   } catch (error) {
-    message.error('清除历史记录失败: ' + error)
+    message.error('清除历史记录失败: ' + formatError(error))
   }
 }
 
@@ -449,14 +434,6 @@ const handleOpenDirFromSearch = (path) => {
   if (path) handleScan(path)
 }
 
-const fetchGlobalSearchStatus = async () => {
-  try {
-    globalSearchState.value = await invoke('global_search_status')
-  } catch (error) {
-    console.error('获取全局搜索状态失败:', error)
-  }
-}
-
 const loadHistory = async () => {
   try {
     const historyData = await invoke('get_history_summary')
@@ -477,18 +454,6 @@ onMounted(async () => {
   loadHistory()
   document.addEventListener('keydown', onGlobalSearchKeydown)
 
-  unlistenGlobalSearchProgress = await listen('global-search-progress', (event) => {
-    globalSearchProgress.value = event.payload
-    if (event.payload?.phase === 'done') {
-      fetchGlobalSearchStatus()
-    } else {
-      globalSearchState.value = {
-        kind: 'loading',
-        data: { drive: event.payload?.drive || '', scanned: event.payload?.scanned || 0 }
-      }
-    }
-  })
-
   unlistenScanPhase = await listen('scan-phase', (event) => {
     scanPhase.value = event.payload || { phase: '', message: '' }
   })
@@ -498,15 +463,9 @@ onMounted(async () => {
   } catch {
     isAdmin.value = false
   }
-
-  await fetchGlobalSearchStatus()
 })
 
 onUnmounted(() => {
-  if (unlistenGlobalSearchProgress) {
-    unlistenGlobalSearchProgress()
-    unlistenGlobalSearchProgress = null
-  }
   if (unlistenScanPhase) {
     unlistenScanPhase()
     unlistenScanPhase = null

@@ -22,6 +22,11 @@ use std::time::Instant;
 use flashdir::perf::PerformanceMonitor;
 use flashdir::scan;
 
+// 与 GUI 保持一致：mimalloc 在大规模小对象分配（全盘扫描的条目构造）上
+// 明显优于 MSVC 默认分配器
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 // ─── 命令行参数解析 ────────────────────────────────────────
 
 struct Args {

@@ -108,6 +108,7 @@
 
 <script setup>
 import { ref, watch } from 'vue'
+import { formatSize, formatTime } from '../utils/format.js'
 
 const props = defineProps({
   items: { type: Array, default: () => [] },
@@ -151,24 +152,6 @@ const getPercent = (size) => {
 const getBarWidth = (size) => {
   if (!props.totalSize || !size) return '0%'
   return Math.min(100, (size / props.totalSize) * 100) + '%'
-}
-
-const formatSize = (bytes) => {
-  if (bytes === 0) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.floor(Math.log(bytes) / Math.log(1024))
-  return (bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 2) + ' ' + units[i]
-}
-
-const formatTime = (ts) => {
-  const d = new Date(ts)
-  return d.toLocaleString('zh-CN', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
 }
 </script>
 

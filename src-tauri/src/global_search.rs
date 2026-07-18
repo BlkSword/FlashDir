@@ -173,6 +173,44 @@ impl GlobalIndex {
         }
     }
 
+    /// 批量 upsert：整批在同一个锁临界区内完成，且按值消费避免逐条 clone。
+    /// 建索引 / 追加扫描结果时使用（逐条 upsert_internal 意味着每条目两次写锁 + 一次克隆）。
+    fn upsert_batch_internal(&self, batch: Vec<IndexEntry>) {
+        // 锁顺序与 upsert_internal 一致：先 entries 后 name_index
+        let mut entries = self.entries.write();
+        let mut name_index = self.name_index.write();
+
+        for entry in batch {
+            let first_char = entry.name_lower.chars().next().unwrap_or('\0');
+            let is_dir = entry.is_dir;
+            let path = entry.path.clone();
+
+            let old_entry = entries.insert(path.clone(), entry);
+
+            if let Some(old) = &old_entry {
+                let old_char = old.name_lower.chars().next().unwrap_or('\0');
+                if old_char != first_char {
+                    if let Some(set) = name_index.get_mut(&old_char) {
+                        set.remove(&old.path);
+                    }
+                }
+            }
+            name_index
+                .entry(first_char)
+                .or_insert_with(HashSet::new)
+                .insert(path);
+
+            match &old_entry {
+                None => self.bump_count(is_dir, 1),
+                Some(old) if old.is_dir != is_dir => {
+                    self.bump_count(old.is_dir, -1);
+                    self.bump_count(is_dir, 1);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// 移除指定路径的索引。
     fn remove_path_internal(&self, path: &str) {
         // 锁顺序与 upsert_internal 一致：先 entries 后 name_index
@@ -195,7 +233,11 @@ impl GlobalIndex {
             let entries = self.entries.read();
             entries
                 .keys()
-                .filter(|k| k.to_lowercase().starts_with(&prefix_lower))
+                .filter(|k| {
+                    // 无分配前缀比较（原实现每个 key to_lowercase 一次堆分配）
+                    k.get(..prefix_lower.len())
+                        .is_some_and(|head| head.eq_ignore_ascii_case(&prefix_lower))
+                })
                 .cloned()
                 .collect()
         };
@@ -278,33 +320,40 @@ impl GlobalIndex {
 
     /// 批量追加 MFT 全卷扫描结果（轻量路径，跳过聚合/format/排序）
     pub fn extend_entries(&self, drive: char, mft_files: &[crate::fs::MftFileInfo]) {
-        for f in mft_files {
-            let name = f.name.clone();
-            let path = normalize_abs_path(drive, &f.path);
-            self.upsert_internal(IndexEntry {
-                path,
-                name: name.clone(),
-                name_lower: name.to_lowercase(),
-                size: f.size as i64,
-                is_dir: f.is_dir,
-                mtime: 0,
-            });
-        }
+        let batch: Vec<IndexEntry> = mft_files
+            .iter()
+            .map(|f| {
+                let name = f.name.clone();
+                IndexEntry {
+                    path: normalize_abs_path(drive, &f.path),
+                    name: name.clone(),
+                    name_lower: name.to_lowercase(),
+                    size: f.size as i64,
+                    is_dir: f.is_dir,
+                    mtime: 0,
+                }
+            })
+            .collect();
+        self.upsert_batch_internal(batch);
     }
 
     /// 逐盘追加 scan_directory 结果（回退路径，已含完整字段）
     pub fn append_scan(&self, drive: char, items: &[crate::scan::Item]) {
-        for item in items {
-            let name = item.name.to_string();
-            self.upsert_internal(IndexEntry {
-                path: normalize_abs_path(drive, item.path.as_str()),
-                name: name.clone(),
-                name_lower: name.to_lowercase(),
-                size: item.size,
-                is_dir: item.is_dir,
-                mtime: 0,
-            });
-        }
+        let batch: Vec<IndexEntry> = items
+            .iter()
+            .map(|item| {
+                let name = item.name.to_string();
+                IndexEntry {
+                    path: normalize_abs_path(drive, item.path.as_str()),
+                    name: name.clone(),
+                    name_lower: name.to_lowercase(),
+                    size: item.size,
+                    is_dir: item.is_dir,
+                    mtime: item.mtime,
+                }
+            })
+            .collect();
+        self.upsert_batch_internal(batch);
 
         let total = self.entries.read().len();
         *self.state.write() = IndexState::Loading {
@@ -340,24 +389,28 @@ impl GlobalIndex {
         // 先移除该路径下已有的条目，避免重复
         self.remove_prefix_internal(&format!("{}/", path_base));
 
-        for item in items {
-            let abs_path = if item.path.as_str().to_lowercase().starts_with(&path_base_lower)
-                || item.path.starts_with('/')
-            {
-                item.path.to_string()
-            } else {
-                format!("{}/{}", path_base, item.path.as_str())
-            };
-            let name = item.name.to_string();
-            self.upsert_internal(IndexEntry {
-                path: abs_path,
-                name: name.clone(),
-                name_lower: name.to_lowercase(),
-                size: item.size,
-                is_dir: item.is_dir,
-                mtime: 0,
-            });
-        }
+        let batch: Vec<IndexEntry> = items
+            .iter()
+            .map(|item| {
+                let abs_path = if item.path.as_str().to_lowercase().starts_with(&path_base_lower)
+                    || item.path.starts_with('/')
+                {
+                    item.path.to_string()
+                } else {
+                    format!("{}/{}", path_base, item.path.as_str())
+                };
+                let name = item.name.to_string();
+                IndexEntry {
+                    path: abs_path,
+                    name: name.clone(),
+                    name_lower: name.to_lowercase(),
+                    size: item.size,
+                    is_dir: item.is_dir,
+                    mtime: item.mtime,
+                }
+            })
+            .collect();
+        self.upsert_batch_internal(batch);
 
         // 保留已有的盘符元数据，仅更新计数
         self.update_ready_state();
@@ -383,6 +436,41 @@ impl GlobalIndex {
     /// 按前缀移除条目（供 USN 增量同步或重建使用）
     pub fn remove_by_prefix(&self, prefix: &str) {
         self.remove_prefix_internal(prefix);
+        if matches!(*self.state.read(), IndexState::Ready(..)) {
+            self.update_ready_state();
+        }
+    }
+
+    /// 批量更新或插入条目（USN 增量同步）：整批一次锁临界区 + 一次状态刷新
+    pub fn upsert_batch(&self, entries: Vec<IndexEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        self.upsert_batch_internal(entries);
+        if matches!(*self.state.read(), IndexState::Ready(..)) {
+            self.update_ready_state();
+        }
+    }
+
+    /// 批量按绝对路径移除条目（USN 增量同步）：一次锁临界区 + 一次状态刷新
+    pub fn remove_paths_batch(&self, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
+        {
+            // 锁顺序与 upsert_internal 一致：先 entries 后 name_index
+            let mut entries = self.entries.write();
+            let mut name_index = self.name_index.write();
+            for path in paths {
+                if let Some(old) = entries.remove(path) {
+                    let old_char = old.name_lower.chars().next().unwrap_or('\0');
+                    if let Some(set) = name_index.get_mut(&old_char) {
+                        set.remove(path.as_str());
+                    }
+                    self.bump_count(old.is_dir, -1);
+                }
+            }
+        }
         if matches!(*self.state.read(), IndexState::Ready(..)) {
             self.update_ready_state();
         }

@@ -31,6 +31,7 @@
 
 <script setup>
 import { computed } from 'vue'
+import { formatSize } from '../utils/format.js'
 
 const props = defineProps({
   items: { type: Array, default: () => [] },
@@ -76,13 +77,6 @@ const extStats = computed(() => {
 const getExt = (name) => {
   const dot = name.lastIndexOf('.')
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : ''
-}
-
-const formatSize = (bytes) => {
-  if (bytes === 0) return '0 B'
-  const units = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.floor(Math.log(bytes) / Math.log(1024))
-  return (bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 2) + ' ' + units[i]
 }
 </script>
 

@@ -30,7 +30,7 @@
     <button
       class="fd-btn fd-btn-primary"
       :disabled="loading"
-      @click="$emit('scan', path)"
+      @click="$emit('scan', localPath)"
     >
       <svg v-if="loading" class="animate-spin" width="13" height="13" fill="none" viewBox="0 0 24 24">
         <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
@@ -43,11 +43,12 @@
     <button class="fd-btn" @click="$emit('browse')">浏览…</button>
 
     <div class="fd-path-bar">
-      <span class="fd-path-prefix">C:</span>
       <input
-        :value="path"
+        v-model="localPath"
         type="text"
-        @keyup.enter="$emit('scan', $event.target.value)"
+        placeholder="输入目录路径，回车或点扫描"
+        spellcheck="false"
+        @keyup.enter="$emit('scan', localPath)"
       />
     </div>
 
@@ -67,16 +68,20 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import GlobalSearchDropdown from './GlobalSearchDropdown.vue'
 
-defineProps({
+const props = defineProps({
   path: { type: String, default: '' },
   canGoBack: { type: Boolean, default: false },
   canGoForward: { type: Boolean, default: false },
   canGoUp: { type: Boolean, default: false },
   loading: { type: Boolean, default: false },
 })
+
+// 路径输入框本地值：用户可自由编辑，父级路径变化（导航/历史/浏览）时同步
+const localPath = ref(props.path)
+watch(() => props.path, (v) => { localPath.value = v })
 
 const globalSearchRef = ref(null)
 
@@ -171,5 +176,5 @@ defineExpose({ focusGlobalSearch })
   font-size: 12px;
   min-width: 0;
 }
-.fd-path-prefix { color: var(--fd-text-2); user-select: none; }
+.fd-path-bar input::placeholder { color: var(--fd-text-3); }
 </style>

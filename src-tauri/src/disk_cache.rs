@@ -497,6 +497,57 @@ impl DiskCache {
         Ok(())
     }
 
+    /// 批量 upsert（USN 增量同步）：单事务写入，避免逐条自动提交带来的 fsync 开销
+    pub fn upsert_global_index_entries(&self, entries: &[IndexEntry]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.conn.lock();
+        let conn = guard.as_mut().ok_or_else(Self::disabled_err)?;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO global_index
+                 (path, name, name_lower, size, is_dir, drive, mtime, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            let now = chrono::Utc::now().timestamp();
+            for entry in entries {
+                let drive = Self::extract_drive(&entry.path).unwrap_or('?').to_string();
+                stmt.execute(params![
+                    entry.path,
+                    entry.name,
+                    entry.name_lower,
+                    entry.size,
+                    entry.is_dir as i64,
+                    drive,
+                    entry.mtime,
+                    now,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 批量按绝对路径删除（USN 增量同步）：单事务
+    pub fn remove_global_index_by_paths(&self, paths: &[String]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.conn.lock();
+        let conn = guard.as_mut().ok_or_else(Self::disabled_err)?;
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM global_index WHERE path = ?1")?;
+            for p in paths {
+                stmt.execute(params![p])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// 按绝对路径删除条目（USN 删除/重命名旧名称）
     pub fn remove_global_index_by_path(&self, path: &str) -> Result<()> {
         let guard = self.conn.lock();

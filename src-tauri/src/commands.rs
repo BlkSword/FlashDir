@@ -500,7 +500,10 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
 
     let drives = flashdir::global_search::list_ntfs_drives();
     if drives.is_empty() {
-        idx.finish_building(&[]);
+        // 不能调 finish_building(&[])：那会把状态置为 Ready(0 项)，
+        // 不仅显示"就绪 · 0 项"，还会把空索引持久化，且后续 ensure_index
+        // 因 Ready 提前返回而永远不再重试
+        idx.set_failed("未检测到可扫描的 NTFS 卷（需要管理员权限读取 MFT）".to_string());
         return Err("未检测到可扫描的 NTFS 卷（需要管理员权限读取 MFT）".to_string());
     }
 
@@ -553,7 +556,11 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
         }
     }
 
-    idx.finish_building(&ok_drives);
+    if ok_drives.is_empty() {
+        idx.set_failed("所有卷都无法建立索引（需要管理员权限读取 MFT）".to_string());
+    } else {
+        idx.finish_building(&ok_drives);
+    }
     let _ = app.emit(
         "global-search-progress",
         serde_json::json!({ "drive": "", "scanned": idx.entries_len(), "phase": "done" }),
@@ -627,7 +634,11 @@ pub async fn global_search_refresh(app: tauri::AppHandle) -> Result<(), String> 
             serde_json::json!({ "drive": drive.to_string(), "scanned": idx.entries_len(), "phase": if count > 0 { "ok" } else { "skipped" }, "count": count }),
         );
     }
-    idx.finish_building(&ok_drives);
+    if ok_drives.is_empty() {
+        idx.set_failed("所有卷都无法建立索引（需要管理员权限读取 MFT）".to_string());
+    } else {
+        idx.finish_building(&ok_drives);
+    }
     let _ = app.emit(
         "global-search-progress",
         serde_json::json!({ "drive": "", "scanned": idx.entries_len(), "phase": "done" }),
