@@ -9,7 +9,7 @@
 直接读取 NTFS 主文件表（$MFT），全盘 64 万+文件约 6 秒扫描完成。
 USN Journal 增量刷新、开发者工具自动识别、多版本快照对比、Everything 式智能过滤，以及跨盘全局文件搜索。
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%2B-orange.svg)](https://www.rust-lang.org)
 [![Tauri](https://img.shields.io/badge/tauri-2.0-blue.svg)](https://tauri.app)
 [![Version](https://img.shields.io/badge/version-3.4.0-green.svg)](src-tauri/Cargo.toml)
@@ -303,14 +303,10 @@ FlashDir/
 │   │       │   └── HistoryList.vue   # 扫描历史
 │   │       ├── composables/
 │   │       │   ├── useTauri.js       # Tauri IPC 封装
-│   │       │   ├── useTheme.js       # 主题管理
-│   │       │   ├── useSortWorker.js  # Web Worker 排序卸载
-│   │       │   └── useWasmSort.js    # WASM 排序模块
+│   │       │   └── useSortWorker.js  # 列表排序/过滤工具
 │   │       ├── utils/
 │   │       │   ├── format.js         # 格式化工具
-│   │       │   ├── smartFilter.js    # Everything 式智能过滤
-│   │       │   └── scanBinary.js     # 二进制扫描辅助
-│   │       └── directives/           # v-lazy 懒加载
+│   │       │   └── smartFilter.js    # Everything 式智能过滤
 │   │
 │   ├── src/                          # Rust 后端（GUI + CLI 共享库）
 │   │   ├── lib.rs                    # 库入口
@@ -333,7 +329,7 @@ FlashDir/
 │   │   └── bin/
 │   │       └── cli.rs                # CLI 终端工具
 │   │
-│   └── wasm-sort/                    # WASM 排序模块
+│   └── icons/                        # 应用图标
 │
 └── README.md
 ```
@@ -343,14 +339,13 @@ FlashDir/
 | 层级 | 技术 |
 |------|------|
 | 核心引擎 | Rust 2021 · Tokio 异步 · Rayon 并行 |
-| 桌面 GUI | Tauri 2.0 · Vue 3 · Vite · Ant Design Vue · Chart.js · Canvas API |
+| 桌面 GUI | Tauri 2.0 · Vue 3 · Vite · Ant Design Vue · Canvas API |
 | 文件系统 | NTFS $MFT 直读 · USN Journal 增量 · FRN 路径解析 · IOCP 异步 I/O |
 | 缓存 | DashMap + LRU（内存）· SQLite + bincode（磁盘 + 快照多版本） |
 | 分析引擎 | KnownPattern 分类器（18 类）· HashMap O(n) 差异引擎 |
-| 可视化 | Squarified Treemap (Canvas) · Chart.js 环形图/柱状图 |
+| 可视化 | Squarified Treemap (Canvas) · 统计面板 |
 | 过滤搜索 | Everything-style 语法解析 · 本地 `ext:`/`size:`/`type:`/`dir:` + 全局 `*.pdf`/`prefix*`/`*suffix`/`NOT` |
-| 内存优化 | mimalloc 分配器 · SmartString 栈存储 · Arc 共享 · ahash |
-| 排序卸载 | 三级回退：WASM（Rust）→ Web Worker（JS）→ 同步 JS |
+| 内存优化 | mimalloc 分配器 · SmartString 栈存储 · Arc 共享 |
 
 ---
 
@@ -388,14 +383,6 @@ npm run tauri:build    # 生产构建 → src-tauri/target/release/bundle/
 cd src-tauri
 cargo build --release --bin cli
 # → target/release/cli.exe
-```
-
-### WASM 排序模块
-
-```bash
-cd src-tauri/wasm-sort
-./build.sh                  # macOS / Linux
-powershell -File build.ps1  # Windows
 ```
 
 ---

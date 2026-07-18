@@ -10,41 +10,6 @@ impl BinarySerializer {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BinaryPayload {
-    #[serde(with = "serde_bytes")]
-    pub data: Vec<u8>,
-    pub compressed: bool,
-    pub original_size: usize,
-}
-
-impl BinaryPayload {
-    pub fn from_data<T: Serialize>(value: &T, _compress_threshold: usize) -> anyhow::Result<Self> {
-        let serialized = BinarySerializer::serialize(value)?;
-        let original_size = serialized.len();
-
-        #[cfg(feature = "zstd")]
-        if original_size > compress_threshold {
-            use std::io::Cursor;
-            if let Ok(compressed) = zstd::stream::encode_all(Cursor::new(&serialized), 3) {
-                if compressed.len() < original_size * 8 / 10 {
-                    return Ok(Self {
-                        data: compressed,
-                        compressed: true,
-                        original_size,
-                    });
-                }
-            }
-        }
-
-        Ok(Self {
-            data: serialized,
-            compressed: false,
-            original_size,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OptimizedScanResult {
     pub path: String,
     pub total_size: i64,

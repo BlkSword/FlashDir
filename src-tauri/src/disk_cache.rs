@@ -1,31 +1,49 @@
 use anyhow::Result;
-use chrono;
 use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Arc;
-use lazy_static::lazy_static;
+use std::sync::{Arc, OnceLock};
 
 use crate::scan::ScanResult;
 use crate::global_search::IndexEntry;
 
 /// 磁盘缓存管理器
+///
+/// 初始化失败（HOME 不可写、DB 文件被占用、杀软干扰等）时降级为
+/// "无磁盘缓存"模式：读操作返回 None，写操作返回错误，绝不 panic。
 pub struct DiskCache {
-    conn: Mutex<Connection>,
+    /// SQLite 连接；None 表示降级模式
+    conn: Mutex<Option<Connection>>,
     max_size_mb: usize,
     current_size_mb: Mutex<usize>,
 }
 
-lazy_static! {
-    static ref DISK_CACHE: Arc<DiskCache> = Arc::new(
-        DiskCache::new().expect("Failed to initialize disk cache")
-    );
-}
+static DISK_CACHE: OnceLock<Arc<DiskCache>> = OnceLock::new();
 
 impl DiskCache {
     pub fn instance() -> Arc<DiskCache> {
-        DISK_CACHE.clone()
+        DISK_CACHE
+            .get_or_init(|| {
+                Arc::new(Self::new().unwrap_or_else(|e| {
+                    eprintln!("[FlashDir] 磁盘缓存初始化失败，降级为无磁盘缓存模式: {e:#}");
+                    Self::disabled()
+                }))
+            })
+            .clone()
+    }
+
+    /// 构造禁用态缓存（数据库不可用时的降级实例）
+    fn disabled() -> Self {
+        Self {
+            conn: Mutex::new(None),
+            max_size_mb: 500,
+            current_size_mb: Mutex::new(0),
+        }
+    }
+
+    fn disabled_err() -> anyhow::Error {
+        anyhow::anyhow!("磁盘缓存不可用（初始化失败，已降级为无缓存模式）")
     }
 
     pub fn new() -> Result<Self> {
@@ -105,7 +123,7 @@ impl DiskCache {
             .unwrap_or(0);
 
         let cache = Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(Some(conn)),
             max_size_mb: 500,
             current_size_mb: Mutex::new((current_size / 1024 / 1024) as usize),
         };
@@ -127,7 +145,8 @@ impl DiskCache {
     }
 
     pub fn get(&self, path: &str, dir_mtime: i64) -> Option<ScanResult> {
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let conn = guard.as_ref()?;
 
         let result: Option<(Vec<u8>, i64)> = conn
             .query_row(
@@ -156,7 +175,8 @@ impl DiskCache {
     /// 获取缓存的扫描结果，忽略 mtime 检查（用于 USN 增量更新）
     /// 返回即使缓存已过期也能使用的数据
     pub fn get_stale(&self, path: &str) -> Option<ScanResult> {
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let conn = guard.as_ref()?;
 
         let data: Option<Vec<u8>> = conn
             .query_row(
@@ -178,7 +198,8 @@ impl DiskCache {
 
         self.maybe_cleanup(size)?;
 
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         conn.execute(
             "INSERT OR REPLACE INTO scan_cache (path, data, dir_mtime, created_at, size, item_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -201,7 +222,10 @@ impl DiskCache {
     fn cleanup_old_entries(&self) -> Result<()> {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
 
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let Some(conn) = guard.as_ref() else {
+            return Ok(());
+        };
         conn.execute(
             "DELETE FROM scan_cache WHERE created_at < ?1",
             params![cutoff.timestamp()],
@@ -215,7 +239,10 @@ impl DiskCache {
         let new_size = *self.current_size_mb.lock() * 1024 * 1024 + new_entry_size;
 
         if new_size > max_bytes {
-            let conn = self.conn.lock();
+            let guard = self.conn.lock();
+            let Some(conn) = guard.as_ref() else {
+                return Ok(());
+            };
 
             let to_remove = (new_size - max_bytes + max_bytes / 4) / 1024 / 1024;
 
@@ -231,14 +258,25 @@ impl DiskCache {
     }
 
     pub fn clear(&self) -> Result<()> {
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         conn.execute("DELETE FROM scan_cache", [])?;
         *self.current_size_mb.lock() = 0;
         Ok(())
     }
 
     pub fn get_stats(&self) -> CacheStats {
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let Some(conn) = guard.as_ref() else {
+            return CacheStats {
+                entry_count: 0,
+                total_size_bytes: 0,
+                total_size_mb: 0.0,
+                max_size_mb: self.max_size_mb,
+                oldest_entry_timestamp: None,
+                enabled: false,
+            };
+        };
 
         let (entry_count, total_size): (i64, i64) = conn
             .query_row(
@@ -263,11 +301,13 @@ impl DiskCache {
             total_size_mb: (total_size / 1024 / 1024) as f64,
             max_size_mb: self.max_size_mb,
             oldest_entry_timestamp: oldest_entry,
+            enabled: true,
         }
     }
 
     pub fn invalidate(&self, path: &str) -> Result<()> {
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         conn.execute(
             "DELETE FROM scan_cache WHERE path = ?1 OR path LIKE ?2",
             params![path, format!("{}%", path)],
@@ -288,7 +328,8 @@ impl DiskCache {
         let data = bincode::serialize(result)?;
         let now = chrono::Utc::now().timestamp();
 
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         conn.execute(
             "INSERT INTO snapshots (path, scan_time, data, total_size, total_size_formatted, item_count, file_count, dir_count)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -326,7 +367,8 @@ impl DiskCache {
 
     /// 列出某路径的所有快照（元数据，不含完整数据）
     pub fn list_snapshots(&self, path: &str) -> Result<Vec<SnapshotInfo>> {
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         let mut stmt = conn.prepare(
             "SELECT id, path, scan_time, total_size, total_size_formatted, item_count, file_count, dir_count
              FROM snapshots WHERE path = ?1 ORDER BY scan_time DESC LIMIT 50",
@@ -353,7 +395,9 @@ impl DiskCache {
 
     /// 获取指定 ID 的快照完整数据
     pub fn get_snapshot(&self, id: i64) -> Option<ScanResult> {
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let conn = guard.as_ref()?;
+
         let data: Option<Vec<u8>> = conn
             .query_row(
                 "SELECT data FROM snapshots WHERE id = ?1",
@@ -369,7 +413,8 @@ impl DiskCache {
 
     /// 删除指定快照
     pub fn delete_snapshot(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         conn.execute("DELETE FROM snapshots WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -378,7 +423,8 @@ impl DiskCache {
 
     /// 加载全部全局索引条目
     pub fn load_global_index(&self) -> Result<Vec<IndexEntry>> {
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         let mut stmt = conn.prepare(
             "SELECT path, name, name_lower, size, is_dir, mtime FROM global_index",
         )?;
@@ -400,7 +446,8 @@ impl DiskCache {
 
     /// 全量重建全局索引时批量写入（事务内先清空再插入）
     pub fn save_global_index_batch(&self, entries: &[IndexEntry]) -> Result<()> {
-        let mut conn = self.conn.lock();
+        let mut guard = self.conn.lock();
+        let conn = guard.as_mut().ok_or_else(Self::disabled_err)?;
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM global_index", [])?;
         {
@@ -429,7 +476,8 @@ impl DiskCache {
 
     /// 单条 upsert（USN 增量同步）
     pub fn upsert_global_index_entry(&self, entry: &IndexEntry) -> Result<()> {
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         let drive = Self::extract_drive(&entry.path).unwrap_or('?').to_string();
         conn.execute(
             "INSERT OR REPLACE INTO global_index
@@ -451,14 +499,16 @@ impl DiskCache {
 
     /// 按绝对路径删除条目（USN 删除/重命名旧名称）
     pub fn remove_global_index_by_path(&self, path: &str) -> Result<()> {
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         conn.execute("DELETE FROM global_index WHERE path = ?1", params![path])?;
         Ok(())
     }
 
     /// 按前缀删除条目（USN 增量失败时重建某路径）
     pub fn remove_global_index_by_prefix(&self, prefix: &str) -> Result<()> {
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         conn.execute(
             "DELETE FROM global_index WHERE path LIKE ?1",
             params![format!("{}%", prefix)],
@@ -468,7 +518,8 @@ impl DiskCache {
 
     /// 清空全局索引
     pub fn clear_global_index(&self) -> Result<()> {
-        let conn = self.conn.lock();
+        let guard = self.conn.lock();
+        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         conn.execute("DELETE FROM global_index", [])?;
         Ok(())
     }
@@ -505,4 +556,6 @@ pub struct CacheStats {
     pub total_size_mb: f64,
     pub max_size_mb: usize,
     pub oldest_entry_timestamp: Option<i64>,
+    /// 磁盘缓存是否可用（false = 初始化失败，已降级为无缓存模式）
+    pub enabled: bool,
 }

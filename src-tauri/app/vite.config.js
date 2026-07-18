@@ -62,8 +62,6 @@ export default defineConfig(({ mode }) => {
           manualChunks: {
             // 将 Ant Design Vue 单独打包
             'ant-design': ['ant-design-vue', '@ant-design/icons-vue'],
-            // 将 Chart.js 单独打包
-            'charts': ['chart.js'],
             // Vue 核心
             'vue-core': ['vue'],
             // Tauri API

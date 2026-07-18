@@ -1,9 +1,8 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
-use lazy_static::lazy_static;
 
 /// 扫描性能指标
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,9 +72,7 @@ struct ScanSession {
     start_instant: Instant,
 }
 
-lazy_static! {
-    static ref MONITOR: Arc<PerformanceMonitor> = Arc::new(PerformanceMonitor::new(50));
-}
+static MONITOR: OnceLock<Arc<PerformanceMonitor>> = OnceLock::new();
 
 impl PerformanceMonitor {
     pub fn new(max_history: usize) -> Self {
@@ -87,7 +84,9 @@ impl PerformanceMonitor {
     }
 
     pub fn instance() -> Arc<PerformanceMonitor> {
-        MONITOR.clone()
+        MONITOR
+            .get_or_init(|| Arc::new(PerformanceMonitor::new(50)))
+            .clone()
     }
 
     pub fn start_scan(&self, path: &str) -> String {

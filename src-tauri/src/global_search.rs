@@ -5,6 +5,8 @@
 // 后续搜索仅为内存过滤；刷新走全量重建（复用 build_index）。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -71,6 +73,9 @@ pub struct GlobalIndex {
     name_index: RwLock<HashMap<char, HashSet<String>>>,
     state: RwLock<IndexState>,
     meta: RwLock<IndexMeta>,
+    /// 增量维护的文件/目录计数，避免每次状态刷新都 O(n) 全量重数
+    file_count: AtomicUsize,
+    dir_count: AtomicUsize,
 }
 
 impl GlobalIndex {
@@ -80,6 +85,8 @@ impl GlobalIndex {
             name_index: RwLock::new(HashMap::new()),
             state: RwLock::new(IndexState::NotLoaded),
             meta: RwLock::new(IndexMeta::default()),
+            file_count: AtomicUsize::new(0),
+            dir_count: AtomicUsize::new(0),
         }
     }
 
@@ -109,10 +116,8 @@ impl GlobalIndex {
     }
 
     fn update_ready_state(&self) {
-        let entries = self.entries.read();
-        let fc = entries.values().filter(|e| !e.is_dir).count();
-        let dc = entries.len() - fc;
-        drop(entries);
+        let fc = self.file_count.load(Ordering::Relaxed);
+        let dc = self.dir_count.load(Ordering::Relaxed);
 
         let meta = self.meta.read();
         *self.state.write() = IndexState::Ready(ReadyData {
@@ -124,20 +129,18 @@ impl GlobalIndex {
         });
     }
 
-    /// 添加或替换一条索引。内部统一维护 entries 与 name_index。
-    /// 注意：绝不在持有 name_index 锁时去获取 entries 锁，避免死锁。
+    /// 添加或替换一条索引。entries 与 name_index 在同一把锁临界区内更新，
+    /// 保证并发 search() 不会观察到两半不一致的中间态。
+    /// 锁顺序：永远先 entries 后 name_index，避免死锁。
     fn upsert_internal(&self, entry: IndexEntry) {
         let first_char = entry.name_lower.chars().next().unwrap_or('\0');
 
-        // 先更新 entries，返回旧条目
-        let old_entry = {
-            let mut entries = self.entries.write();
-            entries.insert(entry.path.clone(), entry.clone())
-        };
-
-        // 再更新 name_index
+        let mut entries = self.entries.write();
         let mut name_index = self.name_index.write();
-        if let Some(old) = old_entry {
+
+        let old_entry = entries.insert(entry.path.clone(), entry.clone());
+
+        if let Some(old) = &old_entry {
             let old_char = old.name_lower.chars().next().unwrap_or('\0');
             if old_char != first_char {
                 if let Some(set) = name_index.get_mut(&old_char) {
@@ -149,20 +152,39 @@ impl GlobalIndex {
             .entry(first_char)
             .or_insert_with(HashSet::new)
             .insert(entry.path.clone());
+
+        // 增量维护计数
+        match &old_entry {
+            None => self.bump_count(entry.is_dir, 1),
+            Some(old) if old.is_dir != entry.is_dir => {
+                self.bump_count(old.is_dir, -1);
+                self.bump_count(entry.is_dir, 1);
+            }
+            _ => {}
+        }
+    }
+
+    fn bump_count(&self, is_dir: bool, delta: isize) {
+        let counter = if is_dir { &self.dir_count } else { &self.file_count };
+        if delta >= 0 {
+            counter.fetch_add(delta as usize, Ordering::Relaxed);
+        } else {
+            counter.fetch_sub((-delta) as usize, Ordering::Relaxed);
+        }
     }
 
     /// 移除指定路径的索引。
     fn remove_path_internal(&self, path: &str) {
-        let old = {
-            let mut entries = self.entries.write();
-            entries.remove(path)
-        };
-        if let Some(old) = old {
+        // 锁顺序与 upsert_internal 一致：先 entries 后 name_index
+        let mut entries = self.entries.write();
+        let mut name_index = self.name_index.write();
+
+        if let Some(old) = entries.remove(path) {
             let old_char = old.name_lower.chars().next().unwrap_or('\0');
-            let mut name_index = self.name_index.write();
             if let Some(set) = name_index.get_mut(&old_char) {
                 set.remove(path);
             }
+            self.bump_count(old.is_dir, -1);
         }
     }
 
@@ -186,6 +208,8 @@ impl GlobalIndex {
     fn clear_internal(&self) {
         self.entries.write().clear();
         self.name_index.write().clear();
+        self.file_count.store(0, Ordering::Relaxed);
+        self.dir_count.store(0, Ordering::Relaxed);
     }
 
     /// 按文件名搜索（大小写不敏感，包含匹配），取前 limit 条。
@@ -834,12 +858,10 @@ pub(crate) fn normalize_abs_path(drive: char, path: &str) -> String {
     }
 }
 
-lazy_static::lazy_static! {
-    static ref GLOBAL_INDEX: GlobalIndex = GlobalIndex::new();
-}
+static GLOBAL_INDEX: OnceLock<GlobalIndex> = OnceLock::new();
 
 pub fn instance() -> &'static GlobalIndex {
-    &GLOBAL_INDEX
+    GLOBAL_INDEX.get_or_init(GlobalIndex::new)
 }
 
 /// 创建一个空实例，仅用于测试。

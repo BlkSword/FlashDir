@@ -10,7 +10,7 @@ use smartstring::SmartString;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tauri::Emitter;
 use tokio::fs;
 
@@ -249,9 +249,12 @@ impl ScanCache {
     }
 }
 
-lazy_static::lazy_static! {
-    static ref SCAN_CACHE: ScanCache = ScanCache::new(30, 200);
-    static ref SIZE_UNITS: [&'static str; 5] = ["B", "KB", "MB", "GB", "TB"];
+const SIZE_UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+
+static SCAN_CACHE: OnceLock<ScanCache> = OnceLock::new();
+
+fn scan_cache() -> &'static ScanCache {
+    SCAN_CACHE.get_or_init(|| ScanCache::new(30, 200))
 }
 
 /// 将任意路径规范化为内存/磁盘缓存使用的 key（canonical + 正斜杠）
@@ -264,7 +267,7 @@ fn cache_key_for(path: &str) -> Option<String> {
 /// 避免把百万级 items 再次跨 IPC 传回后端）
 pub fn get_cached_items(path: &str) -> Option<Arc<Vec<Item>>> {
     let key = cache_key_for(path)?;
-    SCAN_CACHE.get(&key).map(|e| Arc::clone(&e.result.items))
+    scan_cache().get(&key).map(|e| Arc::clone(&e.result.items))
 }
 
 /// 自定义紧凑二进制编码扫描结果，供前端经 Tauri 原始字节通道接收，
@@ -417,7 +420,7 @@ pub async fn scan_directory(
     // 1. 检查内存缓存
     if !force_refresh {
         let cache_check_start = std::time::Instant::now();
-        if let Some(cached) = SCAN_CACHE.get(&root_dir) {
+        if let Some(cached) = scan_cache().get(&root_dir) {
             // 如果缓存来自目录遍历，但当前进程是管理员且 MFT 可用，
             // 则放弃缓存并重新扫描，以升级到 MFT 快速路径。
             let can_upgrade_to_mft = !cached.result.mft_available
@@ -470,7 +473,7 @@ pub async fn scan_directory(
                 perf_monitor.record_cache_hit(cache_read_time);
 
                 // 同时写入内存缓存
-                SCAN_CACHE.insert(root_dir.clone(), cached_result.clone());
+                scan_cache().insert(root_dir.clone(), cached_result.clone());
 
                 let mut result = cached_result;
                 result.scan_time = 0.0;
@@ -499,7 +502,7 @@ pub async fn scan_directory(
         }
     }
 
-    SCAN_CACHE.invalidate(&root_dir);
+    scan_cache().invalidate(&root_dir);
 
     // ── P2 优化：USN Journal 增量更新 ──
     // 在失效缓存之前，先尝试用 USN Journal 增量更新过期的缓存数据
@@ -582,7 +585,7 @@ pub async fn scan_directory(
     };
 
     // 写入两级缓存
-    SCAN_CACHE.insert(root_dir.clone(), result.clone());
+    scan_cache().insert(root_dir.clone(), result.clone());
     DiskCache::instance().insert(&root_dir, &result, mtime_timestamp).ok();
 
     perf_monitor.end_scan();
@@ -924,7 +927,7 @@ fn try_usn_incremental_update(
         // 返回磁盘缓存（无需修改，mtime 已通过 USN 验证为最新）
         if let Some(cached) = DiskCache::instance().get_stale(root_dir) {
             // 重新写入内存缓存
-            SCAN_CACHE.insert(root_dir.to_string(), cached.clone());
+            scan_cache().insert(root_dir.to_string(), cached.clone());
             let _ = DiskCache::instance().insert(root_dir, &cached, new_checkpoint.created_at);
             return Some(cached);
         }
@@ -1277,7 +1280,7 @@ fn try_usn_incremental_update(
     };
 
     // 写入两级缓存
-    SCAN_CACHE.insert(root_dir.to_string(), result.clone());
+    scan_cache().insert(root_dir.to_string(), result.clone());
     let _ = DiskCache::instance().insert(root_dir, &result, new_checkpoint.created_at);
 
     Some(result)

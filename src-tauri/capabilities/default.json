@@ -6,14 +6,6 @@
     "core:default",
     "core:path:default",
     "core:event:default",
-    "dialog:allow-open",
-    "fs:allow-read-file",
-    "fs:allow-write-file",
-    "fs:allow-read-dir",
-    "fs:allow-stat",
-    "fs:allow-fstat",
-    "fs:allow-lstat",
-    "fs:allow-exists",
-    "shell:allow-open"
+    "dialog:allow-open"
   ]
 }

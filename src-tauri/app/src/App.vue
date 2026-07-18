@@ -27,7 +27,7 @@
     <main class="fd-main">
       <FileList
         :items="displayItems"
-        :loading="loading || sortWorker.isProcessing.value"
+        :loading="loading"
         :total-size="totalSize"
         :current-path="currentPath"
         :sort-config="sortConfig"
@@ -83,7 +83,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted, shallowRef, triggerRef } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted, shallowRef } from 'vue'
 import { message } from 'ant-design-vue'
 import { listen } from '@tauri-apps/api/event'
 import Toolbar from './components/Toolbar.vue'
@@ -101,8 +101,6 @@ import { homeDir, join } from '@tauri-apps/api/path'
 const { invoke, openDialog } = useTauri()
 const sortWorker = useSortWorker()
 
-let unlistenScanBatch = null
-const streamedItemCount = ref(0)
 const scanPhase = ref({ phase: '', message: '' })
 let unlistenScanPhase = null
 
@@ -201,29 +199,11 @@ const handleScan = async (path, addToHistory = true) => {
   loading.value = true
   scanTime.value = 0
   backendTime.value = 0
-  streamedItemCount.value = 0
   backendTotalSize.value = 0
   scanPhase.value = { phase: '', message: '' }
 
   allItems.value = []
   treeData.value = []
-
-  if (unlistenScanBatch) {
-    unlistenScanBatch()
-  }
-  unlistenScanBatch = await listen('scan-batch', (event) => {
-    const batch = event.payload
-    if (Array.isArray(batch) && batch.length > 0) {
-      allItems.value.push(...batch)
-      triggerRef(allItems)
-      streamedItemCount.value = allItems.value.length
-      for (let i = 0; i < batch.length; i++) {
-        if (!batch[i].isDir) {
-          backendTotalSize.value += batch[i].size || 0
-        }
-      }
-    }
-  })
 
   const fullStartTime = performance.now()
 
@@ -241,7 +221,6 @@ const handleScan = async (path, addToHistory = true) => {
     lastSortKey.value = `${sortConfig.value.column}-${sortConfig.value.direction}`
 
     currentPath.value = path
-    lastSortKey.value = ''
 
     mftAvailable.value = result.mftAvailable || false
 
@@ -270,11 +249,6 @@ const handleScan = async (path, addToHistory = true) => {
     message.error('扫描失败: ' + error)
   } finally {
     loading.value = false
-    if (unlistenScanBatch) {
-      unlistenScanBatch()
-      unlistenScanBatch = null
-    }
-    streamedItemCount.value = 0
     scanPhase.value = { phase: '', message: '' }
   }
 }
@@ -380,11 +354,10 @@ const handleSort = (column, direction) => {
   }
   sortConfig.value.column = column
   sortConfig.value.direction = newDirection
-  lastSortKey.value = ''
   if (allItems.value.length > 0) {
-    const newSortKey = `${sortConfig.value.column}-${sortConfig.value.direction}`
+    const newSortKey = `${column}-${newDirection}`
     if (newSortKey !== lastSortKey.value) {
-      presortedAllItems.value = sortWorker.sortItemsSync(allItems.value, sortConfig.value.column, sortConfig.value.direction)
+      presortedAllItems.value = sortWorker.sortItemsSync(allItems.value, column, newDirection)
       lastSortKey.value = newSortKey
     }
   }
@@ -530,10 +503,6 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
-  if (unlistenScanBatch) {
-    unlistenScanBatch()
-    unlistenScanBatch = null
-  }
   if (unlistenGlobalSearchProgress) {
     unlistenGlobalSearchProgress()
     unlistenGlobalSearchProgress = null
