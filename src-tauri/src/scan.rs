@@ -405,6 +405,15 @@ pub async fn scan_directory(
     let _scan_id = perf_monitor.start_scan(path);
     let start_time = std::time::Instant::now();
 
+    // 每次扫描开始时重置取消标记
+    crate::cancel::reset();
+
+    if crate::cancel::is_requested() {
+        perf_monitor.add_error("扫描已取消".to_string());
+        perf_monitor.end_scan();
+        return Err(anyhow::anyhow!("扫描已取消"));
+    }
+
     if path.trim().is_empty() {
         perf_monitor.add_error("路径不能为空".to_string());
         perf_monitor.end_scan();
@@ -438,6 +447,12 @@ pub async fn scan_directory(
     };
 
     let root_dir = normalize_path_separator(canonical_path.as_os_str());
+
+    if crate::cancel::is_requested() {
+        perf_monitor.add_error("扫描已取消".to_string());
+        perf_monitor.end_scan();
+        return Err(anyhow::anyhow!("扫描已取消"));
+    }
 
     let mtime = match metadata.modified() {
         Ok(m) => m,
@@ -564,6 +579,12 @@ pub async fn scan_directory(
 
     emit_scan_phase(&app_handle, "mft", "MFT 直接读取", None);
 
+    if crate::cancel::is_requested() {
+        perf_monitor.add_error("扫描已取消".to_string());
+        perf_monitor.end_scan();
+        return Err(anyhow::anyhow!("扫描已取消"));
+    }
+
     // 尝试 MFT 直接读取，失败则回退到目录遍历
     let mft_result = try_mft_scan_path(
         &canonical_path_clone,
@@ -574,6 +595,11 @@ pub async fn scan_directory(
 
     let output = match mft_result {
         Some(mft_output) => {
+            if crate::cancel::is_requested() {
+                perf_monitor.add_error("扫描已取消".to_string());
+                perf_monitor.end_scan();
+                return Err(anyhow::anyhow!("扫描已取消"));
+            }
             emit_scan_phase(&app_handle, "aggregating", "聚合目录大小", None);
             mft_output
         }
@@ -1373,16 +1399,24 @@ fn scan_directory_optimized_v4(
     perf_monitor.start_io_phase();
     let scan_start = std::time::Instant::now();
 
+    let cancelled = Arc::new(AtomicBool::new(false));
+
     pool.scope(|s| {
         for _ in 0..num_threads {
             let dir_sender = dir_sender.clone();
             let dir_receiver = dir_receiver.clone();
             let item_sender = item_sender.clone();
+            let cancelled_clone = Arc::clone(&cancelled);
 
             s.spawn(move |_| {
                 let mut idle_count = 0;
 
                 loop {
+                    if crate::cancel::is_requested() {
+                        cancelled_clone.store(true, Ordering::Relaxed);
+                        break;
+                    }
+
                     let dir_path = match dir_receiver.try_recv() {
                         Ok(d) => {
                             idle_count = 0;
@@ -1430,6 +1464,11 @@ fn scan_directory_optimized_v4(
 
     drop(item_sender);
     drop(dir_sender);
+
+    if cancelled.load(Ordering::Relaxed) || crate::cancel::is_requested() {
+        perf_monitor.add_error("扫描已取消".to_string());
+        return Err(anyhow::anyhow!("扫描已取消"));
+    }
 
     let scan_phase = scan_start.elapsed();
     perf_monitor.end_io_phase();

@@ -286,6 +286,12 @@ pub fn is_admin() -> bool {
     flashdir::fs::is_admin()
 }
 
+/// 请求取消当前扫描
+#[command]
+pub fn cancel_scan() {
+    flashdir::cancel::request();
+}
+
 /// 以管理员权限重启应用
 #[command]
 pub fn restart_as_admin() -> bool {
@@ -407,6 +413,34 @@ pub fn compare_snapshots(
         &new_result.items,
         old_result.total_size,
     ))
+}
+
+/// 对比最新快照与当前扫描结果（缓存优先，避免前端回传全量 items）。
+#[command]
+pub fn compare_with_latest_snapshot_from_cache(
+    path: String,
+) -> Result<Option<flashdir::diff_engine::SnapshotDiff>, String> {
+    let disk_cache = flashdir::disk_cache::DiskCache::instance();
+    let snapshots = disk_cache
+        .list_snapshots(&path)
+        .map_err(|e| format!("获取快照列表失败: {}", e))?;
+
+    if snapshots.is_empty() {
+        return Ok(None);
+    }
+
+    let latest = &snapshots[0];
+    let old_result = disk_cache
+        .get_snapshot(latest.id)
+        .ok_or_else(|| format!("快照 {} 不存在", latest.id))?;
+
+    let current_result = cached_scan_result(&path)?;
+
+    Ok(Some(flashdir::diff_engine::diff(
+        &old_result.items,
+        &current_result.items,
+        old_result.total_size,
+    )))
 }
 
 /// 删除指定快照

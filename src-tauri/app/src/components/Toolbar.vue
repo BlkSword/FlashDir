@@ -40,6 +40,8 @@
       {{ loading ? '扫描中' : '扫描' }}
     </button>
 
+    <button v-if="loading" class="fd-btn" @click="$emit('cancel-scan')">取消</button>
+
     <button class="fd-btn" @click="$emit('browse')">浏览…</button>
 
     <div class="fd-path-bar">
@@ -95,6 +97,7 @@ const focusGlobalSearch = () => {
 
 defineEmits([
   'scan',
+  'cancel-scan',
   'browse',
   'navigate',
   'show-history',

@@ -8,6 +8,7 @@
       :can-go-up="canGoUp"
       :loading="loading"
       @scan="handleScan"
+      @cancel-scan="handleCancelScan"
       @browse="handleBrowse"
       @navigate="handleNavigate"
       @show-history="historyVisible = true"
@@ -253,6 +254,15 @@ const handleScan = async (path, addToHistory = true) => {
   } finally {
     loading.value = false
     scanPhase.value = { phase: '', message: '' }
+  }
+}
+
+const handleCancelScan = async () => {
+  try {
+    await invoke('cancel_scan')
+    message.info('正在取消扫描…')
+  } catch (error) {
+    console.error('取消失败:', error)
   }
 }
 

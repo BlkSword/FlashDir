@@ -20,6 +20,14 @@
         >
           对比最近两次
         </a-button>
+        <a-button
+          size="small"
+          :loading="comparingLatest"
+          :disabled="snapshots.length === 0 || !props.currentPath"
+          @click="handleCompareLatest"
+        >
+          对比当前
+        </a-button>
       </div>
 
       <!-- 快照列表 -->
@@ -213,6 +221,7 @@ const selectedIds = ref([])
 const diffResult = ref(null)
 const saving = ref(false)
 const comparing = ref(false)
+const comparingLatest = ref(false)
 
 const formatPath = (path) => {
   if (!path) return ''
@@ -275,6 +284,24 @@ const handleSaveSnapshot = async () => {
     }
   } finally {
     saving.value = false
+  }
+}
+
+const handleCompareLatest = async () => {
+  if (!props.currentPath) return
+  comparingLatest.value = true
+  try {
+    const result = await invoke('compare_with_latest_snapshot_from_cache', {
+      path: props.currentPath,
+    })
+    diffResult.value = result || null
+    if (!result) {
+      message.info('当前目录还没有历史快照')
+    }
+  } catch (error) {
+    message.error('对比当前失败: ' + error)
+  } finally {
+    comparingLatest.value = false
   }
 }
 

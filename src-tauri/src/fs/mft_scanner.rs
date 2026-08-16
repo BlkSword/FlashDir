@@ -412,6 +412,13 @@ impl MftScanner {
                 let records_in_fragment = (fragment_size / record_size as u64) as usize;
 
                 for fragment_batch_start in (0..records_in_fragment).step_by(batch_records) {
+                    if crate::cancel::is_requested() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "scan cancelled",
+                        ));
+                    }
+
                     let records_in_batch = (records_in_fragment - fragment_batch_start).min(batch_records);
                     let read_size = records_in_batch * record_size;
 
