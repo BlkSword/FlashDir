@@ -107,11 +107,11 @@ defineEmits(['select', 'quick-access'])
   border-right: 1px solid var(--fd-border);
   overflow: hidden;
   transition: width 0.15s ease;
-  width: 220px;
+  width: 240px;
 }
 .fd-sidebar-collapsed { width: 0; }
 .fd-sidebar-inner {
-  width: 220px;
+  width: 240px;
   height: 100%;
   overflow-y: auto;
   padding: 8px 0;

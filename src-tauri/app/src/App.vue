@@ -568,14 +568,14 @@ watch(() => allItems.value.length, () => {
 <style scoped>
 .fd-app {
   display: grid;
-  grid-template-rows: 38px 1fr 24px;
-  grid-template-columns: 220px 1fr 300px;
+  grid-template-rows: 56px 1fr 28px;
+  grid-template-columns: 240px 1fr 360px;
   height: 100vh;
   background: var(--fd-bg-0);
   color: var(--fd-text-1);
 }
 .fd-app.fd-sidebar-collapsed {
-  grid-template-columns: 0px 1fr 300px;
+  grid-template-columns: 0px 1fr 360px;
 }
 .fd-main {
   grid-row: 2 / 3;

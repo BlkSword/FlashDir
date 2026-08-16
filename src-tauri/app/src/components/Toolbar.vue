@@ -1,5 +1,9 @@
 <template>
   <header class="fd-toolbar">
+    <div class="fd-brand" title="FlashDir">
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4h6l2 2h8a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V6a2 2 0 012-2z"/><path d="M2 10h20"/></svg>
+      <span class="fd-brand-text"><b>FlashDir</b><small>磁盘观测站</small></span>
+    </div>
     <div class="fd-toolbar-group">
       <button
         class="fd-icon-btn"
@@ -127,10 +131,36 @@ defineExpose({ focusGlobalSearch })
   z-index: 100;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 0 8px;
+  gap: 8px;
+  padding: 0 10px;
   background: var(--fd-bg-1);
   border-bottom: 1px solid var(--fd-border);
+}
+.fd-brand {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 132px;
+  color: var(--fd-accent);
+}
+.fd-brand > svg {
+  width: 22px;
+  height: 22px;
+}
+.fd-brand-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.1;
+}
+.fd-brand-text b {
+  font-size: 13px;
+  color: var(--fd-text-0);
+  letter-spacing: .3px;
+}
+.fd-brand-text small {
+  font-size: 9px;
+  color: var(--fd-text-2);
+  letter-spacing: 1px;
 }
 .fd-toolbar-group {
   display: flex;

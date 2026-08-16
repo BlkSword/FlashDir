@@ -53,7 +53,7 @@ import SnapshotCompare from './SnapshotCompare.vue'
 import DuplicateFinder from './DuplicateFinder.vue'
 
 const tabs = [
-  { key: 'stats', label: '统计' },
+  { key: 'stats', label: '总览' },
   { key: 'treemap', label: '热图' },
   { key: 'dev', label: '开发者' },
   { key: 'snapshots', label: '快照' },

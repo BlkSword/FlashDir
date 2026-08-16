@@ -1,29 +1,42 @@
 <template>
   <div class="fd-stats">
-    <div class="fd-stats-section">
-      <div class="fd-stats-title">概览</div>
-      <div class="fd-stat-row"><span class="fd-stat-label">总大小</span><span class="fd-stat-value">{{ formatSize(totalSize) }}</span></div>
-      <div class="fd-stat-row"><span class="fd-stat-label">文件数</span><span class="fd-stat-value">{{ fileCount }}</span></div>
-      <div class="fd-stat-row"><span class="fd-stat-label">目录数</span><span class="fd-stat-value">{{ dirCount }}</span></div>
-      <div class="fd-stat-row"><span class="fd-stat-label">扫描耗时</span><span class="fd-stat-value">{{ scanTime.toFixed(2) }}s</span></div>
-    </div>
-
-    <div class="fd-stats-section">
-      <div class="fd-stats-title">扩展名分布</div>
-      <div v-for="(ext, index) in extStats" :key="index" class="fd-ext-row">
-        <div class="fd-ext-head">
-          <span>{{ ext.name }}</span>
-          <span class="fd-ext-size">{{ ext.sizeFormatted }}</span>
+    <div class="fd-card">
+      <div class="fd-card-title">扫描概览</div>
+      <div class="fd-stat-grid">
+        <div class="fd-stat">
+          <b class="fd-stat-value">{{ formatSize(totalSize) }}</b>
+          <span>总占用</span>
         </div>
-        <div class="fd-ext-bar"><div class="fd-ext-fill" :style="{ width: ext.percent + '%', background: ext.color }"></div></div>
+        <div class="fd-stat">
+          <b class="fd-stat-value">{{ fileCount.toLocaleString() }}</b>
+          <span>文件</span>
+        </div>
+        <div class="fd-stat">
+          <b class="fd-stat-value">{{ dirCount.toLocaleString() }}</b>
+          <span>目录</span>
+        </div>
+        <div class="fd-stat">
+          <b class="fd-stat-value">{{ scanTime.toFixed(2) }}s</b>
+          <span>扫描耗时</span>
+        </div>
       </div>
     </div>
 
-    <div class="fd-stats-section">
-      <div class="fd-stats-title">Top 5 大文件</div>
-      <div v-for="(file, index) in topFiles" :key="index" class="fd-stat-row">
-        <span class="truncate" style="max-width: 140px" :title="file.name">{{ file.name }}</span>
-        <span class="fd-stat-value">{{ file.sizeFormatted }}</span>
+    <div class="fd-card">
+      <div class="fd-card-title">扩展名分布</div>
+      <div v-for="(ext, index) in extStats" :key="index" class="fd-ext-row">
+        <span class="fd-ext-label">{{ ext.name }}</span>
+        <div class="fd-ext-track"><div class="fd-ext-fill" :style="{ width: ext.percent + '%', background: ext.color }"></div></div>
+        <span class="fd-ext-size">{{ ext.sizeFormatted }}</span>
+      </div>
+    </div>
+
+    <div class="fd-card">
+      <div class="fd-card-title">Top 5 大文件</div>
+      <div v-for="(file, index) in topFiles" :key="index" class="fd-top-row">
+        <span class="fd-top-rank" :class="'r' + (index + 1)">{{ index + 1 }}</span>
+        <span class="truncate fd-top-name" :title="file.name">{{ file.name }}</span>
+        <span class="fd-top-size">{{ file.sizeFormatted }}</span>
       </div>
     </div>
   </div>
@@ -81,39 +94,107 @@ const getExt = (name) => {
 </script>
 
 <style scoped>
-.fd-stats { display: flex; flex-direction: column; gap: 14px; }
-.fd-stats-section { display: flex; flex-direction: column; gap: 4px; }
-.fd-stats-title {
+.fd-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.fd-card {
+  background: var(--fd-bg-2);
+  border: 1px solid var(--fd-border);
+  border-radius: 8px;
+  padding: 12px;
+}
+.fd-card-title {
   font-size: 11px;
   color: var(--fd-text-2);
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.5px;
-  margin-bottom: 2px;
+  letter-spacing: .5px;
+  margin-bottom: 10px;
 }
-.fd-stat-row {
+.fd-stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.fd-stat {
+  background: var(--fd-bg-1);
+  border: 1px solid var(--fd-border);
+  border-radius: 6px;
+  padding: 9px;
+}
+.fd-stat b {
+  display: block;
+  font-size: 15px;
+  font-family: Consolas, 'JetBrains Mono', monospace;
+  color: var(--fd-text-0);
+}
+.fd-stat span {
+  font-size: 10.5px;
+  color: var(--fd-text-2);
+}
+.fd-ext-row {
   display: flex;
-  justify-content: space-between;
-  padding: 3px 0;
-  border-bottom: 1px solid var(--fd-border);
-  font-size: 12px;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
 }
-.fd-stat-label { color: var(--fd-text-2); }
-.fd-stat-value { font-family: Consolas, 'JetBrains Mono', monospace; color: var(--fd-text-0); }
-.fd-ext-row { margin-bottom: 6px; }
-.fd-ext-head {
-  display: flex;
-  justify-content: space-between;
-  font-size: 12px;
-  margin-bottom: 3px;
+.fd-ext-label {
+  width: 56px;
+  font-family: Consolas, 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--fd-text-1);
 }
-.fd-ext-size { color: var(--fd-text-2); font-family: Consolas, 'JetBrains Mono', monospace; }
-.fd-ext-bar {
-  width: 100%;
-  height: 4px;
+.fd-ext-track {
+  flex: 1;
+  height: 5px;
   background: var(--fd-bg-3);
-  border-radius: 2px;
+  border-radius: 3px;
   overflow: hidden;
 }
-.fd-ext-fill { height: 100%; border-radius: 2px; }
+.fd-ext-fill {
+  height: 100%;
+  border-radius: 3px;
+}
+.fd-ext-size {
+  width: 58px;
+  text-align: right;
+  color: var(--fd-text-2);
+  font-family: Consolas, 'JetBrains Mono', monospace;
+  font-size: 10.5px;
+}
+.fd-top-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--fd-bg-1);
+  border-radius: 6px;
+  margin-bottom: 4px;
+}
+.fd-top-rank {
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  background: var(--fd-bg-3);
+  color: var(--fd-text-2);
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  font-family: Consolas, 'JetBrains Mono', monospace;
+}
+.fd-top-rank.r1 { background: var(--fd-selected); color: #fff; }
+.fd-top-rank.r2 { background: rgba(0,122,204,.35); color: #fff; }
+.fd-top-name {
+  flex: 1;
+  min-width: 0;
+  color: var(--fd-text-1);
+  font-size: 12px;
+}
+.fd-top-size {
+  font-family: Consolas, 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--fd-text-1);
+}
 </style>
