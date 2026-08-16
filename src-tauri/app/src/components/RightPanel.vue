@@ -23,6 +23,7 @@
         v-else-if="activeTab === 'treemap'"
         :items="items"
         :total-size="totalSize"
+        :current-path="currentPath"
       />
       <DevAnalyzer
         v-else-if="activeTab === 'dev'"

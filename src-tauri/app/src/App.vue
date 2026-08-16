@@ -117,6 +117,12 @@ import { homeDir, join } from '@tauri-apps/api/path'
 const { invoke, openDialog } = useTauri()
 const sortWorker = useSortWorker()
 
+// 后端扫描结果默认已按大小降序，直接复用可避免对数十万条目再做一次全量排序
+const sortItemsSmart = (items, column, direction) => {
+  if (column === 'size' && direction === 'desc') return items
+  return sortWorker.sortItemsSync(items, column, direction)
+}
+
 const scanPhase = ref({ phase: '', message: '' })
 let unlistenScanPhase = null
 let unlistenDirChanges = null
@@ -220,7 +226,7 @@ const handleScan = async (path, addToHistory = true) => {
 
     allItems.value = result.items || []
     backendTotalSize.value = result.totalSize || 0
-    presortedAllItems.value = sortWorker.sortItemsSync(result.items || [], sortConfig.value.column, sortConfig.value.direction)
+    presortedAllItems.value = sortItemsSmart(result.items || [], sortConfig.value.column, sortConfig.value.direction)
     lastSortKey.value = `${sortConfig.value.column}-${sortConfig.value.direction}`
 
     currentPath.value = path
@@ -242,14 +248,11 @@ const handleScan = async (path, addToHistory = true) => {
     const fullEndTime = performance.now()
     scanTime.value = parseFloat(((fullEndTime - fullStartTime) / 1000).toFixed(2))
 
-    try {
-      await invoke('global_search_add_scan_from_cache', { path: path.trim() })
-    } catch {
+    // 全局索引追加放到后台执行，不阻塞主界面展示扫描结果
+    invoke('global_search_add_scan_from_cache', { path: path.trim() }).catch(() => {
       // 缓存恰好被逐出时回退到旧的 JSON 传输，保证索引仍然能追加
-      try {
-        await invoke('global_search_add_scan', { path: path.trim(), items: result.items })
-      } catch {}
-    }
+      invoke('global_search_add_scan', { path: path.trim(), items: result.items }).catch(() => {})
+    })
 
     message.success(`扫描完成 (总计: ${scanTime.value}s，找到 ${allItems.value.length} 个项目)`)
   } catch (error) {
@@ -400,7 +403,7 @@ const handleSort = (column, direction) => {
   if (allItems.value.length > 0) {
     const newSortKey = `${column}-${newDirection}`
     if (newSortKey !== lastSortKey.value) {
-      presortedAllItems.value = sortWorker.sortItemsSync(allItems.value, column, newDirection)
+      presortedAllItems.value = sortItemsSmart(allItems.value, column, newDirection)
       lastSortKey.value = newSortKey
     }
   }

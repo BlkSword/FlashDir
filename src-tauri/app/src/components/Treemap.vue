@@ -52,7 +52,8 @@ import { formatSize } from '../utils/format.js'
 
 const props = defineProps({
   items: { type: Array, default: () => [] },
-  totalSize: { type: Number, default: 0 }
+  totalSize: { type: Number, default: 0 },
+  currentPath: { type: String, default: '' }
 })
 
 const emit = defineEmits(['drilldown'])
@@ -144,13 +145,33 @@ const topExtensions = computed(() => {
     .map(([name]) => ({ name, color: extColors[name] || extColorFallbacks[Math.abs(hashCode(name)) % extColorFallbacks.length] }))
 })
 
+// 获取扫描根目录的直接子项；热图只展示第一级大目录，避免文件过多时失效。
+const getRootItems = (items) => {
+  if (!props.currentPath || !items || items.length === 0) return items || []
+
+  const root = props.currentPath.replace(/\\/g, '/').replace(/^\/\/\?\/?/, '').replace(/\/+$/, '')
+  const prefix = root.endsWith('/') ? root : root + '/'
+  const lowerPrefix = prefix.toLowerCase()
+
+  const directChildren = items.filter(item => {
+    const path = (item.path || '').replace(/\\/g, '/')
+    if (!path.toLowerCase().startsWith(lowerPrefix)) return false
+    const rest = path.slice(prefix.length)
+    return rest.length > 0 && !rest.includes('/')
+  })
+
+  // 优先展示第一级目录；如果当前路径没有直接子目录，则退回展示全部条目
+  const dirs = directChildren.filter(i => i.isDir)
+  return dirs.length > 0 ? dirs : directChildren
+}
+
 // 当 items 变化时，重置到根
 watch(() => props.items, (newItems) => {
   if (newItems && newItems.length > 0) {
     navStack.value = []
     currentDir.value = ''
-    currentItems.value = newItems
-    currentTotalSize.value = props.totalSize
+    currentItems.value = getRootItems(newItems)
+    currentTotalSize.value = currentItems.value.reduce((s, i) => s + (i.size || 0), 0)
     nextTick(() => render())
   } else {
     currentItems.value = []
@@ -381,7 +402,7 @@ const handleClick = (e) => {
 
   currentDir.value = dirPath
   currentItems.value = dirItems
-  currentTotalSize.value = dirItems.reduce((s, i) => s + (i.isDir ? 0 : i.size), 0)
+  currentTotalSize.value = dirItems.reduce((s, i) => s + (i.size || 0), 0)
 
   nextTick(() => render())
 }

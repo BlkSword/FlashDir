@@ -3,7 +3,6 @@
 
 use flashdir::scan::{self, HistoryItem, HistoryItemSummary, ScanResult};
 use flashdir::perf::PerformanceMonitor;
-use flashdir::disk_cache::DiskCache;
 use crate::AppState;
 use chrono::Utc;
 use std::collections::VecDeque;

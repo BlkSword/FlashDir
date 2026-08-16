@@ -56,11 +56,20 @@ const fileCount = computed(() => props.items.filter(i => !i.isDir).length)
 const dirCount = computed(() => props.items.filter(i => i.isDir).length)
 
 const topFiles = computed(() => {
-  return props.items
-    .filter(i => !i.isDir)
-    .sort((a, b) => b.size - a.size)
-    .slice(0, 5)
-    .map(i => ({ ...i, sizeFormatted: formatSize(i.size) }))
+  // 单次遍历维护 Top 5，避免对数十万文件做全量排序
+  const top = []
+  for (const item of props.items) {
+    if (item.isDir) continue
+    const size = item.size || 0
+    if (top.length < 5) {
+      top.push(item)
+      top.sort((a, b) => (b.size || 0) - (a.size || 0))
+    } else if (size > (top[top.length - 1].size || 0)) {
+      top[4] = item
+      top.sort((a, b) => (b.size || 0) - (a.size || 0))
+    }
+  }
+  return top.map(i => ({ ...i, sizeFormatted: formatSize(i.size) }))
 })
 
 const extStats = computed(() => {
