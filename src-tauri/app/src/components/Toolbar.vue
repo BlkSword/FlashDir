@@ -59,6 +59,15 @@
       @open-dir="$emit('open-dir', $event)"
     />
 
+    <button
+      class="fd-icon-btn"
+      :class="{ 'fd-icon-active': watching }"
+      :title="watching ? '停止监听目录变更' : '监听目录变更'"
+      @click="$emit('toggle-watch')"
+    >
+      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+    </button>
+
     <button class="fd-icon-btn" title="诊断" @click="$emit('show-diagnostics')">
       <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
     </button>
@@ -83,6 +92,7 @@ const props = defineProps({
   canGoForward: { type: Boolean, default: false },
   canGoUp: { type: Boolean, default: false },
   loading: { type: Boolean, default: false },
+  watching: { type: Boolean, default: false },
 })
 
 // 路径输入框本地值：用户可自由编辑，父级路径变化（导航/历史/浏览）时同步
@@ -100,6 +110,7 @@ defineEmits([
   'cancel-scan',
   'browse',
   'navigate',
+  'toggle-watch',
   'show-history',
   'show-diagnostics',
   'open-dir',
@@ -159,6 +170,11 @@ defineExpose({ focusGlobalSearch })
   cursor: pointer;
 }
 .fd-icon-btn:hover:not(:disabled) { background: var(--fd-bg-3); }
+.fd-icon-btn.fd-icon-active {
+  color: #fff;
+  background: var(--fd-accent);
+  border-color: var(--fd-accent);
+}
 .fd-icon-btn:disabled { opacity: 0.5; cursor: default; }
 .fd-icon-btn svg { width: 14px; height: 14px; }
 .fd-path-bar {

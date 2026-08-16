@@ -7,10 +7,12 @@
       :can-go-forward="canGoForward"
       :can-go-up="canGoUp"
       :loading="loading"
+      :watching="watching"
       @scan="handleScan"
       @cancel-scan="handleCancelScan"
       @browse="handleBrowse"
       @navigate="handleNavigate"
+      @toggle-watch="handleToggleWatch"
       @show-history="historyVisible = true"
       @show-diagnostics="openDiagnostics"
       @open-dir="handleOpenDirFromSearch"
@@ -117,6 +119,7 @@ const sortWorker = useSortWorker()
 
 const scanPhase = ref({ phase: '', message: '' })
 let unlistenScanPhase = null
+let unlistenDirChanges = null
 
 const currentPath = ref('')
 const allItems = shallowRef([])
@@ -143,6 +146,7 @@ const searchKeyword = ref('')
 const historyVisible = ref(false)
 const diagnosticsVisible = ref(false)
 const diagnosticsText = ref('')
+const watching = ref(false)
 const toolbarRef = ref(null)
 const rightPanelTab = ref('stats')
 const sidebarCollapsed = ref(false)
@@ -254,6 +258,32 @@ const handleScan = async (path, addToHistory = true) => {
   } finally {
     loading.value = false
     scanPhase.value = { phase: '', message: '' }
+  }
+}
+
+const handleToggleWatch = async () => {
+  if (watching.value) {
+    try {
+      await invoke('stop_watch')
+      watching.value = false
+      message.info('已停止目录监听')
+    } catch (error) {
+      message.error('停止监听失败: ' + formatError(error))
+    }
+    return
+  }
+
+  if (!currentPath.value) {
+    message.warning('请先扫描一个目录')
+    return
+  }
+
+  try {
+    await invoke('start_watch', { path: currentPath.value })
+    watching.value = true
+    message.success('开始监听目录变更')
+  } catch (error) {
+    message.error('启动监听失败: ' + formatError(error))
   }
 }
 
@@ -497,6 +527,13 @@ onMounted(async () => {
     scanPhase.value = event.payload || { phase: '', message: '' }
   })
 
+  unlistenDirChanges = await listen('dir-changes', (event) => {
+    const payload = event.payload || {}
+    if (payload.changed > 0) {
+      message.info(`目录变更：+${payload.added} -${payload.removed} ~${payload.modified}`)
+    }
+  })
+
   try {
     isAdmin.value = await invoke('is_admin')
   } catch {
@@ -508,6 +545,10 @@ onUnmounted(() => {
   if (unlistenScanPhase) {
     unlistenScanPhase()
     unlistenScanPhase = null
+  }
+  if (unlistenDirChanges) {
+    unlistenDirChanges()
+    unlistenDirChanges = null
   }
   document.removeEventListener('keydown', onGlobalSearchKeydown)
 })
