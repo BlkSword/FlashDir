@@ -140,6 +140,9 @@ pub struct MftScanner {
     mft_start_offset: u64,
     mft_valid_size: u64,
     mft_record_size: u32,
+    /// $MFT 自身的 $DATA data runs；用于同时支持全量顺序读取和单条记录定位。
+    /// 为空时回退到连续读取（兼容极少数解析失败的场景）。
+    mft_data_runs: Vec<(u64, u64)>,
 }
 
 /// MFT 扫描的最终结果
@@ -242,13 +245,18 @@ impl MftScanner {
                 (vol_data.mft_start_lcn as u64) * (vol_data.bytes_per_cluster as u64);
             let mft_valid_size = vol_data.mft_valid_data_length as u64;
 
-            Ok(Self {
+            let mut scanner = Self {
                 volume_handle: handle,
                 bytes_per_cluster: vol_data.bytes_per_cluster as u64,
                 mft_start_offset,
                 mft_valid_size,
                 mft_record_size: vol_data.bytes_per_file_record_segment,
-            })
+                mft_data_runs: Vec::new(),
+            };
+            // 提前解析并缓存 $MFT data runs，供全量扫描和单条记录读取共用。
+            // 解析失败时保持空列表，后续回退到连续读取。
+            scanner.mft_data_runs = scanner.read_mft_data_runs().unwrap_or_default();
+            Ok(scanner)
         }
     }
 
@@ -382,8 +390,12 @@ impl MftScanner {
         let max_records = (self.mft_valid_size as usize) / record_size;
         let mut index: MftIndex = HashMap::with_capacity(max_records);
 
-        // 获取 $MFT 的 data runs（碎片位置）
-        let data_runs = self.read_mft_data_runs()?;
+        // 获取 $MFT 的 data runs（碎片位置）；优先使用 open 时缓存的 runs
+        let data_runs = if self.mft_data_runs.is_empty() {
+            self.read_mft_data_runs()?
+        } else {
+            self.mft_data_runs.clone()
+        };
 
         // 分配读取缓冲区：一次读 256 条记录（256KB）
         let batch_records = 256usize;
@@ -540,13 +552,40 @@ impl Drop for MftScanner {
 // ─── 单条 MFT 记录读取 & FRN 路径解析 ──────────────────────
 
 impl MftScanner {
+    /// 根据 MFT 记录号计算物理偏移。
+    ///
+    /// 优先使用缓存的 $MFT data runs 定位，避免 $MFT 碎片化时直接按连续偏移读取。
+    /// data runs 为空时回退到传统连续读取。
+    fn record_offset_for(&self, record_number: u64) -> Option<u64> {
+        if self.mft_data_runs.is_empty() {
+            return Some(self.mft_start_offset + record_number * self.mft_record_size as u64);
+        }
+
+        let record_size = self.mft_record_size as u64;
+        let mut records_before = 0u64;
+        for (start_lcn, cluster_count) in &self.mft_data_runs {
+            let fragment_records =
+                (cluster_count * self.bytes_per_cluster) / record_size;
+            if record_number < records_before + fragment_records {
+                let offset_in_fragment =
+                    (record_number - records_before) * record_size;
+                return Some((start_lcn * self.bytes_per_cluster) + offset_in_fragment);
+            }
+            records_before += fragment_records;
+        }
+        None
+    }
+
     /// 读取单条 MFT 记录（按 FRN 索引）
     /// FRN 的低 48 位是 MFT 记录号，直接用作 $MFT 中的偏移
     pub fn read_single_record(&self, frn: u64) -> io::Result<Option<MftRecordInfo>> {
         // FRN 结构: [48-bit record number][16-bit sequence number]
         let record_number = frn & 0x0000FFFFFFFFFFFF;
         let record_size = self.mft_record_size as usize;
-        let offset = self.mft_start_offset + record_number * record_size as u64;
+        let offset = match self.record_offset_for(record_number) {
+            Some(offset) => offset,
+            None => return Ok(None),
+        };
 
         let mut buffer = vec![0u8; record_size];
 

@@ -55,6 +55,11 @@ impl DiskCache {
 
         let conn = Connection::open(&cache_path)?;
 
+        // 多线程/多进程场景下降低锁冲突；WAL 提升读并发和崩溃安全性
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS scan_cache (
                 path TEXT PRIMARY KEY,
@@ -309,8 +314,8 @@ impl DiskCache {
         let guard = self.conn.lock();
         let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         conn.execute(
-            "DELETE FROM scan_cache WHERE path = ?1 OR path LIKE ?2",
-            params![path, format!("{}%", path)],
+            "DELETE FROM scan_cache WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
+            params![path, path_child_pattern(path)],
         )?;
         Ok(())
     }
@@ -561,8 +566,8 @@ impl DiskCache {
         let guard = self.conn.lock();
         let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         conn.execute(
-            "DELETE FROM global_index WHERE path LIKE ?1",
-            params![format!("{}%", prefix)],
+            "DELETE FROM global_index WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
+            params![prefix, path_child_pattern(prefix)],
         )?;
         Ok(())
     }
@@ -583,6 +588,24 @@ impl DiskCache {
             None
         }
     }
+}
+
+/// 构造“仅匹配自身与直接子路径”的 SQL LIKE 模式。
+/// 避免 `C:/foo` 误匹配 `C:/foobar`。
+fn path_child_pattern(path: &str) -> String {
+    let escaped = escape_like(path);
+    if path.ends_with('/') {
+        format!("{}%", escaped)
+    } else {
+        format!("{}/%", escaped)
+    }
+}
+
+/// 转义 SQL LIKE 模式中的通配符，避免路径中的 `%` / `_` 被当作通配符。
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// 快照元数据（不含完整文件列表）
@@ -609,4 +632,22 @@ pub struct CacheStats {
     pub oldest_entry_timestamp: Option<i64>,
     /// 磁盘缓存是否可用（false = 初始化失败，已降级为无缓存模式）
     pub enabled: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_path_child_pattern() {
+        assert_eq!(path_child_pattern("C:/Users"), "C:/Users/%");
+        assert_eq!(path_child_pattern("C:/Users/"), "C:/Users/%");
+        assert_eq!(path_child_pattern("C:/"), "C:/%");
+    }
+
+    #[test]
+    fn test_escape_like() {
+        assert_eq!(escape_like(r"C:\Users"), r"C:\\Users");
+        assert_eq!(escape_like("100%_done"), r"100\%\_done");
+    }
 }

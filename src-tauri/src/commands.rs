@@ -1,8 +1,8 @@
 // 命令处理器 - 优化版
-// 集成性能监控、磁盘缓存、二进制协议
+// 集成性能监控、磁盘缓存、自定义二进制扫描结果传输
 
 use flashdir::scan::{self, HistoryItem, HistoryItemSummary, ScanResult};
-use flashdir::perf::{PerformanceMonitor, ScanMetrics};
+use flashdir::perf::PerformanceMonitor;
 use flashdir::disk_cache::DiskCache;
 use crate::AppState;
 use chrono::Utc;
@@ -79,17 +79,23 @@ async fn save_history_to_file_async(history: &VecDeque<HistoryItem>) -> Result<(
     let json = serde_json::to_string(history)
         .map_err(|e| format!("序列化失败: {}", e))?;
 
-    let mut file = fs::File::create(&path)
+    // 原子写入：先写临时文件再 rename，避免进程中断导致 history.json 损坏
+    let tmp_path = path.with_extension("json.tmp");
+    let mut file = fs::File::create(&tmp_path)
         .await
-        .map_err(|e| format!("创建文件失败: {}", e))?;
+        .map_err(|e| format!("创建临时文件失败: {}", e))?;
 
     file.write_all(json.as_bytes())
         .await
-        .map_err(|e| format!("写入文件失败: {}", e))?;
+        .map_err(|e| format!("写入临时文件失败: {}", e))?;
 
     file.sync_all()
         .await
-        .map_err(|e| format!("同步文件失败: {}", e))?;
+        .map_err(|e| format!("同步临时文件失败: {}", e))?;
+
+    fs::rename(&tmp_path, &path)
+        .await
+        .map_err(|e| format!("替换历史文件失败: {}", e))?;
 
     Ok(())
 }
@@ -154,39 +160,11 @@ pub async fn scan_directory_binary(
     Ok(tauri::ipc::Response::new(scan::encode_scan_result(&result)))
 }
 
-/// 批量扫描
-#[command]
-pub async fn scan_directories_batch(
-    paths: Vec<String>,
-    force_refresh: bool,
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<Vec<ScanResult>, String> {
-    let mut results = Vec::with_capacity(paths.len());
-
-    for path in paths {
-        match scan_directory(path, force_refresh, app.clone(), state.clone()).await {
-            Ok(result) => results.push(result),
-            Err(e) => eprintln!("扫描失败: {}", e),
-        }
-    }
-    
-    Ok(results)
-}
-
 #[command]
 pub fn get_history_summary(state: State<'_, AppState>) -> Vec<HistoryItemSummary> {
     let history = state.history.lock();
     let summaries: Vec<HistoryItemSummary> = history.iter().map(|item| item.into()).collect();
     summaries.into_iter().rev().collect()
-}
-
-#[command]
-pub fn get_history(state: State<'_, AppState>) -> Vec<HistoryItem> {
-    let history = state.history.lock();
-    let mut result: Vec<_> = history.iter().cloned().collect();
-    result.reverse();
-    result
 }
 
 #[command]
@@ -199,53 +177,15 @@ pub async fn clear_history(state: State<'_, AppState>) -> Result<(), String> {
     save_history_to_file_async(&VecDeque::new()).await
 }
 
-/// 获取性能指标
-#[command]
-pub fn get_performance_metrics() -> Option<ScanMetrics> {
-    PerformanceMonitor::instance().get_current_metrics()
-}
-
-/// 获取性能历史
-#[command]
-pub fn get_performance_history() -> Vec<ScanMetrics> {
-    PerformanceMonitor::instance().get_history()
-}
-
-/// 清除性能历史
-#[command]
-pub fn clear_performance_history() {
-    PerformanceMonitor::instance().clear_history();
-}
-
-/// 获取性能摘要
-#[command]
-pub fn get_performance_summary() -> flashdir::perf::PerformanceSummary {
-    PerformanceMonitor::instance().get_summary()
-}
-
-/// 获取磁盘缓存统计
-#[command]
-pub fn get_disk_cache_stats() -> flashdir::disk_cache::CacheStats {
-    DiskCache::instance().get_stats()
-}
-
-/// 清除磁盘缓存
-#[command]
-pub fn clear_disk_cache() -> Result<(), String> {
-    DiskCache::instance()
-        .clear()
-        .map_err(|e| format!("清除缓存失败: {}", e))
-}
-
 /// 获取内存缓存统计
 #[command]
 pub fn get_memory_cache_stats() -> MemoryCacheStats {
-    // 返回内存缓存统计
+    let (entries, bytes) = flashdir::scan::memory_cache_stats();
     MemoryCacheStats {
         max_entries: 30,
         max_size_mb: 200,
-        current_entries: 0, // 需要实现获取逻辑
-        current_size_mb: 0.0,
+        current_entries: entries,
+        current_size_mb: bytes as f64 / 1024.0 / 1024.0,
     }
 }
 
@@ -257,36 +197,55 @@ pub struct MemoryCacheStats {
     pub current_size_mb: f64,
 }
 
-/// 获取系统信息
-#[command]
-pub fn get_system_info() -> SystemInfo {
-    use sysinfo::{System, RefreshKind, CpuRefreshKind};
-
-    let mut system = System::new_with_specifics(
-        RefreshKind::new().with_cpu(CpuRefreshKind::everything())
-    );
-    system.refresh_all();
-
-    let cpu_usage = system.global_cpu_info().cpu_usage();
-
-    SystemInfo {
-        cpu_count: num_cpus::get(),
-        cpu_usage,
-        memory_total_mb: system.total_memory() / 1024,
-        memory_used_mb: system.used_memory() / 1024,
-        os_name: System::name().unwrap_or_default(),
-        os_version: System::os_version().unwrap_or_default(),
-    }
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsInfo {
+    pub is_admin: bool,
+    pub data_dir: String,
+    pub memory_cache: MemoryCacheStats,
+    pub disk_cache: flashdir::disk_cache::CacheStats,
+    pub global_search_state: flashdir::global_search::IndexState,
+    pub usn_checkpoints: Vec<String>,
+    pub history_file_exists: bool,
+    pub history_count: usize,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SystemInfo {
-    pub cpu_count: usize,
-    pub cpu_usage: f32,
-    pub memory_total_mb: u64,
-    pub memory_used_mb: u64,
-    pub os_name: String,
-    pub os_version: String,
+/// 汇总当前运行时诊断信息，便于用户/开发者快速定位缓存、索引、权限和 USN 状态。
+#[command]
+pub fn get_diagnostics(state: State<'_, AppState>) -> DiagnosticsInfo {
+    let history_path = get_history_file_path().ok();
+    let data_dir = history_path
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+
+    let usn_checkpoints = if let Some(dir) = history_path.as_ref().and_then(|p| p.parent()) {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.starts_with("usn_checkpoint_") && name.ends_with(".json"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let history_count = state.history.lock().len();
+
+    DiagnosticsInfo {
+        is_admin: flashdir::fs::is_admin(),
+        data_dir,
+        memory_cache: get_memory_cache_stats(),
+        disk_cache: flashdir::disk_cache::DiskCache::instance().get_stats(),
+        global_search_state: flashdir::global_search::instance().state(),
+        usn_checkpoints,
+        history_file_exists: history_path.as_ref().map(|p| p.exists()).unwrap_or(false),
+        history_count,
+    }
 }
 
 /// 使用系统默认程序打开文件或目录
@@ -327,27 +286,6 @@ pub fn is_admin() -> bool {
     flashdir::fs::is_admin()
 }
 
-/// 检测 MFT 直接扫描是否可用（Windows 管理员权限）
-#[command]
-pub fn check_mft_available(path: String) -> bool {
-    flashdir::fs::check_mft_available(&path)
-}
-
-/// 获取当前扫描环境状态（管理员 + 指定路径 MFT 可用性）
-#[command]
-pub fn get_scan_status(path: String) -> ScanStatus {
-    ScanStatus {
-        is_admin: flashdir::fs::is_admin(),
-        mft_available: flashdir::fs::check_mft_available(&path),
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ScanStatus {
-    pub is_admin: bool,
-    pub mft_available: bool,
-}
-
 /// 以管理员权限重启应用
 #[command]
 pub fn restart_as_admin() -> bool {
@@ -362,6 +300,18 @@ pub fn analyze_dev_disk(path: String) -> Option<flashdir::dev_analyzer::DevAnaly
     let total_size: i64 = items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum();
     let total_items = items.len();
     Some(flashdir::dev_analyzer::analyze(&items, total_size, total_items))
+}
+
+/// 重复文件检测：从内存缓存读取当前扫描结果，按大小 + 内容哈希找出重复文件。
+#[command]
+pub fn find_duplicates(
+    path: String,
+    min_size: Option<i64>,
+) -> Result<flashdir::duplicate_finder::DuplicateResult, String> {
+    let items = flashdir::scan::get_cached_items(&path)
+        .ok_or_else(|| format!("内存缓存中不存在 {} 的扫描结果，请重新扫描", path))?;
+    let min_size = min_size.unwrap_or(1).max(0);
+    Ok(flashdir::duplicate_finder::find_duplicates(&items, min_size))
 }
 
 // ─── 快照管理 ────────────────────────────────────────────
@@ -385,6 +335,41 @@ pub fn save_snapshot(
         perf_metrics: None,
     };
 
+    let file_count = result.items.iter().filter(|i| !i.is_dir).count();
+    let dir_count = result.items.iter().filter(|i| i.is_dir).count();
+
+    flashdir::disk_cache::DiskCache::instance()
+        .insert_snapshot(&path, &result, file_count, dir_count)
+        .map_err(|e| format!("保存快照失败: {}", e))
+}
+
+/// 从内存缓存构造 ScanResult，避免快照/全局搜索等场景把百万级 items 经 JSON 跨 IPC 回传。
+fn cached_scan_result(path: &str) -> Result<flashdir::scan::ScanResult, String> {
+    let cached = flashdir::scan::get_cached_items(path)
+        .ok_or_else(|| format!("内存缓存中不存在 {} 的扫描结果，请重新扫描", path))?;
+    let items: Vec<flashdir::scan::Item> = cached.iter().cloned().collect();
+    let total_size: i64 = items
+        .iter()
+        .filter(|i| !i.is_dir)
+        .map(|i| i.size)
+        .sum();
+
+    Ok(flashdir::scan::ScanResult {
+        items,
+        total_size,
+        total_size_formatted: flashdir::scan::format_size(total_size),
+        scan_time: 0.0,
+        path: flashdir::scan::CompactString::from(path),
+        mft_available: false,
+        timing: None,
+        perf_metrics: None,
+    })
+}
+
+/// 保存当前扫描结果为快照（缓存优先版本，避免把全量 items 从前端传回后端）。
+#[command]
+pub fn save_snapshot_from_cache(path: String) -> Result<i64, String> {
+    let result = cached_scan_result(&path)?;
     let file_count = result.items.iter().filter(|i| !i.is_dir).count();
     let dir_count = result.items.iter().filter(|i| i.is_dir).count();
 
@@ -430,35 +415,6 @@ pub fn delete_snapshot(id: i64) -> Result<(), String> {
     flashdir::disk_cache::DiskCache::instance()
         .delete_snapshot(id)
         .map_err(|e| format!("删除快照失败: {}", e))
-}
-
-/// 比较最新快照与当前扫描结果（用于增量增长分析）
-#[command]
-pub fn compare_with_latest_snapshot(
-    path: String,
-    current_items: Vec<flashdir::scan::Item>,
-    _current_total_size: i64,
-) -> Result<Option<flashdir::diff_engine::SnapshotDiff>, String> {
-    let disk_cache = flashdir::disk_cache::DiskCache::instance();
-    let snapshots = disk_cache
-        .list_snapshots(&path)
-        .map_err(|e| format!("获取快照列表失败: {}", e))?;
-
-    if snapshots.is_empty() {
-        return Ok(None);
-    }
-
-    // 取最新的快照
-    let latest = &snapshots[0];
-    let old_result = disk_cache
-        .get_snapshot(latest.id)
-        .ok_or_else(|| format!("快照 {} 不存在", latest.id))?;
-
-    Ok(Some(flashdir::diff_engine::diff(
-        &old_result.items,
-        &current_items,
-        old_result.total_size,
-    )))
 }
 
 // ─── 全局文件搜索 ──────────────────────────────────────────
@@ -593,6 +549,16 @@ pub fn global_search_add_scan(
     path: String,
     items: Vec<flashdir::scan::Item>,
 ) -> Result<(), String> {
+    flashdir::global_search::instance().add_items(&path, &items);
+    Ok(())
+}
+
+/// 将主界面扫描结果追加到全局索引（缓存优先版本）。
+/// 扫描刚完成时后端内存缓存中一定存在该路径，因此无需把百万级 items 经 JSON 传回后端。
+#[command]
+pub fn global_search_add_scan_from_cache(path: String) -> Result<(), String> {
+    let items = flashdir::scan::get_cached_items(&path)
+        .ok_or_else(|| format!("内存缓存中不存在 {} 的扫描结果，请重新扫描", path))?;
     flashdir::global_search::instance().add_items(&path, &items);
     Ok(())
 }

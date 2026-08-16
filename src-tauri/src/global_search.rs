@@ -1,8 +1,8 @@
 // 全局文件搜索索引管理器
 //
-// 复用 fs::try_mft_scan 扫描所有 NTFS 卷，构建常驻内存索引，
+// 复用 fs::try_mft_scan / scan::scan_lite 扫描所有 NTFS 卷，构建常驻内存索引，
 // 支持按文件名毫秒级跨盘搜索（Everything 式）。索引构建一次后常驻，
-// 后续搜索仅为内存过滤；刷新走全量重建（复用 build_index）。
+// 后续搜索仅为内存过滤；刷新通过 global_search_ensure_index / refresh 全量重建。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde::Serialize;
-use tauri::Emitter;
 
 /// 索引中的一项（绝对路径）
 #[derive(Debug, Clone, Serialize)]
@@ -48,15 +47,6 @@ pub enum IndexState {
     Loading { drive: String, scanned: usize },
     Ready(ReadyData),
     Failed { reason: String },
-}
-
-/// 流式进度事件载荷
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ProgressPayload {
-    drive: String,
-    scanned: usize,
-    phase: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -227,17 +217,13 @@ impl GlobalIndex {
     }
 
     /// 按前缀移除索引（用于 USN 增量失败时重建某路径，或移除某盘）。
+    /// 只移除该路径本身及其子路径，避免 `C:/foo` 误伤 `C:/foobar`。
     fn remove_prefix_internal(&self, prefix: &str) {
-        let prefix_lower = prefix.to_lowercase();
         let paths_to_remove: Vec<String> = {
             let entries = self.entries.read();
             entries
                 .keys()
-                .filter(|k| {
-                    // 无分配前缀比较（原实现每个 key to_lowercase 一次堆分配）
-                    k.get(..prefix_lower.len())
-                        .is_some_and(|head| head.eq_ignore_ascii_case(&prefix_lower))
-                })
+                .filter(|k| is_same_or_child(prefix, k))
                 .cloned()
                 .collect()
         };
@@ -318,25 +304,6 @@ impl GlobalIndex {
         *self.state.write() = IndexState::Failed { reason };
     }
 
-    /// 批量追加 MFT 全卷扫描结果（轻量路径，跳过聚合/format/排序）
-    pub fn extend_entries(&self, drive: char, mft_files: &[crate::fs::MftFileInfo]) {
-        let batch: Vec<IndexEntry> = mft_files
-            .iter()
-            .map(|f| {
-                let name = f.name.clone();
-                IndexEntry {
-                    path: normalize_abs_path(drive, &f.path),
-                    name: name.clone(),
-                    name_lower: name.to_lowercase(),
-                    size: f.size as i64,
-                    is_dir: f.is_dir,
-                    mtime: 0,
-                }
-            })
-            .collect();
-        self.upsert_batch_internal(batch);
-    }
-
     /// 逐盘追加 scan_directory 结果（回退路径，已含完整字段）
     pub fn append_scan(&self, drive: char, items: &[crate::scan::Item]) {
         let batch: Vec<IndexEntry> = items
@@ -380,8 +347,7 @@ impl GlobalIndex {
         });
     }
 
-    /// 将主界面某次扫描的结果追加到全局索引（复用已验证可用的 scan_dir 结果，
-    /// 避免 MFT 在 build_index 的 spawn_blocking 上下文出现的 name 解析异常）。
+    /// 将主界面某次扫描的结果追加到全局索引（复用已验证可用的 scan_dir 结果）。
     pub fn add_items(&self, scan_path: &str, items: &[crate::scan::Item]) {
         let path_base = scan_path.trim_end_matches('/').trim_end_matches('\\');
         let path_base_lower = path_base.to_lowercase();
@@ -484,83 +450,6 @@ impl GlobalIndex {
     /// 返回前 n 个条目名称样本（诊断：搜索无结果时确认 name 字段是否正常）
     pub fn sample_names(&self, n: usize) -> Vec<String> {
         self.entries.read().values().take(n).map(|e| e.name.clone()).collect()
-    }
-
-    /// 构建全盘索引（同步、耗时较长，调用者须在 spawn_blocking 中运行）
-    pub fn build_index(&self, app: &tauri::AppHandle) {
-        *self.state.write() = IndexState::Loading { drive: String::new(), scanned: 0 };
-        self.clear_internal();
-
-        let drives = list_ntfs_drives();
-        if drives.is_empty() {
-            *self.state.write() = IndexState::Failed {
-                reason: "未检测到可扫描的 NTFS 卷（全局搜索需要管理员权限读取 MFT）".to_string(),
-            };
-            return;
-        }
-
-        let mut failed_drives = Vec::new();
-        let mut ok_drives = Vec::new();
-        let mut total_scanned = 0usize;
-
-        for drive in &drives {
-            *self.state.write() = IndexState::Loading {
-                drive: drive.to_string(),
-                scanned: total_scanned,
-            };
-            let _ = app.emit(
-                "global-search-progress",
-                ProgressPayload {
-                    drive: drive.to_string(),
-                    scanned: total_scanned,
-                    phase: "scanning".to_string(),
-                },
-            );
-
-            let root = format!("{}:\\", drive);
-            match crate::fs::try_mft_scan(&root) {
-                Some(result) => {
-                    total_scanned += result.files.len() + result.dir_count;
-                    self.extend_entries(*drive, &result.files);
-                    ok_drives.push(*drive);
-                }
-                None => {
-                    failed_drives.push(drive.to_string());
-                    let _ = app.emit(
-                        "global-search-progress",
-                        ProgressPayload {
-                            drive: drive.to_string(),
-                            scanned: total_scanned,
-                            phase: "skipped（需管理员或非 NTFS）".to_string(),
-                        },
-                    );
-                }
-            }
-        }
-
-        if ok_drives.is_empty() {
-            *self.state.write() = IndexState::Failed {
-                reason: "所有卷都无法扫描（需要管理员权限读取 MFT）".to_string(),
-            };
-            return;
-        }
-
-        {
-            let mut meta = self.meta.write();
-            meta.drive_count = ok_drives.len();
-            meta.failed_drives = failed_drives;
-            meta.all_drives = drives.iter().map(|c| c.to_string()).collect();
-        }
-        self.update_ready_state();
-
-        let _ = app.emit(
-            "global-search-progress",
-            ProgressPayload {
-                drive: String::new(),
-                scanned: total_scanned,
-                phase: "done".to_string(),
-            },
-        );
     }
 
     /// 支持 Everything 式过滤语法与相关性排序的搜索。
@@ -949,6 +838,20 @@ pub(crate) fn normalize_abs_path(drive: char, path: &str) -> String {
     }
 }
 
+/// 判断 `key` 是否为 `base` 本身或其子路径（路径分隔符已统一为 `/`）。
+fn is_same_or_child(base: &str, key: &str) -> bool {
+    if key.eq_ignore_ascii_case(base) {
+        return true;
+    }
+    let child_prefix = if base.ends_with('/') {
+        base.to_string()
+    } else {
+        format!("{}/", base)
+    };
+    key.get(..child_prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(&child_prefix))
+}
+
 static GLOBAL_INDEX: OnceLock<GlobalIndex> = OnceLock::new();
 
 pub fn instance() -> &'static GlobalIndex {
@@ -1215,5 +1118,16 @@ mod tests {
         idx.remove_by_path("C:/a.txt");
         let r2 = idx.search_with_filter("a", 10);
         assert_eq!(r2.len(), 1);
+    }
+
+    #[test]
+    fn test_is_same_or_child() {
+        assert!(is_same_or_child("C:/foo", "C:/foo"));
+        assert!(is_same_or_child("C:/foo", "C:/foo/bar"));
+        assert!(is_same_or_child("C:/foo", "c:/FOO/BAR"));
+        assert!(!is_same_or_child("C:/foo", "C:/foobar"));
+        assert!(!is_same_or_child("C:/foo", "C:/bar"));
+        assert!(is_same_or_child("C:/", "C:/Windows"));
+        assert!(is_same_or_child("C:/", "C:/"));
     }
 }

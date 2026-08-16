@@ -36,6 +36,11 @@
         :total-size="totalSize"
         :current-path="currentPath"
       />
+      <DuplicateFinder
+        v-else-if="activeTab === 'duplicates'"
+        :items="items"
+        :current-path="currentPath"
+      />
     </div>
   </aside>
 </template>
@@ -45,12 +50,14 @@ import StatsTab from './StatsTab.vue'
 import Treemap from './Treemap.vue'
 import DevAnalyzer from './DevAnalyzer.vue'
 import SnapshotCompare from './SnapshotCompare.vue'
+import DuplicateFinder from './DuplicateFinder.vue'
 
 const tabs = [
   { key: 'stats', label: '统计' },
   { key: 'treemap', label: '热图' },
   { key: 'dev', label: '开发者' },
   { key: 'snapshots', label: '快照' },
+  { key: 'duplicates', label: '重复' },
 ]
 
 defineProps({

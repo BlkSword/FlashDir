@@ -321,6 +321,16 @@ pub fn read_incremental_changes(
         ));
     }
 
+    // 验证卷序列号未变（防止盘符指向了另一块磁盘）
+    let vol_serial = get_volume_serial(drive_letter)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Cannot get volume serial"))?;
+    if vol_serial != checkpoint.volume_serial {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "Volume serial changed, full scan required",
+        ));
+    }
+
     // 读取增量变更
     let changes = journal.read_changes_since(
         checkpoint.max_usn,
@@ -329,9 +339,6 @@ pub fn read_incremental_changes(
     )?;
 
     // 创建新检查点
-    let vol_serial = get_volume_serial(drive_letter)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Cannot get volume serial"))?;
-
     let new_checkpoint = journal.create_checkpoint(vol_serial)?;
 
     Ok((changes, new_checkpoint))

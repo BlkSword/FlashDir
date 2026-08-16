@@ -242,13 +242,40 @@ impl ScanCache {
         let mut cache = self.cache.lock();
         let keys_to_remove: Vec<String> = cache
             .iter()
-            .filter(|(k, _)| k.starts_with(path))
+            .filter(|(k, _)| is_same_or_child(path, k))
             .map(|(k, _)| k.clone())
             .collect();
         for key in keys_to_remove {
             cache.pop(&key);
         }
     }
+
+    /// 返回当前内存缓存统计：(条目数, 估算字节数)
+    pub fn stats(&self) -> (usize, usize) {
+        let cache = self.cache.lock();
+        let entries = cache.len();
+        let bytes = cache.iter().map(|(_, e)| e.size).sum();
+        (entries, bytes)
+    }
+}
+
+/// 供 Tauri command 读取内存缓存统计。
+pub fn memory_cache_stats() -> (usize, usize) {
+    scan_cache().stats()
+}
+
+/// 判断 `key` 是否为 `base` 本身或其子路径（统一按正斜杠规范化后比较）。
+fn is_same_or_child(base: &str, key: &str) -> bool {
+    if key.eq_ignore_ascii_case(base) {
+        return true;
+    }
+    let child_prefix = if base.ends_with('/') {
+        base.to_string()
+    } else {
+        format!("{}/", base)
+    };
+    key.get(..child_prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(&child_prefix))
 }
 
 const SIZE_UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -667,8 +694,11 @@ pub fn scan_lite(path: &str) -> Option<Vec<Item>> {
         .files
         .into_iter()
         .filter(|f| {
-            let p = f.path.to_lowercase();
-            vol_prefix.is_empty() || p.starts_with(&vol_prefix)
+            // 无分配前缀比较，避免每条目 to_lowercase 造成堆分配
+            vol_prefix.is_empty()
+                || f.path
+                    .get(..vol_prefix.len())
+                    .is_some_and(|p| p.eq_ignore_ascii_case(&vol_prefix))
         })
         .map(|f| Item {
             path: mft_path_to_abs(drive, &f.path),
@@ -847,7 +877,7 @@ fn save_usn_checkpoint(path: &str) {
                 let _ = std::fs::create_dir_all(parent);
             }
             if let Ok(json) = serde_json::to_string(&checkpoint) {
-                let _ = std::fs::write(&checkpoint_path, json);
+                let _ = write_usn_checkpoint_atomic(&checkpoint_path, &json);
                 eprintln!(
                     "[USN] 检查点已保存: {}.{} (USN={})",
                     drive,
@@ -877,6 +907,18 @@ fn usn_checkpoint_path(drive: char) -> std::path::PathBuf {
 #[cfg(not(target_os = "windows"))]
 fn usn_checkpoint_path(_drive: char) -> std::path::PathBuf {
     std::path::PathBuf::new()
+}
+
+/// 原子写入 USN 检查点：先写临时文件再 rename，避免检查点文件损坏。
+#[cfg(target_os = "windows")]
+fn write_usn_checkpoint_atomic(path: &std::path::Path, json: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, json)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
 }
 
 /// 尝试使用 USN Journal 增量更新缓存
@@ -924,7 +966,7 @@ fn try_usn_incremental_update(
             ..new_checkpoint
         };
         if let Ok(json) = serde_json::to_string(&updated_cp) {
-            let _ = std::fs::write(&cp_path, json);
+            let _ = write_usn_checkpoint_atomic(&cp_path, &json);
         }
         // 返回磁盘缓存（无需修改，mtime 已通过 USN 验证为最新）
         if let Some(cached) = DiskCache::instance().get_stale(root_dir) {
@@ -1255,7 +1297,7 @@ fn try_usn_incremental_update(
         ..new_checkpoint
     };
     if let Ok(json) = serde_json::to_string(&updated_cp) {
-        let _ = std::fs::write(&cp_path, json);
+        let _ = write_usn_checkpoint_atomic(&cp_path, &json);
     }
 
     // ── 写回缓存 ──
@@ -1265,7 +1307,7 @@ fn try_usn_incremental_update(
         total_size_formatted: format_size(actual_total_size),
         scan_time: 0.0, // USN 增量更新视为即时
         path: CompactString::from(root_dir),
-        mft_available: false, // USN 增量更新路径不直接依赖 MFT 直读能力标志
+        mft_available: true, // USN 增量更新依赖 MFT/FRN 解析，数据来源实际为 MFT 直读链路
         timing: Some(TimingInfo {
             scan_phase: 0.0,
             compute_phase: 0.0,
@@ -1566,5 +1608,16 @@ mod tests {
         assert_eq!(mft_path_to_abs('C', "Users/xxx/file.txt"), CompactString::from("C:/Users/xxx/file.txt"));
         assert_eq!(mft_path_to_abs('C', "C:/Users/xxx/file.txt"), CompactString::from("C:/Users/xxx/file.txt"));
         assert_eq!(mft_path_to_abs('C', ""), CompactString::from("C:/"));
+    }
+
+    #[test]
+    fn test_is_same_or_child() {
+        assert!(is_same_or_child("C:/foo", "C:/foo"));
+        assert!(is_same_or_child("C:/foo", "C:/foo/bar"));
+        assert!(is_same_or_child("C:/foo", "c:/FOO/BAR"));
+        assert!(!is_same_or_child("C:/foo", "C:/foobar"));
+        assert!(!is_same_or_child("C:/foo", "C:/bar"));
+        assert!(is_same_or_child("C:/", "C:/Windows"));
+        assert!(is_same_or_child("C:/", "C:/"));
     }
 }

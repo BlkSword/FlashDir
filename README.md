@@ -57,13 +57,15 @@ USN Journal 增量刷新、开发者工具自动识别、多版本快照对比�
 2. 点击**扫描**
 3. 在右侧面板切换视图：
    - **📊 统计** — 文件类型分布 + Top 5 大文件
-   - **🗺️ 热图** — Squarified Treemap，点击钻入子目录
+   - **🗺️ 热图** — Canvas Treemap，点击钻入子目录
    - **🛠️ 开发者** — 自动识别 18 类开发工具目录的空间占用
    - **📸 快照** — 保存扫描历史、对比任意两次扫描的增长变化
+   - **🔁 重复** — 按大小 + 内容哈希识别重复文件，估算可回收空间
 4. 点击顶部工具栏的搜索框，或使用 **Ctrl+K** 打开**全局搜索**：
    - 跨盘搜索所有已索引文件
    - 支持 `*.pdf`、`report*`、`*2024`、`ext:zip`、`size:>1GB` 等语法
    - 首次使用需建立全盘索引（约几秒至几十秒）
+5. 点击工具栏右侧的**诊断**按钮，可查看缓存、索引、USN 检查点、权限与数据目录状态，便于排查问题。
 
 > 💡 以**管理员身份运行**可启用 MFT 直读模式，扫描速度通常提升 **30-60 倍**，同时全局搜索也能索引所有 NTFS 卷。
 
@@ -152,7 +154,7 @@ SIZE     TYPE       NAME
 | 纯文本 | `年报` | 按文件名或路径搜索 |
 | 否定 | `NOT .tmp` | 排除匹配项 |
 
-### 🗺️ Squarified Treemap 热图
+### 🗺️ Treemap 热图
 
 - 按大小比例布局的矩形色块图，一眼识别空间大户
 - 颜色编码：按文件扩展名自动配色（📄 zip=棕色 📄 mp4=红色 📄 js=黄色 📁 目录=灰色）
@@ -199,6 +201,14 @@ SIZE     TYPE       NAME
 
 ---
 
+### 🔁 重复文件检测
+
+- 基于“先按大小分组，再对候选文件做内容哈希”的两阶段算法
+- 避免对大文件全集做无意义哈希
+- 输出重复文件组、组内文件列表、单组可回收空间与总可回收空间
+- 使用 Rayon 并行计算文件哈希，支持设置最小文件大小过滤小文件
+- 双击文件可调用系统默认程序打开
+
 ## 性能实测
 
 测试环境：Windows 10 Pro，消费级 NVMe SSD。
@@ -224,7 +234,7 @@ FlashDir 采用**四级扫描流水线**，自动选择最优策略：
 
 ```
 scan_directory()
-  ├─ 第一级 —— 内存缓存（LRU + DashMap）
+  ├─ 第一级 —— 内存缓存（LRU）
   │     < 1ms 命中，最多 30 个目录 / 200MB
   │
   ├─ 第二级 —— 磁盘缓存（SQLite + bincode 序列化）
@@ -292,8 +302,8 @@ FlashDir/
 │   │       │   ├── Toolbar.vue       # 路径输入 + 全局搜索入口
 │   │       │   ├── GlobalSearchDropdown.vue # Everything 式跨盘全局搜索
 │   │       │   ├── FileList.vue      # 可排序虚拟列表
-│   │       │   ├── Charts.vue        # 文件类型分布图表
-│   │       │   ├── Treemap.vue       # Squarified Treemap 热图
+│   │       │   ├── StatsTab.vue       # 文件类型分布图表
+│   │       │   ├── Treemap.vue       # Canvas Treemap 热图
 │   │       │   ├── DevAnalyzer.vue   # 开发者工具目录分析
 │   │       │   ├── SnapshotCompare.vue # 快照对比与增长追踪
 │   │       │   ├── Sidebar.vue       # 目录树导航
@@ -303,10 +313,14 @@ FlashDir/
 │   │       │   └── HistoryList.vue   # 扫描历史
 │   │       ├── composables/
 │   │       │   ├── useTauri.js       # Tauri IPC 封装
-│   │       │   └── useSortWorker.js  # 列表排序/过滤工具
+│   │       │   ├── useSortWorker.js  # 列表排序/过滤工具
+│   │       │   └── useGlobalSearch.js# 全局搜索状态单源
 │   │       ├── utils/
 │   │       │   ├── format.js         # 格式化工具
-│   │       │   └── smartFilter.js    # Everything 式智能过滤
+│   │       │   ├── smartFilter.js    # Everything 式智能过滤
+│   │       │   └── scanBinary.js     # 自定义二进制扫描结果解码
+│   │       ├── main.js               # Vue 入口
+│   │       └── style.css             # 全局样式
 │   │
 │   ├── src/                          # Rust 后端（GUI + CLI 共享库）
 │   │   ├── lib.rs                    # 库入口
@@ -317,14 +331,13 @@ FlashDir/
 │   │   ├── disk_cache.rs             # SQLite 缓存（含多版本快照表）
 │   │   ├── dev_analyzer.rs           # 开发者目录识别引擎
 │   │   ├── diff_engine.rs            # 快照差异引擎
-│   │   ├── binary_protocol.rs        # bincode 二进制序列化
+│   │   ├── duplicate_finder.rs       # 重复文件检测
 │   │   ├── perf/mod.rs               # 性能监控
 │   │   ├── fs/
 │   │   │   ├── mod.rs                # 平台抽象层
 │   │   │   ├── mft_scanner.rs        # NTFS $MFT 读取 + FRN 路径解析
 │   │   │   ├── usn_journal.rs        # USN Journal 增量读取
 │   │   │   ├── windows_walker.rs     # FindFirstFileExW 零额外 syscall
-│   │   │   ├── iocp_scanner.rs       # IOCP 异步 I/O 扫描器
 │   │   │   └── fallback_walker.rs    # 非 Windows 平台回退
 │   │   └── bin/
 │   │       └── cli.rs                # CLI 终端工具
@@ -340,10 +353,10 @@ FlashDir/
 |------|------|
 | 核心引擎 | Rust 2021 · Tokio 异步 · Rayon 并行 |
 | 桌面 GUI | Tauri 2.0 · Vue 3 · Vite · Ant Design Vue · Canvas API |
-| 文件系统 | NTFS $MFT 直读 · USN Journal 增量 · FRN 路径解析 · IOCP 异步 I/O |
-| 缓存 | DashMap + LRU（内存）· SQLite + bincode（磁盘 + 快照多版本） |
+| 文件系统 | NTFS $MFT 直读 · USN Journal 增量 · FRN 路径解析 · FindFirstFileExW 快速遍历 |
+| 缓存 | LRU（内存）· SQLite + bincode（磁盘 + 快照多版本） |
 | 分析引擎 | KnownPattern 分类器（18 类）· HashMap O(n) 差异引擎 |
-| 可视化 | Squarified Treemap (Canvas) · 统计面板 |
+| 可视化 | Canvas Treemap · 统计面板 |
 | 过滤搜索 | Everything-style 语法解析 · 本地 `ext:`/`size:`/`type:`/`dir:` + 全局 `*.pdf`/`prefix*`/`*suffix`/`NOT` |
 | 内存优化 | mimalloc 分配器 · SmartString 栈存储 · Arc 共享 |
 

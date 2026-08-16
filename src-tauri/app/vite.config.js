@@ -138,7 +138,6 @@ export default defineConfig(({ mode }) => {
         'vue',
         'ant-design-vue',
         '@ant-design/icons-vue',
-        'chart.js',
         '@tauri-apps/api'
       ],
       // 排除某些依赖的预构建

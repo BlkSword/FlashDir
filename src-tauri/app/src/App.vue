@@ -11,6 +11,7 @@
       @browse="handleBrowse"
       @navigate="handleNavigate"
       @show-history="historyVisible = true"
+      @show-diagnostics="openDiagnostics"
       @open-dir="handleOpenDirFromSearch"
       @toggle-sidebar="sidebarCollapsed = !sidebarCollapsed"
     />
@@ -79,6 +80,16 @@
         @clear="handleClearHistory"
       />
     </a-modal>
+
+    <a-modal
+      :open="diagnosticsVisible"
+      title="运行诊断"
+      width="760px"
+      :footer="null"
+      @cancel="diagnosticsVisible = false"
+    >
+      <pre class="diagnostics-pre">{{ diagnosticsText || '正在获取诊断信息…' }}</pre>
+    </a-modal>
   </div>
 </template>
 
@@ -129,6 +140,8 @@ const sortConfig = ref({
 
 const searchKeyword = ref('')
 const historyVisible = ref(false)
+const diagnosticsVisible = ref(false)
+const diagnosticsText = ref('')
 const toolbarRef = ref(null)
 const rightPanelTab = ref('stats')
 const sidebarCollapsed = ref(false)
@@ -225,8 +238,13 @@ const handleScan = async (path, addToHistory = true) => {
     scanTime.value = parseFloat(((fullEndTime - fullStartTime) / 1000).toFixed(2))
 
     try {
-      await invoke('global_search_add_scan', { path: path.trim(), items: result.items })
-    } catch {}
+      await invoke('global_search_add_scan_from_cache', { path: path.trim() })
+    } catch {
+      // 缓存恰好被逐出时回退到旧的 JSON 传输，保证索引仍然能追加
+      try {
+        await invoke('global_search_add_scan', { path: path.trim(), items: result.items })
+      } catch {}
+    }
 
     message.success(`扫描完成 (总计: ${scanTime.value}s，找到 ${allItems.value.length} 个项目)`)
   } catch (error) {
@@ -443,6 +461,17 @@ const loadHistory = async () => {
   }
 }
 
+const openDiagnostics = async () => {
+  diagnosticsVisible.value = true
+  diagnosticsText.value = ''
+  try {
+    const data = await invoke('get_diagnostics')
+    diagnosticsText.value = JSON.stringify(data, null, 2)
+  } catch (error) {
+    diagnosticsText.value = '获取诊断信息失败: ' + formatError(error)
+  }
+}
+
 const onGlobalSearchKeydown = (e) => {
   if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
     e.preventDefault()
@@ -505,5 +534,18 @@ watch(() => allItems.value.length, () => {
   background: var(--fd-bg-0);
   min-width: 0;
   overflow: hidden;
+}
+.diagnostics-pre {
+  max-height: 60vh;
+  overflow: auto;
+  background: var(--fd-bg-0);
+  color: var(--fd-text-0);
+  border: 1px solid var(--fd-border);
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 12px;
+  font-family: Consolas, 'JetBrains Mono', monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 </style>

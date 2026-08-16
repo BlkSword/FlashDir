@@ -159,7 +159,7 @@ watch(() => props.items, (newItems) => {
   }
 }, { immediate: true })
 
-// ─── Squarified Treemap 算法 ──────────────────────────────
+// ─── Treemap 布局算法（简单切片）────────────────────────────
 
 // 性能限制：超过此阈值的 items 只展示 Top N，避免 squarify O(n²) 卡死
 const MAX_TREEMAP_ITEMS = 2000

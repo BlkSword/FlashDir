@@ -255,16 +255,24 @@ const handleSaveSnapshot = async () => {
   }
   saving.value = true
   try {
-    await invoke('save_snapshot', {
-      path: props.currentPath,
-      items: props.items,
-      totalSize: props.totalSize,
-      totalSizeFormatted: formatSize(props.totalSize)
-    })
+    // 优先从后端内存缓存保存，避免把百万级 items 经 JSON 回传
+    await invoke('save_snapshot_from_cache', { path: props.currentPath })
     message.success('快照已保存')
     await loadSnapshots()
   } catch (error) {
-    message.error('保存快照失败: ' + error)
+    // 缓存被逐出时回退到旧接口，保证功能可用
+    try {
+      await invoke('save_snapshot', {
+        path: props.currentPath,
+        items: props.items,
+        totalSize: props.totalSize,
+        totalSizeFormatted: formatSize(props.totalSize)
+      })
+      message.success('快照已保存')
+      await loadSnapshots()
+    } catch (fallbackError) {
+      message.error('保存快照失败: ' + (fallbackError || error))
+    }
   } finally {
     saving.value = false
   }
