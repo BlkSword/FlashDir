@@ -1,6 +1,6 @@
 [package]
 name = "flashdir"
-version = "3.4.1"
+version = "3.4.2"
 edition = "2021"
 description = "FlashDir - Disk observability platform for Windows"
 

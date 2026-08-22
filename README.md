@@ -14,7 +14,7 @@ USN Journal 增量刷新让重复扫描接近秒级；内置开发者目录分�
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%2B-orange.svg)](https://www.rust-lang.org)
 [![Tauri](https://img.shields.io/badge/tauri-2.0-blue.svg)](https://tauri.app)
-[![Version](https://img.shields.io/badge/version-3.4.1-green.svg)](src-tauri/Cargo.toml)
+[![Version](https://img.shields.io/badge/version-3.4.2-green.svg)](src-tauri/Cargo.toml)
 
 </div>
 

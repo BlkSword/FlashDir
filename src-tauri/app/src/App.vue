@@ -113,7 +113,7 @@
           <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" width="48" height="48"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6" d="M4 4h6l2 2h8a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V6a2 2 0 012-2z"/><path d="M2 10h20"/></svg>
         </div>
         <div class="about-title">FlashDir</div>
-        <div class="about-subtitle">磁盘可观测性平台 · v3.4.1</div>
+        <div class="about-subtitle">磁盘可观测性平台 · v3.4.2</div>
         <p class="about-desc">
           FlashDir 是一款面向 Windows 的磁盘空间分析与可观测性工具：MFT 直读扫描、
           USN 增量刷新、开发者目录分析、快照对比、重复文件检测与跨盘全局文件搜索。
