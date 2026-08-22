@@ -588,8 +588,20 @@ pub async fn scan_directory(
             return Ok(derived);
         }
 
-        // 2. 检查磁盘缓存
+        // 1.8 从磁盘上层缓存推导子目录结果（条目级 SQL 前缀查询，无需反序列化整个父目录）
         let disk_cache = DiskCache::instance();
+        if let Some(derived) = disk_cache.get_derived(&root_dir, mtime_timestamp) {
+            emit_scan_phase(&app_handle, "cache-hit-disk-derived", "磁盘上层缓存推导", None);
+            let cache_read_time = cache_check_start.elapsed().as_millis() as u64;
+            perf_monitor.record_cache_hit(cache_read_time);
+
+            scan_cache().insert(root_dir.clone(), derived.clone());
+
+            perf_monitor.end_scan();
+            return Ok(derived);
+        }
+
+        // 2. 检查磁盘缓存
         if let Some(cached_result) = disk_cache.get(&root_dir, mtime_timestamp) {
             let can_upgrade_to_mft = !cached_result.mft_available
                 && cfg!(target_os = "windows")
