@@ -786,6 +786,71 @@ fn mft_path_to_abs(drive: char, vol_relative_path: &str) -> CompactString {
     }
 }
 
+/// 高效聚合目录大小。
+///
+/// 旧实现为每个文件沿路径向上遍历所有祖先目录，复杂度 O(文件数 × 平均深度)。
+/// 新实现：
+/// 1. 每个文件只累加到直接父目录；
+/// 2. 再把每个目录的累计值按“深度从深到浅”传播到其父目录。
+/// 复杂度约为 O(文件数 + 目录数)，避免深路径导致聚合阶段卡顿。
+fn aggregate_directory_sizes(items: &mut Vec<Item>) -> i64 {
+    let n = items.len();
+    let dir_index: HashMap<&str, usize> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, it)| it.is_dir)
+        .map(|(i, it)| (it.path.as_str(), i))
+        .collect();
+
+    let mut dir_sizes = vec![0i64; n];
+    let mut dir_parent = vec![None; n];
+    let mut dir_indices = Vec::with_capacity(dir_index.len());
+
+    for (i, item) in items.iter().enumerate() {
+        if item.is_dir {
+            dir_indices.push(i);
+            if let Some(slash) = item.path.rfind('/') {
+                if let Some(&pidx) = dir_index.get(&item.path[..slash]) {
+                    dir_parent[i] = Some(pidx);
+                }
+            }
+        } else if item.size > 0 {
+            // 只累加到直接父目录，后续通过目录传播完成祖先聚合
+            if let Some(slash) = item.path.rfind('/') {
+                if let Some(&pidx) = dir_index.get(&item.path[..slash]) {
+                    dir_sizes[pidx] += item.size;
+                }
+            }
+        }
+    }
+
+    // 按目录深度从深到浅传播，确保子目录先累加完成再传给父目录
+    dir_indices.sort_unstable_by_key(|&i| std::cmp::Reverse(items[i].path.matches('/').count()));
+
+    for &i in &dir_indices {
+        if let Some(p) = dir_parent[i] {
+            dir_sizes[p] += dir_sizes[i];
+        }
+    }
+
+    let total_size: i64 = items
+        .iter()
+        .filter(|i| !i.is_dir)
+        .map(|i| i.size)
+        .sum();
+
+    // 此时不再需要借用 items 的 dir_index，可以安全地按下标回写
+    for &i in &dir_indices {
+        items[i].size = dir_sizes[i];
+    }
+
+    for item in items.iter_mut() {
+        item.size_formatted = format_size(item.size);
+    }
+
+    total_size
+}
+
 /// 轻量扫描：只做 MFT 读取 + 文件名提取（不聚合目录大小、不排序、不格式化）。
 /// 供全局搜索索引构建使用。与 try_mft_scan_path 使用相同的 canonicalize 预处理，
 /// 但跳过聚合/format/sort，失败返回 None，调用者应回退到完整 scan_directory。
@@ -880,46 +945,8 @@ fn try_mft_scan_path(
     perf_monitor.start_compute_phase();
     let compute_start = std::time::Instant::now();
 
-    use std::collections::HashMap;
-
-    // 目录大小聚合：path → 下标索引 + 按下标累加，避免每层祖先都分配 CompactString
-    let dir_index: HashMap<&str, usize> = items
-        .iter()
-        .enumerate()
-        .filter(|(_, it)| it.is_dir)
-        .map(|(i, it)| (it.path.as_str(), i))
-        .collect();
-
-    let mut dir_sizes: Vec<i64> = vec![0; items.len()];
-
-    for item in items.iter() {
-        if item.is_dir || item.size <= 0 {
-            continue;
-        }
-        let file_path = item.path.as_str();
-        let mut pos = 0;
-        while let Some(slash_pos) = file_path[pos..].find('/') {
-            let abs_pos = pos + slash_pos;
-            let parent = &file_path[..abs_pos];
-            if let Some(&idx) = dir_index.get(parent) {
-                dir_sizes[idx] += item.size;
-            }
-            pos = abs_pos + 1;
-        }
-    }
-
-    // 释放对 items 的借用，以便下方 iter_mut 可变借用
-    drop(dir_index);
-
+    let actual_total_size = aggregate_directory_sizes(&mut items);
     let compute_phase = compute_start.elapsed();
-
-    // 更新目录条目的 size 和 size_formatted
-    for (i, item) in items.iter_mut().enumerate() {
-        if item.is_dir {
-            item.size = dir_sizes[i];
-        }
-        item.size_formatted = format_size(item.size);
-    }
 
     // 按大小降序排序
     items.sort_unstable_by(|a, b| b.size.cmp(&a.size));
@@ -927,12 +954,6 @@ fn try_mft_scan_path(
     let format_phase = compute_start.elapsed(); // approximate
     let total = total_start.elapsed();
     perf_monitor.end_compute_phase();
-
-    let actual_total_size: i64 = items
-        .iter()
-        .filter(|i| !i.is_dir)
-        .map(|i| i.size)
-        .sum();
 
     let throughput_mbps = if scan_phase.as_secs_f64() > 0.0 {
         (actual_total_size as f64 / 1024.0 / 1024.0) / scan_phase.as_secs_f64()
@@ -1348,46 +1369,10 @@ fn try_usn_incremental_update(
     // 文件大小可能已更新，需要重新聚合计入目录
     let mut new_items: Vec<Item> = items_map.into_values().collect();
 
-    // 重新计算目录大小：为每个目录累计其子文件的字节数
-    {
-        use std::collections::HashMap as StdHashMap;
-
-        let mut dir_sizes: StdHashMap<CompactString, i64> = StdHashMap::new();
-
-        for item in &new_items {
-            if !item.is_dir && item.size > 0 {
-                let file_path = item.path.as_str();
-                // 沿路径向上，累加到每个祖先目录
-                let mut pos = 0;
-                while let Some(slash_pos) = file_path[pos..].find('/') {
-                    let abs_pos = pos + slash_pos;
-                    let parent = &file_path[..abs_pos];
-                    *dir_sizes
-                        .entry(CompactString::from(parent))
-                        .or_insert(0) += item.size;
-                    pos = abs_pos + 1;
-                }
-                // 也计入根
-                *dir_sizes.entry(CompactString::new()).or_insert(0) += item.size;
-            }
-        }
-
-        for item in &mut new_items {
-            if item.is_dir {
-                item.size = dir_sizes.get(&item.path).copied().unwrap_or(0);
-                item.size_formatted = format_size(item.size);
-            }
-        }
-    }
+    let actual_total_size = aggregate_directory_sizes(&mut new_items);
 
     // 按大小降序排序
     new_items.sort_unstable_by(|a, b| b.size.cmp(&a.size));
-
-    let actual_total_size: i64 = new_items
-        .iter()
-        .filter(|i| !i.is_dir)
-        .map(|i| i.size)
-        .sum();
 
     let new_file_count = new_items.iter().filter(|i| !i.is_dir).count();
     let new_dir_count = new_items.iter().filter(|i| i.is_dir).count();
