@@ -18,10 +18,30 @@ const state = reactive({
 })
 
 let listenStarted = false
+let pollTimer = null
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
+function startPolling() {
+  if (pollTimer) return
+  pollTimer = setInterval(() => {
+    fetchStatus()
+  }, 1000)
+}
 
 async function fetchStatus() {
   try {
     state.index = await invoke('global_search_status')
+    if (state.index?.kind === 'loading') {
+      startPolling()
+    } else {
+      stopPolling()
+    }
   } catch (e) {
     console.error('获取全局索引状态失败:', e)
   }
@@ -33,14 +53,17 @@ function ensureListener() {
   listen('global-search-progress', (event) => {
     state.progress = event.payload
     if (event.payload?.phase === 'done') {
+      stopPolling()
       fetchStatus()
     } else if (event.payload?.phase === 'loading-persisted') {
       state.index = { kind: 'loading', data: { drive: '索引缓存', scanned: 0 } }
+      startPolling()
     } else {
       state.index = {
         kind: 'loading',
         data: { drive: event.payload?.drive || '', scanned: event.payload?.scanned || 0 }
       }
+      startPolling()
     }
   })
 }
