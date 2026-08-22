@@ -195,6 +195,76 @@ impl ScanCache {
         cache.get(path).cloned()
     }
 
+    /// 从已缓存的上层目录结果推导子目录扫描结果。
+    ///
+    /// 上层目录扫描已经包含全量绝对路径，因此子目录只需做一次内存过滤，无需再次访问磁盘。
+    /// 例如扫描过 `C:/Users` 后，扫描 `C:/Users/wfshenm` 可以直接从缓存中切出。
+    pub fn get_derived(&self, child_path: &str) -> Option<ScanResult> {
+        let mut cache = self.cache.lock();
+
+        // 找到能覆盖 child_path 的最深祖先缓存
+        let mut best_key: Option<String> = None;
+        for key in cache.iter().map(|(k, _)| k) {
+            if key.len() < child_path.len() && is_same_or_child(key, child_path) {
+                if best_key.as_deref().map_or(true, |k| key.len() > k.len()) {
+                    best_key = Some(key.clone());
+                }
+            }
+        }
+
+        let parent = cache.get(best_key.as_ref()?)?;
+        let parent_items = parent.result.items.as_ref();
+
+        // 子目录前缀：C:/Users/wfshenm -> C:/Users/wfshenm/
+        let child_prefix = {
+            let trimmed = child_path.trim_end_matches('/');
+            if trimmed.is_empty() {
+                "/".to_string()
+            } else {
+                format!("{}/", trimmed)
+            }
+        };
+
+        // 子目录本身在父结果中作为一个目录条目存在；没有它说明缓存无法推导
+        let child_dir_exists = parent_items.iter().any(|i| i.is_dir && i.path == child_path);
+        if !child_dir_exists {
+            return None;
+        }
+
+        let items: Vec<Item> = parent_items
+            .iter()
+            .filter(|i| i.path.starts_with(&child_prefix))
+            .cloned()
+            .collect();
+
+        let total_size: i64 = items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum();
+        let file_count = items.iter().filter(|i| !i.is_dir).count();
+        let dir_count = items.len() - file_count;
+
+        Some(ScanResult {
+            items,
+            total_size,
+            total_size_formatted: format_size(total_size),
+            scan_time: 0.0,
+            path: CompactString::from(child_path),
+            mft_available: parent.result.mft_available,
+            timing: None,
+            perf_metrics: Some(ScanPerfMetrics {
+                io_phase_ms: 0,
+                compute_phase_ms: 0,
+                serialize_phase_ms: 0,
+                cache_read_time_ms: 0,
+                files_scanned: file_count,
+                dirs_scanned: dir_count,
+                io_throughput_mbps: 0.0,
+                memory_peak_mb: 0.0,
+                threads_used: 0,
+                cache_hit: true,
+                cache_source: Some("memory-derived".to_string()),
+            }),
+        })
+    }
+
     pub fn insert(&self, path: String, result: ScanResult) {
         let arc_result = ArcScanResult {
             items: Arc::new(result.items),
@@ -503,6 +573,19 @@ pub async fn scan_directory(
                     root_dir
                 );
             }
+        }
+
+        // 1.5 从上层目录缓存推导子目录结果（应毫秒级返回）
+        if let Some(derived) = scan_cache().get_derived(&root_dir) {
+            emit_scan_phase(&app_handle, "cache-hit-derived", "从上层缓存推导", None);
+            let cache_read_time = cache_check_start.elapsed().as_millis() as u64;
+            perf_monitor.record_cache_hit(cache_read_time);
+
+            // 把推导结果写入内存缓存，后续再次扫描该子目录可直接命中
+            scan_cache().insert(root_dir.clone(), derived.clone());
+
+            perf_monitor.end_scan();
+            return Ok(derived);
         }
 
         // 2. 检查磁盘缓存
