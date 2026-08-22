@@ -90,9 +90,8 @@ impl GlobalIndex {
         match crate::disk_cache::DiskCache::instance().load_global_index() {
             Ok(entries) if !entries.is_empty() => {
                 eprintln!("[GlobalIndex] 从磁盘恢复 {} 条索引", entries.len());
-                for entry in entries {
-                    self.upsert_internal(entry);
-                }
+                // 一次性批量写入，避免每条一次写锁 + clone
+                self.upsert_batch_internal(entries);
                 self.update_ready_state();
             }
             _ => {
@@ -302,6 +301,31 @@ impl GlobalIndex {
     /// 标记索引构建失败（例如启动时无管理员权限读取 MFT）
     pub fn set_failed(&self, reason: String) {
         *self.state.write() = IndexState::Failed { reason };
+    }
+
+    /// 直接追加 MFT 全卷扫描结果，避免先转成 `Item` 再转成 `IndexEntry` 的中间分配。
+    pub fn append_mft_files(&self, drive: char, mft_files: &[crate::fs::MftFileInfo]) {
+        let batch: Vec<IndexEntry> = mft_files
+            .iter()
+            .map(|f| {
+                let name = f.name.clone();
+                IndexEntry {
+                    path: normalize_abs_path(drive, &f.path),
+                    name: name.clone(),
+                    name_lower: name.to_lowercase(),
+                    size: f.size as i64,
+                    is_dir: f.is_dir,
+                    mtime: f.mtime,
+                }
+            })
+            .collect();
+        self.upsert_batch_internal(batch);
+
+        let total = self.entries.read().len();
+        *self.state.write() = IndexState::Loading {
+            drive: drive.to_string(),
+            scanned: total,
+        };
     }
 
     /// 逐盘追加 scan_directory 结果（回退路径，已含完整字段）

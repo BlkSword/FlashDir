@@ -674,12 +674,13 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
         }
 
         // 2) 轻量 MFT 扫描：仅取文件名/路径/大小，跳过聚合/format/排序（3-5s）
-        if let Some(lite_items) = flashdir::scan::scan_lite(&root) {
-            idx.append_scan(drive, &lite_items);
+        if let Some(mft_result) = flashdir::fs::try_mft_scan(&root) {
+            let count = mft_result.files.len();
+            idx.append_mft_files(drive, &mft_result.files);
             ok_drives.push(drive);
             let _ = app.emit(
                 "global-search-progress",
-                serde_json::json!({ "drive": drive.to_string(), "scanned": idx.entries_len(), "phase": "ok (lite)", "count": lite_items.len() }),
+                serde_json::json!({ "drive": drive.to_string(), "scanned": idx.entries_len(), "phase": "ok (mft)", "count": count }),
             );
             continue;
         }
@@ -774,10 +775,10 @@ pub async fn global_search_refresh(app: tauri::AppHandle) -> Result<(), String> 
             idx.append_scan(drive, &cached);
             ok_drives.push(drive);
             count = cached.len();
-        } else if let Some(lite_items) = flashdir::scan::scan_lite(&root) {
-            idx.append_scan(drive, &lite_items);
+        } else if let Some(mft_result) = flashdir::fs::try_mft_scan(&root) {
+            idx.append_mft_files(drive, &mft_result.files);
             ok_drives.push(drive);
-            count = lite_items.len();
+            count = mft_result.files.len();
         } else if let Ok(result) = flashdir::scan::scan_directory(
             &root, false, std::sync::Arc::clone(&perf), Some(app.clone()),
         )

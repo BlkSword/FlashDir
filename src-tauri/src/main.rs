@@ -71,9 +71,9 @@ async fn main() {
                     let root = format!("{}:\\", drive);
                     let app_h = app_handle.clone();
                     let result = tokio::task::spawn_blocking(move || {
-                        scan::scan_lite(&root).map(|items| {
-                            let count = items.len();
-                            global_search::instance().append_scan(drive, &items);
+                        flashdir::fs::try_mft_scan(&root).map(|mft_result| {
+                            let count = mft_result.files.len();
+                            global_search::instance().append_mft_files(drive, &mft_result.files);
                             (drive, count)
                         })
                     })
