@@ -212,6 +212,8 @@ pub async fn scan_directory_paged(
     let sort_direction = sort_direction.unwrap_or_else(|| "desc".to_string());
 
     let mut items = items;
+    // MFT 解析失败的占位记录不应展示给用户
+    items.retain(|i| !i.name.starts_with("<record_"));
     if let Some(filter) = filter.as_deref() {
         let lower = filter.trim().to_lowercase();
         if !lower.is_empty() {
@@ -290,6 +292,7 @@ pub async fn get_dir_children(path: String) -> Result<Vec<flashdir::scan::Item>,
         .into_iter()
         .filter(|i| {
             i.is_dir
+                && !i.name.starts_with("<record_")
                 && i.path.starts_with(&prefix)
                 && !i.path[prefix.len()..].contains('/')
         })

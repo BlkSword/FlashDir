@@ -20,18 +20,23 @@
       </div>
 
       <div class="fd-side-section">
-        <div class="fd-side-title">目录树</div>
+        <div class="fd-side-title">
+          目录树
+          <button v-if="treeData.length" class="fd-tree-collapse" @click="$emit('collapse-tree')">折叠</button>
+        </div>
         <div v-if="!treeData.length" class="fd-side-empty">
           扫描后显示目录结构
         </div>
-        <TreeNode
-          v-for="node in treeData"
-          :key="node.key"
-          :node="node"
-          :selected-path="selectedPath"
-          @select="$emit('select', $event)"
-          @load-children="$emit('load-children', $event)"
-        />
+        <div class="fd-tree-scroll">
+          <TreeNode
+            v-for="node in treeData"
+            :key="treeKey + '-' + node.key"
+            :node="node"
+            :selected-path="selectedPath"
+            @select="$emit('select', $event)"
+            @load-children="$emit('load-children', $event)"
+          />
+        </div>
       </div>
 
       <div class="fd-side-section">
@@ -64,6 +69,7 @@ defineProps({
   selectedPath: { type: String, default: '' },
   history: { type: Array, default: () => [] },
   collapsed: { type: Boolean, default: false },
+  treeKey: { type: Number, default: 0 },
 })
 
 const ComputerIcon = {
@@ -97,7 +103,7 @@ const quickAccess = [
   { name: '桌面', action: 'desktop', icon: DesktopIcon },
 ]
 
-defineEmits(['select', 'quick-access', 'load-children'])
+defineEmits(['select', 'quick-access', 'load-children', 'collapse-tree'])
 </script>
 
 <style scoped>
@@ -128,6 +134,26 @@ defineEmits(['select', 'quick-access', 'load-children'])
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.5px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.fd-tree-collapse {
+  border: 1px solid var(--fd-border);
+  background: var(--fd-bg-2);
+  color: var(--fd-text-2);
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.fd-tree-collapse:hover {
+  color: var(--fd-text-0);
+  background: var(--fd-bg-3);
+}
+.fd-tree-scroll {
+  max-height: 38vh;
+  overflow-y: auto;
 }
 .fd-side-list {
   display: flex;

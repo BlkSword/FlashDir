@@ -24,9 +24,11 @@
       :selected-path="currentPath"
       :history="history"
       :collapsed="sidebarCollapsed"
+      :tree-key="treeKey"
       @select="handleSelectPath"
       @quick-access="handleQuickAccess"
       @load-children="handleLoadTreeChildren"
+      @collapse-tree="handleCollapseTree"
     />
 
     <main class="fd-main">
@@ -132,6 +134,7 @@ const loading = ref(false)
 const scanTime = ref(0)
 const backendTime = ref(0)
 const treeData = shallowRef([])
+const treeKey = ref(0)
 const history = shallowRef([])
 const mftAvailable = ref(false)
 const isAdmin = ref(false)
@@ -212,6 +215,11 @@ const buildTreeData = async () => {
     console.error('加载目录树失败:', error)
     treeData.value = []
   }
+}
+
+const handleCollapseTree = () => {
+  treeData.value = treeData.value.map(node => ({ ...node, loaded: false, children: [] }))
+  treeKey.value += 1
 }
 
 const handleLoadTreeChildren = async (node) => {
