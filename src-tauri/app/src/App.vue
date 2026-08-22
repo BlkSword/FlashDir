@@ -14,6 +14,7 @@
       @navigate="handleNavigate"
       @toggle-watch="handleToggleWatch"
       @show-history="historyVisible = true"
+      @show-about="aboutVisible = true"
       @show-diagnostics="openDiagnostics"
       @open-dir="handleOpenDirFromSearch"
       @toggle-sidebar="sidebarCollapsed = !sidebarCollapsed"
@@ -99,6 +100,30 @@
     >
       <pre class="diagnostics-pre">{{ diagnosticsText || '正在获取诊断信息…' }}</pre>
     </a-modal>
+
+    <a-modal
+      :open="aboutVisible"
+      title="关于 FlashDir"
+      width="520px"
+      :footer="null"
+      @cancel="aboutVisible = false"
+    >
+      <div class="about-card">
+        <div class="about-logo">
+          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" width="48" height="48"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6" d="M4 4h6l2 2h8a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V6a2 2 0 012-2z"/><path d="M2 10h20"/></svg>
+        </div>
+        <div class="about-title">FlashDir</div>
+        <div class="about-subtitle">磁盘可观测性平台 · v3.4.1</div>
+        <p class="about-desc">
+          FlashDir 是一款面向 Windows 的磁盘空间分析与可观测性工具：MFT 直读扫描、
+          USN 增量刷新、开发者目录分析、快照对比、重复文件检测与跨盘全局文件搜索。
+        </p>
+        <div class="about-meta">
+          <span>本地优先 · 无遥测 · Apache-2.0</span>
+          <a href="https://github.com/BlkSword/FlashDir" target="_blank">GitHub</a>
+        </div>
+      </div>
+    </a-modal>
   </div>
 </template>
 
@@ -148,6 +173,7 @@ const sortConfig = ref({ column: 'size', direction: 'desc' })
 const searchKeyword = ref('')
 
 const historyVisible = ref(false)
+const aboutVisible = ref(false)
 const diagnosticsVisible = ref(false)
 const diagnosticsText = ref('')
 const watching = ref(false)
@@ -504,5 +530,47 @@ watch(historyVisible, (isOpen) => { if (isOpen) loadHistory() })
   font-family: Consolas, 'JetBrains Mono', monospace;
   white-space: pre-wrap;
   word-break: break-all;
+}
+.about-card {
+  text-align: center;
+  padding: 12px 8px;
+}
+.about-logo {
+  width: 64px;
+  height: 64px;
+  margin: 0 auto 12px;
+  border-radius: 16px;
+  background: var(--fd-accent);
+  color: #fff;
+  display: grid;
+  place-items: center;
+}
+.about-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--fd-text-0);
+}
+.about-subtitle {
+  font-size: 12px;
+  color: var(--fd-text-2);
+  margin: 4px 0 12px;
+}
+.about-desc {
+  font-size: 13px;
+  color: var(--fd-text-1);
+  line-height: 1.7;
+  max-width: 420px;
+  margin: 0 auto 16px;
+}
+.about-meta {
+  display: flex;
+  justify-content: center;
+  gap: 16px;
+  font-size: 12px;
+  color: var(--fd-text-2);
+}
+.about-meta a {
+  color: var(--fd-accent);
+  text-decoration: none;
 }
 </style>

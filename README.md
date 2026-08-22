@@ -6,8 +6,10 @@
 
 **磁盘可观测性平台 —— 不止于"谁占了我的磁盘"，而是"我的磁盘在过去一周发生了什么变化"**
 
-直接读取 NTFS 主文件表（$MFT），全盘 64 万+文件约 6 秒扫描完成。
-USN Journal 增量刷新、开发者工具自动识别、多版本快照对比、Everything 式智能过滤，以及跨盘全局文件搜索。
+FlashDir 是一款面向 Windows 的磁盘空间分析与可观测性工具：
+直接读取 NTFS 主文件表（$MFT），全盘 64 万+文件约 6 秒扫描完成；
+USN Journal 增量刷新让重复扫描接近秒级；内置开发者目录分析、快照对比、
+重复文件检测、Everything 式智能过滤与跨盘全局文件搜索。
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021%2B-orange.svg)](https://www.rust-lang.org)
@@ -437,6 +439,18 @@ const SNAPSHOT_EXPIRE_DAYS: i64 = 30;    // 快照保留 30 天
 ```
 
 ---
+
+## 关于 FlashDir
+
+FlashDir 是开源的 Windows 磁盘可观测性工具，核心目标是回答三个问题：
+
+1. **磁盘空间被什么占用了？**
+2. **这些占用在过去一段时间发生了什么变化？**
+3. **我能不能在全部磁盘中瞬间找到想要的文件？**
+
+它融合了 Everything 的文件名索引能力、WizTree 的 MFT 直读效率，以及 SpaceSniffer 的可视化表达，同时加入了开发者目录识别、快照对比、重复文件检测等面向工程实践的功能。
+
+FlashDir 由 Rust 驱动核心性能，Vue 3 承载界面交互，Tauri 2 构建轻量桌面应用。项目完全开源，定位隐私友好：所有数据仅保存在本地，不上传、不追踪、无遥测。
 
 ## 常见问题
 

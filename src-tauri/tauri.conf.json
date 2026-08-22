@@ -31,7 +31,9 @@
     "targets": [],
     "icon": [
       "icons/icon.ico"
-    ]
+    ],
+    "shortDescription": "磁盘可观测性平台",
+    "longDescription": "FlashDir 是一款面向 Windows 的磁盘空间分析与可观测性工具：MFT 直读扫描、USN 增量刷新、开发者目录分析、快照对比、重复文件检测与跨盘全局文件搜索。"
   },
   "plugins": {}
 }
