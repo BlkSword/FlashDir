@@ -1727,4 +1727,18 @@ mod tests {
         assert!(is_same_or_child("C:/", "C:/Windows"));
         assert!(is_same_or_child("C:/", "C:/"));
     }
+
+    #[test]
+    fn test_aggregate_directory_sizes() {
+        let mut items = vec![
+            Item { path: CompactString::from("C:/a"), name: CompactString::from("a"), size: 0, size_formatted: CompactString::new(), is_dir: true, mtime: 0 },
+            Item { path: CompactString::from("C:/a/b"), name: CompactString::from("b"), size: 0, size_formatted: CompactString::new(), is_dir: true, mtime: 0 },
+            Item { path: CompactString::from("C:/a/b/f"), name: CompactString::from("f"), size: 10, size_formatted: CompactString::new(), is_dir: false, mtime: 0 },
+            Item { path: CompactString::from("C:/a/f2"), name: CompactString::from("f2"), size: 5, size_formatted: CompactString::new(), is_dir: false, mtime: 0 },
+        ];
+        let total = aggregate_directory_sizes(&mut items);
+        assert_eq!(total, 15);
+        assert_eq!(items[0].size, 15);
+        assert_eq!(items[1].size, 10);
+    }
 }

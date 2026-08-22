@@ -434,61 +434,37 @@ const handleSizeChange = (current, size) => {
 }
 
 const buildTreeData = () => {
-  const dirs = allItems.value.filter(item => item.isDir)
-  if (dirs.length === 0) {
+  if (!currentPath.value || allItems.value.length === 0) {
     treeData.value = []
     return
   }
 
-  const nodeMap = new Map()
+  // 为避免超大目录递归渲染导致前端崩溃，目录树只展示当前路径的直接子目录；
+  // 点击目录会触发扫描进入下一级，等价于“按需展开”。
+  const root = currentPath.value.replace(/\\/g, '/').replace(/^\/\/\?\/?/, '').replace(/\/+$/, '')
+  const prefix = root.endsWith('/') ? root : root + '/'
+  const lowerPrefix = prefix.toLowerCase()
 
-  for (const dir of dirs) {
-    const pathParts = dir.path.split('/')
-    const name = pathParts[pathParts.length - 1] || dir.path
+  const dirs = allItems.value.filter(item => {
+    if (!item.isDir) return false
+    const path = (item.path || '').replace(/\\/g, '/')
+    if (!path.toLowerCase().startsWith(lowerPrefix)) return false
+    const rest = path.slice(prefix.length)
+    return rest.length > 0 && !rest.includes('/')
+  })
 
-    nodeMap.set(dir.path, {
+  const nodes = dirs
+    .map(dir => ({
       key: dir.path,
-      title: name,
+      title: dir.name,
       size: dir.size,
       sizeFormatted: dir.sizeFormatted,
       isLeaf: true,
       children: []
-    })
-  }
+    }))
+    .sort((a, b) => (b.size || 0) - (a.size || 0))
 
-  const topLevelNodes = []
-
-  for (const [path, node] of nodeMap) {
-    const lastSlashIndex = path.lastIndexOf('/')
-
-    if (lastSlashIndex === -1 || lastSlashIndex === 0) {
-      topLevelNodes.push(node)
-    } else {
-      const parentPath = path.substring(0, lastSlashIndex)
-      const parentNode = nodeMap.get(parentPath)
-
-      if (parentNode) {
-        parentNode.isLeaf = false
-        parentNode.children.push(node)
-      } else {
-        topLevelNodes.push(node)
-      }
-    }
-  }
-
-  const sortBySize = (a, b) => (b.size || 0) - (a.size || 0)
-
-  const sortChildren = (nodes) => {
-    nodes.sort(sortBySize)
-    for (const node of nodes) {
-      if (node.children && node.children.length > 0) {
-        sortChildren(node.children)
-      }
-    }
-  }
-
-  sortChildren(topLevelNodes)
-  treeData.value = topLevelNodes
+  treeData.value = nodes
 }
 
 const handleOpenDirFromSearch = (path) => {
