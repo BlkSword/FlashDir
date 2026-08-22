@@ -30,6 +30,7 @@
           :node="node"
           :selected-path="selectedPath"
           @select="$emit('select', $event)"
+          @load-children="$emit('load-children', $event)"
         />
       </div>
 
@@ -96,7 +97,7 @@ const quickAccess = [
   { name: '桌面', action: 'desktop', icon: DesktopIcon },
 ]
 
-defineEmits(['select', 'quick-access'])
+defineEmits(['select', 'quick-access', 'load-children'])
 </script>
 
 <style scoped>

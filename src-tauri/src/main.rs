@@ -112,6 +112,8 @@ async fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::scan_directory,
             commands::scan_directory_binary,
+            commands::scan_directory_paged,
+            commands::get_dir_children,
             commands::get_history_summary,
             commands::clear_history,
             commands::get_memory_cache_stats,

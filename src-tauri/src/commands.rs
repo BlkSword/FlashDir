@@ -159,6 +159,145 @@ pub async fn scan_directory_binary(
     Ok(tauri::ipc::Response::new(scan::encode_scan_result(&result)))
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanPageResponse {
+    pub items: Vec<flashdir::scan::Item>,
+    pub total_items: usize,
+    pub total_size: i64,
+    pub total_size_formatted: String,
+    pub file_count: usize,
+    pub dir_count: usize,
+    pub scan_time: f64,
+    pub path: String,
+    pub mft_available: bool,
+    pub page: usize,
+    pub page_size: usize,
+    pub top_files: Vec<flashdir::scan::Item>,
+}
+
+/// 分页扫描：后端只返回当前页，避免大目录把全量 items 传到前端导致崩溃。
+#[command]
+pub async fn scan_directory_paged(
+    path: String,
+    force_refresh: bool,
+    page: Option<usize>,
+    page_size: Option<usize>,
+    sort_column: Option<String>,
+    sort_direction: Option<String>,
+    filter: Option<String>,
+) -> Result<ScanPageResponse, String> {
+    let result = flashdir::scan::scan_directory(
+        &path,
+        force_refresh,
+        flashdir::perf::PerformanceMonitor::instance(),
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let flashdir::scan::ScanResult {
+        items,
+        total_size,
+        total_size_formatted,
+        scan_time,
+        path,
+        mft_available,
+        ..
+    } = result;
+
+    let page = page.unwrap_or(1).max(1);
+    let page_size = page_size.unwrap_or(100).clamp(1, 1000);
+    let sort_column = sort_column.unwrap_or_else(|| "size".to_string());
+    let sort_direction = sort_direction.unwrap_or_else(|| "desc".to_string());
+
+    let mut items = items;
+    if let Some(filter) = filter.as_deref() {
+        let lower = filter.trim().to_lowercase();
+        if !lower.is_empty() {
+            items.retain(|i| {
+                i.name.to_lowercase().contains(&lower) || i.path.to_lowercase().contains(&lower)
+            });
+        }
+    }
+
+    if sort_column != "size" || sort_direction != "desc" {
+        items.sort_unstable_by(|a, b| {
+            let ord = match sort_column.as_str() {
+                "name" => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                "mtime" => a.mtime.cmp(&b.mtime),
+                _ => a.size.cmp(&b.size),
+            };
+            if sort_direction == "asc" { ord } else { ord.reverse() }
+        });
+    }
+
+    let total_items = items.len();
+    let file_count = items.iter().filter(|i| !i.is_dir).count();
+    let dir_count = total_items - file_count;
+    let top_files: Vec<flashdir::scan::Item> = items
+        .iter()
+        .filter(|i| !i.is_dir)
+        .take(5)
+        .cloned()
+        .collect();
+    let start = (page - 1) * page_size;
+    let end = start.saturating_add(page_size).min(total_items);
+    let page_items: Vec<flashdir::scan::Item> = if start < total_items {
+        items[start..end].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    Ok(ScanPageResponse {
+        items: page_items,
+        total_items,
+        total_size,
+        total_size_formatted: total_size_formatted.to_string(),
+        file_count,
+        dir_count,
+        scan_time,
+        path: path.to_string(),
+        mft_available,
+        page,
+        page_size,
+        top_files,
+    })
+}
+
+/// 目录树懒加载：只返回指定目录的直接子目录。
+#[command]
+pub async fn get_dir_children(path: String) -> Result<Vec<flashdir::scan::Item>, String> {
+    let result = flashdir::scan::scan_directory(
+        &path,
+        false,
+        flashdir::perf::PerformanceMonitor::instance(),
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    let normalized = path.replace('\\', "/");
+    let root = normalized.trim_end_matches('/');
+    let prefix = if root.ends_with(':') {
+        format!("{}/", root)
+    } else {
+        format!("{}/", root)
+    };
+
+    let children: Vec<flashdir::scan::Item> = result
+        .items
+        .into_iter()
+        .filter(|i| {
+            i.is_dir
+                && i.path.starts_with(&prefix)
+                && !i.path[prefix.len()..].contains('/')
+        })
+        .collect();
+
+    Ok(children)
+}
+
 #[command]
 pub fn get_history_summary(state: State<'_, AppState>) -> Vec<HistoryItemSummary> {
     let history = state.history.lock();

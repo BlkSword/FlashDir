@@ -26,18 +26,19 @@
       :collapsed="sidebarCollapsed"
       @select="handleSelectPath"
       @quick-access="handleQuickAccess"
+      @load-children="handleLoadTreeChildren"
     />
 
     <main class="fd-main">
       <FileList
-        :items="displayItems"
+        :items="pageItems"
         :loading="loading"
         :total-size="totalSize"
         :current-path="currentPath"
         :sort-config="sortConfig"
         :current-page="currentPage"
         :page-size="pageSize"
-        :total-items="filteredTotalItems"
+        :total-items="totalItems"
         @sort="handleSort"
         @select="handleSelectItem"
         @page-change="handlePageChange"
@@ -47,11 +48,14 @@
     </main>
 
     <RightPanel
-      :items="allItems"
+      :items="pageItems"
       :total-size="totalSize"
       :current-path="currentPath"
       :active-tab="rightPanelTab"
       :scan-time="scanTime"
+      :file-count="fileCount"
+      :dir-count="dirCount"
+      :top-files="topFiles"
       @update:active-tab="rightPanelTab = $event"
     />
 
@@ -107,28 +111,23 @@ import RightPanel from './components/RightPanel.vue'
 import StatusBar from './components/StatusBar.vue'
 import HistoryList from './components/HistoryList.vue'
 import { useTauri } from './composables/useTauri'
-import { useSortWorker } from './composables/useSortWorker'
 import { useGlobalSearch } from './composables/useGlobalSearch'
 import { debounce, getParentPath, formatError } from './utils/format.js'
-import { applySmartFilter } from './utils/smartFilter.js'
-import { decodeScanResult } from './utils/scanBinary.js'
 import { homeDir, join } from '@tauri-apps/api/path'
 
 const { invoke, openDialog } = useTauri()
-const sortWorker = useSortWorker()
-
-// 后端扫描结果默认已按大小降序，直接复用可避免对数十万条目再做一次全量排序
-const sortItemsSmart = (items, column, direction) => {
-  if (column === 'size' && direction === 'desc') return items
-  return sortWorker.sortItemsSync(items, column, direction)
-}
 
 const scanPhase = ref({ phase: '', message: '' })
 let unlistenScanPhase = null
 let unlistenDirChanges = null
 
 const currentPath = ref('')
-const allItems = shallowRef([])
+const pageItems = shallowRef([])
+const totalItems = ref(0)
+const totalSize = ref(0)
+const fileCount = ref(0)
+const dirCount = ref(0)
+const topFiles = ref([])
 const loading = ref(false)
 const scanTime = ref(0)
 const backendTime = ref(0)
@@ -142,13 +141,9 @@ const navigationIndex = ref(-1)
 
 const currentPage = ref(1)
 const pageSize = ref(100)
-
-const sortConfig = ref({
-  column: 'size',
-  direction: 'desc'
-})
-
+const sortConfig = ref({ column: 'size', direction: 'desc' })
 const searchKeyword = ref('')
+
 const historyVisible = ref(false)
 const diagnosticsVisible = ref(false)
 const diagnosticsText = ref('')
@@ -157,15 +152,7 @@ const toolbarRef = ref(null)
 const rightPanelTab = ref('stats')
 const sidebarCollapsed = ref(false)
 
-// 全局搜索状态（单源 composable，与 GlobalSearchDropdown 共享）
-const {
-  loading: globalSearchLoading,
-  failed: globalSearchFailed,
-  statusText: globalSearchStatusText,
-} = useGlobalSearch()
-
-const lastSortKey = ref('')
-const presortedAllItems = shallowRef([])
+const { loading: globalSearchLoading, failed: globalSearchFailed, statusText: globalSearchStatusText } = useGlobalSearch()
 
 const canGoBack = computed(() => navigationIndex.value > 0)
 const canGoForward = computed(() => navigationIndex.value < navigationHistory.value.length - 1)
@@ -175,23 +162,77 @@ const canGoUp = computed(() => {
   return parts.length > 1
 })
 
-const totalItems = computed(() => allItems.value.length)
-const backendTotalSize = ref(0)
-const totalSize = computed(() => backendTotalSize.value)
+const loadPage = async () => {
+  if (!currentPath.value) return
+  loading.value = true
+  try {
+    const result = await invoke('scan_directory_paged', {
+      path: currentPath.value,
+      forceRefresh: false,
+      page: currentPage.value,
+      pageSize: pageSize.value,
+      sortColumn: sortConfig.value.column,
+      sortDirection: sortConfig.value.direction,
+      filter: searchKeyword.value.trim(),
+    })
 
-const filteredItems = computed(() => {
-  const keyword = searchKeyword.value.trim()
-  if (!keyword) return presortedAllItems.value
-  return applySmartFilter(presortedAllItems.value, keyword)
-})
+    pageItems.value = result.items || []
+    totalItems.value = result.totalItems || 0
+    totalSize.value = result.totalSize || 0
+    fileCount.value = result.fileCount || 0
+    dirCount.value = result.dirCount || 0
+    topFiles.value = result.topFiles || []
+    backendTime.value = typeof result.scanTime === 'number' ? result.scanTime : 0
+    mftAvailable.value = !!result.mftAvailable
+  } catch (error) {
+    console.error('加载分页失败:', error)
+    message.error('加载分页失败: ' + formatError(error))
+  } finally {
+    loading.value = false
+  }
+}
 
-const filteredTotalItems = computed(() => filteredItems.value.length)
+const buildTreeData = async () => {
+  if (!currentPath.value) {
+    treeData.value = []
+    return
+  }
+  try {
+    const children = await invoke('get_dir_children', { path: currentPath.value })
+    treeData.value = (children || []).map(item => ({
+      key: item.path,
+      title: item.name,
+      size: item.size,
+      sizeFormatted: item.sizeFormatted,
+      isLeaf: false,
+      loaded: false,
+      children: [],
+    }))
+  } catch (error) {
+    console.error('加载目录树失败:', error)
+    treeData.value = []
+  }
+}
 
-const displayItems = computed(() => {
-  const start = (currentPage.value - 1) * pageSize.value
-  const end = start + pageSize.value
-  return filteredItems.value.slice(start, end)
-})
+const handleLoadTreeChildren = async (node) => {
+  try {
+    const children = await invoke('get_dir_children', { path: node.key })
+    const childNodes = (children || []).map(item => ({
+      key: item.path,
+      title: item.name,
+      size: item.size,
+      sizeFormatted: item.sizeFormatted,
+      isLeaf: false,
+      loaded: false,
+      children: [],
+    }))
+    node.children = childNodes
+    node.loaded = true
+    treeData.value = JSON.parse(JSON.stringify(treeData.value))
+  } catch (error) {
+    console.error('展开目录失败:', error)
+  }
+}
 
 const handleScan = async (path, addToHistory = true) => {
   if (!path || path.trim() === '') {
@@ -202,42 +243,40 @@ const handleScan = async (path, addToHistory = true) => {
   loading.value = true
   scanTime.value = 0
   backendTime.value = 0
-  backendTotalSize.value = 0
-  scanPhase.value = { phase: '', message: '' }
-
-  allItems.value = []
+  totalSize.value = 0
+  pageItems.value = []
   treeData.value = []
-  presortedAllItems.value = []
-  lastSortKey.value = ''
+  currentPage.value = 1
+  scanPhase.value = { phase: '', message: '' }
 
   const fullStartTime = performance.now()
 
   try {
-    // 走二进制通道：避免百万级条目的 JSON 序列化/解析卡死渲染进程
-    const buffer = await invoke('scan_directory_binary', {
-      path: path.trim(),
-      forceRefresh: false
-    })
-    const result = await decodeScanResult(buffer, (decoded, total) => {
-      scanPhase.value = { phase: 'transfer', message: `加载结果 ${decoded.toLocaleString()}/${total.toLocaleString()}` }
-    })
-
-    backendTime.value = typeof result.scanTime === 'number' ? result.scanTime : 0
-
-    allItems.value = result.items || []
-    backendTotalSize.value = result.totalSize || 0
-    presortedAllItems.value = sortItemsSmart(result.items || [], sortConfig.value.column, sortConfig.value.direction)
-    lastSortKey.value = `${sortConfig.value.column}-${sortConfig.value.direction}`
-
     currentPath.value = path
 
-    mftAvailable.value = result.mftAvailable || false
+    const result = await invoke('scan_directory_paged', {
+      path: path.trim(),
+      forceRefresh: false,
+      page: 1,
+      pageSize: pageSize.value,
+      sortColumn: sortConfig.value.column,
+      sortDirection: sortConfig.value.direction,
+      filter: searchKeyword.value.trim(),
+    })
 
-    if ('requestIdleCallback' in window) {
-      requestIdleCallback(() => buildTreeData(), { timeout: 100 })
-    } else {
-      setTimeout(() => buildTreeData(), 50)
-    }
+    pageItems.value = result.items || []
+    totalItems.value = result.totalItems || 0
+    totalSize.value = result.totalSize || 0
+    fileCount.value = result.fileCount || 0
+    dirCount.value = result.dirCount || 0
+    topFiles.value = result.topFiles || []
+    backendTime.value = typeof result.scanTime === 'number' ? result.scanTime : 0
+    mftAvailable.value = !!result.mftAvailable
+
+    const fullEndTime = performance.now()
+    scanTime.value = parseFloat(((fullEndTime - fullStartTime) / 1000).toFixed(2))
+
+    await buildTreeData()
 
     if (addToHistory) {
       navigationHistory.value = navigationHistory.value.slice(0, navigationIndex.value + 1)
@@ -245,16 +284,10 @@ const handleScan = async (path, addToHistory = true) => {
       navigationIndex.value = navigationHistory.value.length - 1
     }
 
-    const fullEndTime = performance.now()
-    scanTime.value = parseFloat(((fullEndTime - fullStartTime) / 1000).toFixed(2))
+    // 全局索引追加放到后台，不阻塞 UI
+    invoke('global_search_add_scan_from_cache', { path: path.trim() }).catch(() => {})
 
-    // 全局索引追加放到后台执行，不阻塞主界面展示扫描结果
-    invoke('global_search_add_scan_from_cache', { path: path.trim() }).catch(() => {
-      // 缓存恰好被逐出时回退到旧的 JSON 传输，保证索引仍然能追加
-      invoke('global_search_add_scan', { path: path.trim(), items: result.items }).catch(() => {})
-    })
-
-    message.success(`扫描完成 (总计: ${scanTime.value}s，找到 ${allItems.value.length} 个项目)`)
+    message.success(`扫描完成 (总计: ${scanTime.value}s，找到 ${totalItems.value.toLocaleString()} 个项目)`)
   } catch (error) {
     console.error('扫描失败:', error)
     message.error('扫描失败: ' + formatError(error))
@@ -264,55 +297,34 @@ const handleScan = async (path, addToHistory = true) => {
   }
 }
 
-const handleToggleWatch = async () => {
-  if (watching.value) {
-    try {
-      await invoke('stop_watch')
-      watching.value = false
-      message.info('已停止目录监听')
-    } catch (error) {
-      message.error('停止监听失败: ' + formatError(error))
-    }
-    return
-  }
+const handleSearchInput = debounce((keyword) => {
+  searchKeyword.value = keyword
+  currentPage.value = 1
+  loadPage()
+}, 250)
 
-  if (!currentPath.value) {
-    message.warning('请先扫描一个目录')
-    return
+const handleSort = (column, direction) => {
+  let newDirection = direction
+  if (!newDirection) {
+    newDirection = sortConfig.value.column === column
+      ? (sortConfig.value.direction === 'asc' ? 'desc' : 'asc')
+      : (column === 'name' ? 'asc' : 'desc')
   }
-
-  try {
-    await invoke('start_watch', { path: currentPath.value })
-    watching.value = true
-    message.success('开始监听目录变更')
-  } catch (error) {
-    message.error('启动监听失败: ' + formatError(error))
-  }
+  sortConfig.value.column = column
+  sortConfig.value.direction = newDirection
+  currentPage.value = 1
+  loadPage()
 }
 
-const handleCancelScan = async () => {
-  try {
-    await invoke('cancel_scan')
-    message.info('正在取消扫描…')
-  } catch (error) {
-    console.error('取消失败:', error)
-  }
+const handlePageChange = (page) => {
+  currentPage.value = page
+  loadPage()
 }
 
-const handleBrowse = async () => {
-  try {
-    const selected = await openDialog({
-      title: '选择要扫描的目录',
-      multiple: false,
-      directory: true
-    })
-    if (selected) {
-      await handleScan(selected)
-    }
-  } catch (error) {
-    console.error('选择目录失败:', error)
-    message.error('选择目录失败: ' + formatError(error))
-  }
+const handleSizeChange = (current, size) => {
+  pageSize.value = size
+  currentPage.value = current
+  loadPage()
 }
 
 const handleNavigate = async (direction) => {
@@ -332,81 +344,43 @@ const handleNavigate = async (direction) => {
   }
 }
 
-const handleSearchInput = debounce((keyword) => {
-  searchKeyword.value = keyword
-  currentPage.value = 1
-  lastSortKey.value = ''
-}, 200)
+const handleBrowse = async () => {
+  try {
+    const selected = await openDialog({ title: '选择要扫描的目录', multiple: false, directory: true })
+    if (selected) await handleScan(selected)
+  } catch (error) {
+    message.error('选择目录失败: ' + formatError(error))
+  }
+}
 
 const handleSelectPath = async (path) => {
   if (!path) return
-
   try {
     const isDir = await invoke('is_directory', { path })
-    if (isDir) {
-      await handleScan(path)
-    } else {
-      await invoke('open_path', { path })
-    }
+    if (isDir) await handleScan(path)
+    else await invoke('open_path', { path })
   } catch (error) {
-    console.error('选择路径失败:', error)
     message.error('选择路径失败: ' + formatError(error))
   }
 }
 
-const handleQuickAccess = async (action) => {
-  if (action === 'computer') {
-    await handleBrowse()
-    return
+const handleSelectItem = async (item) => {
+  if (!item) return
+  if (item.isDir) await handleScan(item.path)
+  else {
+    try { await invoke('open_path', { path: item.path }) } catch (error) { message.error('打开文件失败: ' + formatError(error)) }
   }
+}
+
+const handleQuickAccess = async (action) => {
+  if (action === 'computer') { await handleBrowse(); return }
   try {
     const home = await homeDir()
-    if (!home) {
-      message.warning('无法获取用户目录')
-      return
-    }
     let target = home
-    if (action === 'downloads') {
-      target = await join(home, 'Downloads')
-    } else if (action === 'desktop') {
-      target = await join(home, 'Desktop')
-    }
+    if (action === 'downloads') target = await join(home, 'Downloads')
+    else if (action === 'desktop') target = await join(home, 'Desktop')
     await handleScan(target)
-  } catch (error) {
-    console.error('快速访问失败:', error)
-    message.error('快速访问失败: ' + formatError(error))
-  }
-}
-
-const handleSelectItem = async (item) => {
-  if (item.isDir) {
-    await handleScan(item.path)
-  } else {
-    try {
-      await invoke('open_path', { path: item.path })
-    } catch (error) {
-      console.error('打开文件失败:', error)
-      message.error('打开文件失败: ' + formatError(error))
-    }
-  }
-}
-
-const handleSort = (column, direction) => {
-  let newDirection = direction
-  if (!newDirection) {
-    newDirection = sortConfig.value.column === column
-      ? (sortConfig.value.direction === 'asc' ? 'desc' : 'asc')
-      : (column === 'name' ? 'asc' : 'desc')
-  }
-  sortConfig.value.column = column
-  sortConfig.value.direction = newDirection
-  if (allItems.value.length > 0) {
-    const newSortKey = `${column}-${newDirection}`
-    if (newSortKey !== lastSortKey.value) {
-      presortedAllItems.value = sortItemsSmart(allItems.value, column, newDirection)
-      lastSortKey.value = newSortKey
-    }
-  }
+  } catch (error) { message.error('快速访问失败: ' + formatError(error)) }
 }
 
 const handleSelectHistory = async (path) => {
@@ -419,52 +393,7 @@ const handleClearHistory = async () => {
     await invoke('clear_history')
     history.value = []
     message.success('历史记录已清除')
-  } catch (error) {
-    message.error('清除历史记录失败: ' + formatError(error))
-  }
-}
-
-const handlePageChange = (page) => {
-  currentPage.value = page
-}
-
-const handleSizeChange = (current, size) => {
-  pageSize.value = size
-  currentPage.value = current
-}
-
-const buildTreeData = () => {
-  if (!currentPath.value || allItems.value.length === 0) {
-    treeData.value = []
-    return
-  }
-
-  // 为避免超大目录递归渲染导致前端崩溃，目录树只展示当前路径的直接子目录；
-  // 点击目录会触发扫描进入下一级，等价于“按需展开”。
-  const root = currentPath.value.replace(/\\/g, '/').replace(/^\/\/\?\/?/, '').replace(/\/+$/, '')
-  const prefix = root.endsWith('/') ? root : root + '/'
-  const lowerPrefix = prefix.toLowerCase()
-
-  const dirs = allItems.value.filter(item => {
-    if (!item.isDir) return false
-    const path = (item.path || '').replace(/\\/g, '/')
-    if (!path.toLowerCase().startsWith(lowerPrefix)) return false
-    const rest = path.slice(prefix.length)
-    return rest.length > 0 && !rest.includes('/')
-  })
-
-  const nodes = dirs
-    .map(dir => ({
-      key: dir.path,
-      title: dir.name,
-      size: dir.size,
-      sizeFormatted: dir.sizeFormatted,
-      isLeaf: true,
-      children: []
-    }))
-    .sort((a, b) => (b.size || 0) - (a.size || 0))
-
-  treeData.value = nodes
+  } catch (error) { message.error('清除历史记录失败: ' + formatError(error)) }
 }
 
 const handleOpenDirFromSearch = (path) => {
@@ -473,22 +402,31 @@ const handleOpenDirFromSearch = (path) => {
 
 const loadHistory = async () => {
   try {
-    const historyData = await invoke('get_history_summary')
-    history.value = historyData || []
-  } catch (error) {
-    console.error('加载历史记录失败:', error)
-  }
+    history.value = await invoke('get_history_summary') || []
+  } catch (error) { console.error('加载历史记录失败:', error) }
 }
 
 const openDiagnostics = async () => {
   diagnosticsVisible.value = true
   diagnosticsText.value = ''
   try {
-    const data = await invoke('get_diagnostics')
-    diagnosticsText.value = JSON.stringify(data, null, 2)
+    diagnosticsText.value = JSON.stringify(await invoke('get_diagnostics'), null, 2)
   } catch (error) {
     diagnosticsText.value = '获取诊断信息失败: ' + formatError(error)
   }
+}
+
+const handleCancelScan = async () => {
+  try { await invoke('cancel_scan'); message.info('正在取消扫描…') } catch (error) { console.error('取消失败:', error) }
+}
+
+const handleToggleWatch = async () => {
+  if (watching.value) {
+    try { await invoke('stop_watch'); watching.value = false; message.info('已停止目录监听') } catch (error) { message.error('停止监听失败: ' + formatError(error)) }
+    return
+  }
+  if (!currentPath.value) { message.warning('请先扫描一个目录'); return }
+  try { await invoke('start_watch', { path: currentPath.value }); watching.value = true; message.success('开始监听目录变更') } catch (error) { message.error('启动监听失败: ' + formatError(error)) }
 }
 
 const onGlobalSearchKeydown = (e) => {
@@ -513,35 +451,16 @@ onMounted(async () => {
     }
   })
 
-  try {
-    isAdmin.value = await invoke('is_admin')
-  } catch {
-    isAdmin.value = false
-  }
+  try { isAdmin.value = await invoke('is_admin') } catch { isAdmin.value = false }
 })
 
 onUnmounted(() => {
-  if (unlistenScanPhase) {
-    unlistenScanPhase()
-    unlistenScanPhase = null
-  }
-  if (unlistenDirChanges) {
-    unlistenDirChanges()
-    unlistenDirChanges = null
-  }
+  if (unlistenScanPhase) { unlistenScanPhase(); unlistenScanPhase = null }
+  if (unlistenDirChanges) { unlistenDirChanges(); unlistenDirChanges = null }
   document.removeEventListener('keydown', onGlobalSearchKeydown)
 })
 
-watch(historyVisible, (isOpen) => {
-  if (isOpen) {
-    loadHistory()
-  }
-})
-
-watch(() => allItems.value.length, () => {
-  currentPage.value = 1
-  lastSortKey.value = ''
-})
+watch(historyVisible, (isOpen) => { if (isOpen) loadHistory() })
 </script>
 
 <style scoped>

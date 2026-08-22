@@ -15,9 +15,11 @@
     <div class="fd-panel-body">
       <StatsTab
         v-if="activeTab === 'stats'"
-        :items="items"
         :total-size="totalSize"
         :scan-time="scanTime"
+        :file-count="fileCount"
+        :dir-count="dirCount"
+        :top-files="topFiles"
       />
       <Treemap
         v-else-if="activeTab === 'treemap'"
@@ -67,6 +69,9 @@ defineProps({
   currentPath: { type: String, default: '' },
   activeTab: { type: String, default: 'stats' },
   scanTime: { type: Number, default: 0 },
+  fileCount: { type: Number, default: 0 },
+  dirCount: { type: Number, default: 0 },
+  topFiles: { type: Array, default: () => [] },
 })
 
 defineEmits(['update:activeTab'])

@@ -44,6 +44,7 @@
         :selected-path="selectedPath"
         :level="level + 1"
         @select="$emit('select', $event)"
+        @load-children="$emit('load-children', $event)"
       />
     </div>
   </div>
@@ -58,12 +59,15 @@ const props = defineProps({
   level: { type: Number, default: 0 },
 })
 
-const expanded = ref(props.level < 1)
+const expanded = ref(false)
 
-const hasChildren = computed(() => props.node.children && props.node.children.length > 0)
+const hasChildren = computed(() => !props.node.isLeaf || (props.node.children && props.node.children.length > 0))
 const isSelected = computed(() => props.selectedPath && props.node.key && props.selectedPath.includes(props.node.key))
 
 const toggleExpand = () => {
+  if (!expanded.value && hasChildren.value && !props.node.loaded) {
+    emit('load-children', props.node)
+  }
   expanded.value = !expanded.value
 }
 
@@ -77,7 +81,7 @@ const handleClick = () => {
   }
 }
 
-const emit = defineEmits(['select'])
+const emit = defineEmits(['select', 'load-children'])
 </script>
 
 <style scoped>

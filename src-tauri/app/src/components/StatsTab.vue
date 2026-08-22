@@ -23,83 +23,27 @@
     </div>
 
     <div class="fd-card">
-      <div class="fd-card-title">扩展名分布</div>
-      <div v-for="(ext, index) in extStats" :key="index" class="fd-ext-row">
-        <span class="fd-ext-label">{{ ext.name }}</span>
-        <div class="fd-ext-track"><div class="fd-ext-fill" :style="{ width: ext.percent + '%', background: ext.color }"></div></div>
-        <span class="fd-ext-size">{{ ext.sizeFormatted }}</span>
-      </div>
-    </div>
-
-    <div class="fd-card">
       <div class="fd-card-title">Top 5 大文件</div>
       <div v-for="(file, index) in topFiles" :key="index" class="fd-top-row">
         <span class="fd-top-rank" :class="'r' + (index + 1)">{{ index + 1 }}</span>
         <span class="truncate fd-top-name" :title="file.name">{{ file.name }}</span>
-        <span class="fd-top-size">{{ file.sizeFormatted }}</span>
+        <span class="fd-top-size">{{ file.sizeFormatted || formatSize(file.size) }}</span>
       </div>
+      <div v-if="topFiles.length === 0" class="fd-empty">暂无数据</div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { computed } from 'vue'
 import { formatSize } from '../utils/format.js'
 
-const props = defineProps({
-  items: { type: Array, default: () => [] },
+defineProps({
   totalSize: { type: Number, default: 0 },
   scanTime: { type: Number, default: 0 },
+  fileCount: { type: Number, default: 0 },
+  dirCount: { type: Number, default: 0 },
+  topFiles: { type: Array, default: () => [] },
 })
-
-const fileCount = computed(() => props.items.filter(i => !i.isDir).length)
-const dirCount = computed(() => props.items.filter(i => i.isDir).length)
-
-const topFiles = computed(() => {
-  // 单次遍历维护 Top 5，避免对数十万文件做全量排序
-  const top = []
-  for (const item of props.items) {
-    if (item.isDir) continue
-    const size = item.size || 0
-    if (top.length < 5) {
-      top.push(item)
-      top.sort((a, b) => (b.size || 0) - (a.size || 0))
-    } else if (size > (top[top.length - 1].size || 0)) {
-      top[4] = item
-      top.sort((a, b) => (b.size || 0) - (a.size || 0))
-    }
-  }
-  return top.map(i => ({ ...i, sizeFormatted: formatSize(i.size) }))
-})
-
-const extStats = computed(() => {
-  const map = new Map()
-  for (const item of props.items) {
-    if (item.isDir) continue
-    const ext = getExt(item.name)
-    const key = ext || '无扩展名'
-    const cur = map.get(key) || { size: 0, count: 0 }
-    cur.size += item.size
-    cur.count++
-    map.set(key, cur)
-  }
-
-  const colors = ['#007acc', '#dcb67a', '#89d185', '#c586c0', '#a0a0a0']
-  return Array.from(map.entries())
-    .sort((a, b) => b[1].size - a[1].size)
-    .slice(0, 5)
-    .map(([name, data], idx) => ({
-      name,
-      sizeFormatted: formatSize(data.size),
-      percent: props.totalSize ? Math.max(1, (data.size / props.totalSize) * 100) : 0,
-      color: colors[idx % colors.length],
-    }))
-})
-
-const getExt = (name) => {
-  const dot = name.lastIndexOf('.')
-  return dot > 0 ? name.slice(dot + 1).toLowerCase() : ''
-}
 </script>
 
 <style scoped>
@@ -143,36 +87,6 @@ const getExt = (name) => {
   font-size: 10.5px;
   color: var(--fd-text-2);
 }
-.fd-ext-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 0;
-}
-.fd-ext-label {
-  width: 56px;
-  font-family: Consolas, 'JetBrains Mono', monospace;
-  font-size: 11px;
-  color: var(--fd-text-1);
-}
-.fd-ext-track {
-  flex: 1;
-  height: 5px;
-  background: var(--fd-bg-3);
-  border-radius: 3px;
-  overflow: hidden;
-}
-.fd-ext-fill {
-  height: 100%;
-  border-radius: 3px;
-}
-.fd-ext-size {
-  width: 58px;
-  text-align: right;
-  color: var(--fd-text-2);
-  font-family: Consolas, 'JetBrains Mono', monospace;
-  font-size: 10.5px;
-}
 .fd-top-row {
   display: flex;
   align-items: center;
@@ -205,5 +119,11 @@ const getExt = (name) => {
   font-family: Consolas, 'JetBrains Mono', monospace;
   font-size: 11px;
   color: var(--fd-text-1);
+}
+.fd-empty {
+  text-align: center;
+  color: var(--fd-text-3);
+  font-size: 12px;
+  padding: 12px 0;
 }
 </style>

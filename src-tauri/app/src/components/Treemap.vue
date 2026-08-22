@@ -49,6 +49,7 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { formatSize } from '../utils/format.js'
+import { useTauri } from '../composables/useTauri'
 
 const props = defineProps({
   items: { type: Array, default: () => [] },
@@ -57,6 +58,7 @@ const props = defineProps({
 })
 
 const emit = defineEmits(['drilldown'])
+const { invoke } = useTauri()
 
 const containerRef = ref(null)
 const canvasWrapperRef = ref(null)
@@ -67,6 +69,7 @@ const navStack = ref([]) // [{ dirPath, items, totalSize }]
 const currentDir = ref('')
 const currentItems = ref([])
 const currentTotalSize = ref(0)
+const loading = ref(false)
 
 const canGoUp = computed(() => navStack.value.length > 0)
 
@@ -145,6 +148,23 @@ const topExtensions = computed(() => {
     .map(([name]) => ({ name, color: extColors[name] || extColorFallbacks[Math.abs(hashCode(name)) % extColorFallbacks.length] }))
 })
 
+// 从后端按需加载直接子目录，避免把全量条目传到前端。
+const loadChildren = async (path) => {
+  if (!path) return
+  loading.value = true
+  try {
+    const children = await invoke('get_dir_children', { path })
+    currentDir.value = path
+    currentItems.value = children || []
+    currentTotalSize.value = currentItems.value.reduce((s, i) => s + (i.size || 0), 0)
+    nextTick(() => render())
+  } catch (error) {
+    console.error('加载热图数据失败:', error)
+  } finally {
+    loading.value = false
+  }
+}
+
 // 获取扫描根目录的直接子项；热图只展示第一级大目录，避免文件过多时失效。
 const getRootItems = (items) => {
   if (!props.currentPath || !items || items.length === 0) return items || []
@@ -165,17 +185,14 @@ const getRootItems = (items) => {
   return dirs.length > 0 ? dirs : directChildren
 }
 
-// 当 items 变化时，重置到根
-watch(() => props.items, (newItems) => {
-  if (newItems && newItems.length > 0) {
-    navStack.value = []
-    currentDir.value = ''
-    currentItems.value = getRootItems(newItems)
-    currentTotalSize.value = currentItems.value.reduce((s, i) => s + (i.size || 0), 0)
-    nextTick(() => render())
+// 当扫描路径变化时，从后端加载第一级目录
+watch(() => props.currentPath, (path) => {
+  navStack.value = []
+  layoutCache = []
+  if (path) {
+    loadChildren(path)
   } else {
     currentItems.value = []
-    layoutCache = []
     nextTick(() => clearCanvas())
   }
 }, { immediate: true })
@@ -376,7 +393,7 @@ const buildDirIndex = (items) => {
   }
 }
 
-const handleClick = (e) => {
+const handleClick = async (e) => {
   if (!canvasRef.value) return
   const rect = canvasRef.value.getBoundingClientRect()
   const mx = e.clientX - rect.left
@@ -385,26 +402,16 @@ const handleClick = (e) => {
   const cell = findCellAtPos(mx, my)
   if (!cell || !cell.item.isDir) return
 
-  // 钻入目录 — 使用预建索引 O(1) 查找子项
+  // 钻入目录 — 从后端按需加载子目录
   const dirPath = cell.item.path
-  const dirItems = dirIndex.get(dirPath) || []
 
-  if (dirItems.length === 0) {
-    return
-  }
-
-  // 保存当前状态到栈
   navStack.value.push({
     dirPath: currentDir.value,
     items: currentItems.value,
     totalSize: currentTotalSize.value
   })
 
-  currentDir.value = dirPath
-  currentItems.value = dirItems
-  currentTotalSize.value = dirItems.reduce((s, i) => s + (i.size || 0), 0)
-
-  nextTick(() => render())
+  await loadChildren(dirPath)
 }
 
 const goUp = () => {
