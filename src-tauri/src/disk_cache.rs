@@ -127,6 +127,7 @@ impl DiskCache {
                 path TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 name_lower TEXT NOT NULL,
+                ext TEXT NOT NULL DEFAULT '',
                 size INTEGER NOT NULL,
                 is_dir INTEGER NOT NULL,
                 drive TEXT NOT NULL,
@@ -135,6 +136,9 @@ impl DiskCache {
             )",
             [],
         )?;
+
+        // 兼容旧库：缺少 ext 列时补上
+        let _ = conn.execute("ALTER TABLE global_index ADD COLUMN ext TEXT NOT NULL DEFAULT ''", []);
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_global_index_name_lower ON global_index(name_lower)",
@@ -608,7 +612,7 @@ impl DiskCache {
         let guard = self.conn.lock();
         let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         let mut stmt = conn.prepare(
-            "SELECT path, name, name_lower, size, is_dir, mtime FROM global_index",
+            "SELECT path, name, name_lower, ext, size, is_dir, mtime FROM global_index",
         )?;
         let entries = stmt
             .query_map([], |row| {
@@ -616,9 +620,10 @@ impl DiskCache {
                     path: row.get(0)?,
                     name: row.get(1)?,
                     name_lower: row.get(2)?,
-                    size: row.get(3)?,
-                    is_dir: row.get::<_, i64>(4)? != 0,
-                    mtime: row.get(5)?,
+                    ext: row.get(3)?,
+                    size: row.get(4)?,
+                    is_dir: row.get::<_, i64>(5)? != 0,
+                    mtime: row.get(6)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -635,8 +640,8 @@ impl DiskCache {
         {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO global_index
-                 (path, name, name_lower, size, is_dir, drive, mtime, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (path, name, name_lower, ext, size, is_dir, drive, mtime, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             for e in entries {
                 let drive = Self::extract_drive(&e.path).unwrap_or('?').to_string();
@@ -644,12 +649,50 @@ impl DiskCache {
                     e.path,
                     e.name,
                     e.name_lower,
+                    e.ext,
                     e.size,
                     e.is_dir as i64,
                     drive,
                     e.mtime,
                     chrono::Utc::now().timestamp(),
                 ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 流式全量重建：避免把整个内存索引 clone 成一个大 Vec 再写入。
+    pub fn save_global_index_stream(
+        &self,
+        rx: std::sync::mpsc::Receiver<Vec<IndexEntry>>,
+    ) -> Result<()> {
+        let mut guard = self.conn.lock();
+        let conn = guard.as_mut().ok_or_else(Self::disabled_err)?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM global_index", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO global_index
+                 (path, name, name_lower, ext, size, is_dir, drive, mtime, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            let now = chrono::Utc::now().timestamp();
+            for chunk in rx {
+                for e in chunk {
+                    let drive = Self::extract_drive(&e.path).unwrap_or('?').to_string();
+                    stmt.execute(params![
+                        e.path,
+                        e.name,
+                        e.name_lower,
+                        e.ext,
+                        e.size,
+                        e.is_dir as i64,
+                        drive,
+                        e.mtime,
+                        now,
+                    ])?;
+                }
             }
         }
         tx.commit()?;
@@ -663,12 +706,13 @@ impl DiskCache {
         let drive = Self::extract_drive(&entry.path).unwrap_or('?').to_string();
         conn.execute(
             "INSERT OR REPLACE INTO global_index
-             (path, name, name_lower, size, is_dir, drive, mtime, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (path, name, name_lower, ext, size, is_dir, drive, mtime, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 entry.path,
                 entry.name,
                 entry.name_lower,
+                entry.ext,
                 entry.size,
                 entry.is_dir as i64,
                 drive,
@@ -690,8 +734,8 @@ impl DiskCache {
         {
             let mut stmt = tx.prepare(
                 "INSERT OR REPLACE INTO global_index
-                 (path, name, name_lower, size, is_dir, drive, mtime, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (path, name, name_lower, ext, size, is_dir, drive, mtime, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             )?;
             let now = chrono::Utc::now().timestamp();
             for entry in entries {
@@ -700,6 +744,7 @@ impl DiskCache {
                     entry.path,
                     entry.name,
                     entry.name_lower,
+                    entry.ext,
                     entry.size,
                     entry.is_dir as i64,
                     drive,

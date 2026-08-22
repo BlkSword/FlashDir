@@ -1331,6 +1331,10 @@ fn try_usn_incremental_update(
                     path: crate::global_search::normalize_abs_path(drive, &vol_path),
                     name: name.clone(),
                     name_lower: name.to_lowercase(),
+                    ext: name
+                        .rsplit_once('.')
+                        .map(|(_, e)| e.to_lowercase())
+                        .unwrap_or_default(),
                     size: file_size,
                     is_dir,
                     mtime: file_mtime,
@@ -1355,6 +1359,10 @@ fn try_usn_incremental_update(
                                     path: crate::global_search::normalize_abs_path(drive, &vol_path),
                                     name: name.clone(),
                                     name_lower: name.to_lowercase(),
+                                    ext: name
+                                        .rsplit_once('.')
+                                        .map(|(_, e)| e.to_lowercase())
+                                        .unwrap_or_default(),
                                     size: new_size,
                                     is_dir: item.is_dir,
                                     mtime: record.mtime,

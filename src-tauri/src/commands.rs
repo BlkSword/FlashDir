@@ -658,34 +658,52 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
 
     let perf = flashdir::perf::PerformanceMonitor::instance();
     let mut ok_drives: Vec<char> = Vec::new();
+    let mut failed_drives: Vec<char> = Vec::new();
 
-    for &drive in &drives {
+    // 并行 MFT 扫描所有 NTFS 卷，内存/磁盘缓存命中直接复用
+    let parallel_results: Vec<(char, Option<usize>)> = std::thread::scope(|scope| {
+        let mut handles: Vec<(char, std::thread::ScopedJoinHandle<'_, (char, Option<usize>)>)> = Vec::new();
+        for &drive in &drives {
+            let root = format!("{}:\\", drive);
+            handles.push((
+                drive,
+                scope.spawn(move || {
+                    if let Some(cached) = flashdir::scan::get_cached_items(&root) {
+                        let count = cached.len();
+                        flashdir::global_search::instance().append_scan(drive, &cached);
+                        (drive, Some(count))
+                    } else if let Some(mft_result) = flashdir::fs::try_mft_scan(&root) {
+                        let count = mft_result.files.len();
+                        flashdir::global_search::instance().append_mft_files(drive, &mft_result.files);
+                        (drive, Some(count))
+                    } else {
+                        (drive, None)
+                    }
+                }),
+            ));
+        }
+        handles
+            .into_iter()
+            .map(|(drive, handle)| handle.join().unwrap_or((drive, None)))
+            .collect()
+    });
+
+    for (drive, count) in parallel_results {
+        match count {
+            Some(count) => {
+                ok_drives.push(drive);
+                let _ = app.emit(
+                    "global-search-progress",
+                    serde_json::json!({ "drive": drive.to_string(), "scanned": flashdir::global_search::instance().entries_len(), "phase": "ok (mft)", "count": count }),
+                );
+            }
+            None => failed_drives.push(drive),
+        }
+    }
+
+    // 对 MFT 失败的卷回退到完整目录遍历
+    for drive in failed_drives {
         let root = format!("{}:\\", drive);
-
-        // 1) 内存缓存命中：毫秒级（之前扫过该盘）
-        if let Some(cached) = flashdir::scan::get_cached_items(&root) {
-            idx.append_scan(drive, &cached);
-            ok_drives.push(drive);
-            let _ = app.emit(
-                "global-search-progress",
-                serde_json::json!({ "drive": drive.to_string(), "scanned": idx.entries_len(), "phase": "ok (cache)", "count": cached.len() }),
-            );
-            continue;
-        }
-
-        // 2) 轻量 MFT 扫描：仅取文件名/路径/大小，跳过聚合/format/排序（3-5s）
-        if let Some(mft_result) = flashdir::fs::try_mft_scan(&root) {
-            let count = mft_result.files.len();
-            idx.append_mft_files(drive, &mft_result.files);
-            ok_drives.push(drive);
-            let _ = app.emit(
-                "global-search-progress",
-                serde_json::json!({ "drive": drive.to_string(), "scanned": idx.entries_len(), "phase": "ok (mft)", "count": count }),
-            );
-            continue;
-        }
-
-        // 3) 完整 scan_directory（回退，同时写缓存供后续命中）
         match flashdir::scan::scan_directory(&root, false, std::sync::Arc::clone(&perf), Some(app.clone()))
             .await
         {
@@ -694,7 +712,7 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
                 ok_drives.push(drive);
                 let _ = app.emit(
                     "global-search-progress",
-                    serde_json::json!({ "drive": drive.to_string(), "scanned": idx.entries_len(), "phase": "ok", "count": result.items.len() }),
+                    serde_json::json!({ "drive": drive.to_string(), "scanned": idx.entries_len(), "phase": "ok (walk)", "count": result.items.len() }),
                 );
             }
             Err(e) => {

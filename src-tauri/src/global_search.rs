@@ -5,6 +5,7 @@
 // 后续搜索仅为内存过滤；刷新通过 global_search_ensure_index / refresh 全量重建。
 
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::RwLock;
@@ -20,10 +21,20 @@ pub struct IndexEntry {
     /// 小写文件名（搜索用，避免每次搜索对全量 name 做 to_lowercase）
     #[serde(skip)]
     pub name_lower: String,
+    /// 缓存的小写扩展名（不含点），用于加速 `ext:` 过滤
+    #[serde(skip)]
+    pub ext: String,
     pub size: i64,
     pub is_dir: bool,
     /// 文件修改时间（Windows FILETIME 转换而来的 Unix 时间戳，目录为 0）
     pub mtime: i64,
+}
+
+/// 从文件名提取小写扩展名（不含点）；无扩展名返回空字符串。
+fn extension_of(name: &str) -> String {
+    name.rsplit_once('.')
+        .map(|(_, ext)| ext.to_lowercase())
+        .unwrap_or_default()
 }
 
 /// 索引就绪时的元数据（独立 struct：enum 级 rename_all 在 serde 里只作用于 variant 名，
@@ -313,6 +324,7 @@ impl GlobalIndex {
                     path: normalize_abs_path(drive, &f.path),
                     name: name.clone(),
                     name_lower: name.to_lowercase(),
+                    ext: extension_of(&name),
                     size: f.size as i64,
                     is_dir: f.is_dir,
                     mtime: f.mtime,
@@ -338,6 +350,7 @@ impl GlobalIndex {
                     path: normalize_abs_path(drive, item.path.as_str()),
                     name: name.clone(),
                     name_lower: name.to_lowercase(),
+                    ext: extension_of(&name),
                     size: item.size,
                     is_dir: item.is_dir,
                     mtime: item.mtime,
@@ -361,14 +374,30 @@ impl GlobalIndex {
         drop(meta);
         self.update_ready_state();
 
-        // 后台线程把全量索引持久化到 SQLite，不阻塞状态返回
-        let entries: Vec<IndexEntry> = self.entries.read().values().cloned().collect();
+        // 流式持久化：后台 SQLite 写入，前台分批发送，避免整表 clone
+        let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            match crate::disk_cache::DiskCache::instance().save_global_index_batch(&entries) {
-                Ok(_) => eprintln!("[GlobalIndex] 已持久化 {} 条索引", entries.len()),
+            match crate::disk_cache::DiskCache::instance().save_global_index_stream(rx) {
+                Ok(_) => eprintln!("[GlobalIndex] 已持久化全局索引"),
                 Err(e) => eprintln!("[GlobalIndex] 持久化失败: {}", e),
             }
         });
+
+        const CHUNK_SIZE: usize = 5000;
+        {
+            let entries = self.entries.read();
+            let mut chunk = Vec::with_capacity(CHUNK_SIZE);
+            for entry in entries.values() {
+                chunk.push(entry.clone());
+                if chunk.len() >= CHUNK_SIZE {
+                    let _ = tx.send(std::mem::take(&mut chunk));
+                }
+            }
+            if !chunk.is_empty() {
+                let _ = tx.send(chunk);
+            }
+        }
+        drop(tx);
     }
 
     /// 将主界面某次扫描的结果追加到全局索引（复用已验证可用的 scan_dir 结果）。
@@ -376,8 +405,10 @@ impl GlobalIndex {
         let path_base = scan_path.trim_end_matches('/').trim_end_matches('\\');
         let path_base_lower = path_base.to_lowercase();
 
-        // 先移除该路径下已有的条目，避免重复
-        self.remove_prefix_internal(&format!("{}/", path_base));
+        // 先移除该路径下已有的条目，避免重复（内存 + 磁盘同步移除）
+        let prefix = format!("{}/", path_base);
+        self.remove_prefix_internal(&prefix);
+        let _ = crate::disk_cache::DiskCache::instance().remove_global_index_by_prefix(&prefix);
 
         let batch: Vec<IndexEntry> = items
             .iter()
@@ -394,12 +425,17 @@ impl GlobalIndex {
                     path: abs_path,
                     name: name.clone(),
                     name_lower: name.to_lowercase(),
+                    ext: extension_of(&name),
                     size: item.size,
                     is_dir: item.is_dir,
                     mtime: item.mtime,
                 }
             })
             .collect();
+
+        // 增量持久化到磁盘，避免全量重建
+        let _ = crate::disk_cache::DiskCache::instance().upsert_global_index_entries(&batch);
+
         self.upsert_batch_internal(batch);
 
         // 保留已有的盘符元数据，仅更新计数
@@ -795,18 +831,7 @@ fn apply_filters(entry: &IndexEntry, filters: &[SearchFilter]) -> bool {
             SearchFilterKind::Name(n) => entry.name_lower.contains(n),
             SearchFilterKind::Prefix(p) => entry.name_lower.starts_with(p),
             SearchFilterKind::Suffix(s) => entry.name_lower.ends_with(s),
-            SearchFilterKind::Ext(e) => {
-                if entry.is_dir {
-                    false
-                } else {
-                    entry
-                        .name
-                        .to_lowercase()
-                        .rsplit_once('.')
-                        .map(|(_, ext)| ext == e)
-                        .unwrap_or(false)
-                }
-            }
+            SearchFilterKind::Ext(e) => !entry.is_dir && entry.ext == *e,
             SearchFilterKind::Dir(d) => entry.path.to_lowercase().contains(d),
             SearchFilterKind::Type { is_dir } => entry.is_dir == *is_dir,
             SearchFilterKind::Size { op, bytes } => compare_op(entry.size, *op, *bytes),
@@ -1004,6 +1029,7 @@ mod tests {
             path: "C:/docs/report.pdf".to_string(),
             name: "report.pdf".to_string(),
             name_lower: "report.pdf".to_string(),
+            ext: "pdf".to_string(),
             size: 1024 * 1024,
             is_dir: false,
             mtime: 0,
@@ -1033,6 +1059,7 @@ mod tests {
             path: "C:/docs/report_2024.pdf".to_string(),
             name: "report_2024.pdf".to_string(),
             name_lower: "report_2024.pdf".to_string(),
+            ext: "pdf".to_string(),
             size: 1024,
             is_dir: false,
             mtime: 0,
@@ -1092,6 +1119,7 @@ mod tests {
                 path: format!("C:/docs/{}", name),
                 name: name.to_string(),
                 name_lower: name.to_string(),
+                ext: name.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default(),
                 size: 1024,
                 is_dir: false,
                 mtime: 0,
@@ -1122,6 +1150,7 @@ mod tests {
             path: "C:/a.txt".to_string(),
             name: "a.txt".to_string(),
             name_lower: "a.txt".to_string(),
+            ext: "txt".to_string(),
             size: 100,
             is_dir: false,
             mtime: 0,
@@ -1130,6 +1159,7 @@ mod tests {
             path: "C:/ab.txt".to_string(),
             name: "ab.txt".to_string(),
             name_lower: "ab.txt".to_string(),
+            ext: "txt".to_string(),
             size: 200,
             is_dir: false,
             mtime: 0,
