@@ -9,7 +9,6 @@
 pub mod cancel;
 pub mod scan;
 pub mod perf;
-pub mod watcher;
 pub mod disk_cache;
 pub mod fs;
 pub mod dev_analyzer;

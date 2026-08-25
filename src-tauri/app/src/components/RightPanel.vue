@@ -21,12 +21,6 @@
         :dir-count="dirCount"
         :top-files="topFiles"
       />
-      <Treemap
-        v-else-if="activeTab === 'treemap'"
-        :items="items"
-        :total-size="totalSize"
-        :current-path="currentPath"
-      />
       <DevAnalyzer
         v-else-if="activeTab === 'dev'"
         :items="items"
@@ -50,14 +44,12 @@
 
 <script setup>
 import StatsTab from './StatsTab.vue'
-import Treemap from './Treemap.vue'
 import DevAnalyzer from './DevAnalyzer.vue'
 import SnapshotCompare from './SnapshotCompare.vue'
 import DuplicateFinder from './DuplicateFinder.vue'
 
 const tabs = [
   { key: 'stats', label: '总览' },
-  { key: 'treemap', label: '热图' },
   { key: 'dev', label: '开发者' },
   { key: 'snapshots', label: '快照' },
   { key: 'duplicates', label: '重复' },
@@ -89,29 +81,37 @@ defineEmits(['update:activeTab'])
 }
 .fd-panel-tabs {
   display: flex;
+  gap: 6px;
+  padding: 8px;
   border-bottom: 1px solid var(--fd-border);
+  background: var(--fd-bg-1);
   flex-shrink: 0;
 }
 .fd-panel-tab {
   flex: 1;
-  padding: 6px 0;
+  padding: 5px 0;
   border: none;
   background: transparent;
   color: var(--fd-text-2);
-  font-size: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .4px;
+  text-transform: uppercase;
   cursor: pointer;
-  border-bottom: 2px solid transparent;
-  margin-bottom: -1px;
+  border-radius: 6px;
+  transition: background .12s ease, color .12s ease;
 }
-.fd-panel-tab:hover { color: var(--fd-text-1); }
-.fd-panel-tab.active {
-  color: var(--fd-text-0);
-  border-bottom-color: var(--fd-accent);
+.fd-panel-tab:hover {
   background: var(--fd-bg-2);
+  color: var(--fd-text-0);
+}
+.fd-panel-tab.active {
+  background: var(--fd-selected);
+  color: #fff;
 }
 .fd-panel-body {
   flex: 1;
   overflow: auto;
-  padding: 10px;
+  padding: 12px;
 }
 </style>

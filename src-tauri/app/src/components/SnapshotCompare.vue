@@ -1,6 +1,5 @@
 <template>
   <div class="snapshot-panel">
-    <div class="snapshot-panel-header">快照对比</div>
     <div class="snapshot-panel-content">
       <!-- 操作区 -->
       <div class="snapshot-actions">
@@ -372,10 +371,6 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-}
-
-.snapshot-panel-header {
-  display: none; /* handled by parent tabs */
 }
 
 .snapshot-panel-content {

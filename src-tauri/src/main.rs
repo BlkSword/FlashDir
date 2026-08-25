@@ -13,10 +13,50 @@ mod commands;
 
 use flashdir::scan;
 use flashdir::global_search;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 struct AppState {
     history: Mutex<VecDeque<scan::HistoryItem>>,
+    tray: Mutex<Option<tauri::tray::TrayIcon>>,
+}
+
+
+fn toggle_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+        } else {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+    }
+}
+
+fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+
+    let show_item = MenuItem::with_id(app, "show", "显示/隐藏主窗口", true, None::<&str>)?;
+    let quit_item = MenuItem::with_id(app, "quit", "退出 FlashDir", true, None::<&str>)?;
+
+    let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+    let tray = TrayIconBuilder::with_id("flashdir-tray")
+        .icon(app.default_window_icon().cloned().expect("default window icon"))
+        .tooltip("FlashDir")
+        .menu(&menu)
+        .show_menu_on_left_click(true)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => toggle_main_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .build(app)?;
+
+    let state = app.state::<AppState>();
+    *state.tray.lock() = Some(tray);
+    Ok(())
 }
 
 #[tokio::main]
@@ -29,9 +69,27 @@ async fn main() {
         .plugin(tauri_plugin_fs::init())
         .manage(AppState {
             history: Mutex::new(commands::load_history_from_file_sync()),
+            tray: Mutex::new(None),
         })
         .setup(|app| {
             let app_handle = app.handle().clone();
+
+            // 关闭主窗口 = 最小化到系统托盘
+            if let Some(main_window) = app_handle.get_webview_window("main") {
+                let main_window_for_event = main_window.clone();
+                main_window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = main_window_for_event.hide();
+                    }
+                });
+            }
+
+            // 创建系统托盘
+            if let Err(e) = setup_tray(&app_handle) {
+                eprintln!("[Tray] 创建托盘失败: {}", e);
+            }
+
             tauri::async_runtime::spawn(async move {
                 let idx = global_search::instance();
 
@@ -120,9 +178,6 @@ async fn main() {
             commands::get_diagnostics,
             commands::is_admin,
             commands::cancel_scan,
-            commands::start_watch,
-            commands::stop_watch,
-            commands::watch_status,
             commands::open_path,
             commands::is_directory,
             commands::restart_as_admin,

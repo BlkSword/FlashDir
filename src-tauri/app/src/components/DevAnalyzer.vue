@@ -1,6 +1,5 @@
 <template>
   <div class="dev-panel" v-if="hasData">
-    <div class="dev-panel-header">开发者分析</div>
     <div class="dev-panel-content">
       <!-- 概览卡片 -->
       <div class="dev-summary" v-if="devData">
@@ -167,15 +166,6 @@ analyze()
   display: flex;
   flex-direction: column;
   overflow: hidden;
-}
-
-.dev-panel-header {
-  padding: 12px 16px;
-  font-size: 14px;
-  font-weight: 600;
-  border-bottom: 1px solid var(--fd-border);
-  background: var(--fd-bg-1);
-  color: var(--fd-text-0);
 }
 
 .dev-panel-content {

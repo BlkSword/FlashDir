@@ -432,25 +432,6 @@ pub fn is_admin() -> bool {
 pub fn cancel_scan() {
     flashdir::cancel::request();
 }
-
-/// 开始监听指定目录的变更（内部定期 USN 增量刷新）
-#[command]
-pub fn start_watch(app: tauri::AppHandle, path: String) {
-    flashdir::watcher::start(app, path);
-}
-
-/// 停止目录变更监听
-#[command]
-pub fn stop_watch() {
-    flashdir::watcher::stop();
-}
-
-/// 查询目录变更监听状态
-#[command]
-pub fn watch_status() -> bool {
-    flashdir::watcher::is_active()
-}
-
 /// 以管理员权限重启应用
 #[command]
 pub fn restart_as_admin() -> bool {
