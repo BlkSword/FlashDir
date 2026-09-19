@@ -1,5 +1,20 @@
 # FlashDir Release Notes
 
+## Unreleased（四）—— 缓存读取与索引内存再优化
+
+### 磁盘缓存：blob 移出 SQLite
+- blob 改存 `~/.flashdir/blobs/<fnv64>.bin`（含 magic/version/path 头，原子写、读取校验），
+  SQLite 只留元信息：实测 72MB 文件顺序读 **24ms**、305k 条完整加载 **158ms**
+- 缓存命中 **0.83s → 0.40-0.50s**；WAL 峰值 **274MB → 186KB**；
+  VACUUM 后 DB **519MB → 371MB**；淘汰/TTL/clear 同步删文件，启动清理孤儿文件
+- 修 bug：全量扫描前的级联失效会把 `C:/` 之下所有目录缓存一起删掉
+  （实测扫 C:/ 后 C:/Windows、C:/Users 的 blob 全被清空）
+
+### 全局索引：再省 25% 内存
+- `IndexEntry` 去掉 `name`/`ext` 字段（name 序列化时由 path 派生、ext 过滤时现算）
+- 路径索引 key 由 `String` 改为 **128 位哈希**（命中后用 arena 内 path 校验）
+- GUI 常驻 **673MB → 506MB**（最初 938MB-1.5GB）；索引构建 **1.08s → 0.67s**
+
 ## Unreleased（三）—— 性能专项（实测驱动）
 
 > 所有改动都有 before/after 实测；完整数据见 README「性能实测」。
