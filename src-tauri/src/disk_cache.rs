@@ -16,7 +16,8 @@ pub struct DiskCache {
     /// SQLite 连接；None 表示降级模式
     conn: Mutex<Option<Connection>>,
     max_size_mb: usize,
-    current_size_mb: Mutex<usize>,
+    /// 当前缓存字节数（以字节为单位维护，删除时同步回退）
+    current_bytes: Mutex<u64>,
 }
 
 static DISK_CACHE: OnceLock<Arc<DiskCache>> = OnceLock::new();
@@ -38,7 +39,7 @@ impl DiskCache {
         Self {
             conn: Mutex::new(None),
             max_size_mb: 500,
-            current_size_mb: Mutex::new(0),
+            current_bytes: Mutex::new(0),
         }
     }
 
@@ -69,10 +70,17 @@ impl DiskCache {
                 created_at INTEGER NOT NULL,
                 size INTEGER NOT NULL,
                 mft_available INTEGER NOT NULL,
-                item_count INTEGER NOT NULL
+                item_count INTEGER NOT NULL,
+                verified_usn INTEGER NOT NULL DEFAULT 0
             )",
             [],
         )?;
+
+        // 兼容旧库：缺少 verified_usn 列时补上
+        let _ = conn.execute(
+            "ALTER TABLE scan_meta ADD COLUMN verified_usn INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS scan_items (
@@ -150,6 +158,15 @@ impl DiskCache {
             [],
         )?;
 
+        // 全局索引元数据（是否为全盘构建 / 盘符列表），用于重启后恢复状态语义
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS index_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )",
+            [],
+        )?;
+
         let current_size: i64 = conn
             .query_row("SELECT COALESCE(SUM(size), 0) FROM scan_meta", [], |row| row.get(0))
             .unwrap_or(0);
@@ -157,7 +174,7 @@ impl DiskCache {
         let cache = Self {
             conn: Mutex::new(Some(conn)),
             max_size_mb: 500,
-            current_size_mb: Mutex::new((current_size / 1024 / 1024) as usize),
+            current_bytes: Mutex::new(current_size.max(0) as u64),
         };
 
         cache.cleanup_old_entries()?;
@@ -176,31 +193,159 @@ impl DiskCache {
         Ok(path)
     }
 
-    pub fn get(&self, path: &str, dir_mtime: i64) -> Option<ScanResult> {
+    /// 按目录 mtime 读取缓存，返回 (扫描结果, 已校验 USN)
+    pub fn get_with_usn(&self, path: &str, dir_mtime: i64) -> Option<(ScanResult, i64)> {
         let guard = self.conn.lock();
         let conn = guard.as_ref()?;
         Self::load_scan(conn, path, dir_mtime, false)
     }
 
-    /// \u83b7\u53d6\u7f13\u5b58\u7684\u626b\u63cf\u7ed3\u679c\uff0c\u5ffd\u7565 mtime \u68c0\u67e5\uff08\u7528\u4e8e USN \u589e\u91cf\u66f4\u65b0\uff09
-    pub fn get_stale(&self, path: &str) -> Option<ScanResult> {
+    /// 忽略 mtime 检查读取缓存（用于 USN 增量校验的基底）
+    pub fn get_stale_with_usn(&self, path: &str) -> Option<(ScanResult, i64)> {
         let guard = self.conn.lock();
         let conn = guard.as_ref()?;
         Self::load_scan(conn, path, 0, true)
     }
 
-    fn load_scan(conn: &Connection, path: &str, dir_mtime: i64, ignore_mtime: bool) -> Option<ScanResult> {
-        let meta: Option<(i64, i64)> = conn
+    /// 只读取"已校验 USN"，避免为了判断是否需要增量而加载全部条目
+    pub fn verified_usn(&self, path: &str) -> Option<i64> {
+        let guard = self.conn.lock();
+        let conn = guard.as_ref()?;
+        conn.query_row(
+            "SELECT verified_usn FROM scan_meta WHERE scan_path = ?1",
+            params![path],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// 估算一批条目在缓存中的字节占用（含固定开销）
+    fn estimate_items_size(items: &[Item]) -> usize {
+        items
+            .iter()
+            .map(|i| i.path.len() + i.name.len() + i.size_formatted.len() + 48)
+            .sum::<usize>()
+            + 128
+    }
+
+    /// USN 增量写回：只写变更的行，避免为了几十条变更重写整份目录缓存
+    /// （百万级条目的整份重写会带来秒级延迟与大量 WAL 写入）。
+    ///
+    /// 返回 `Ok(false)` 表示基底行已不存在（缓存被淘汰），调用方应回退整份写入。
+    pub fn apply_items_delta(
+        &self,
+        path: &str,
+        removed_paths: &[String],
+        upserted: &[Item],
+        mft_available: bool,
+        dir_mtime: i64,
+        verified_usn: i64,
+    ) -> Result<bool> {
+        let added_size = Self::estimate_items_size(upserted) as i64;
+        let removed_size: i64 = removed_paths
+            .iter()
+            .map(|p| (p.len() + 48) as i64)
+            .sum();
+
+        let mut guard = self.conn.lock();
+        let conn = guard.as_mut().ok_or_else(Self::disabled_err)?;
+        let tx = conn.transaction()?;
+
+        let base_exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM scan_meta WHERE scan_path = ?1",
+            params![path],
+            |row| row.get(0),
+        )?;
+        if base_exists == 0 {
+            // 事务未提交，drop 时自动回滚
+            return Ok(false);
+        }
+
+        {
+            let mut del = tx.prepare(
+                "DELETE FROM scan_items WHERE scan_path = ?1 AND path = ?2",
+            )?;
+            for removed in removed_paths {
+                del.execute(params![path, removed.as_str()])?;
+            }
+
+            let mut upsert = tx.prepare(
+                "INSERT OR REPLACE INTO scan_items
+                 (scan_path, path, name, size, size_formatted, is_dir, mtime)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for item in upserted {
+                upsert.execute(params![
+                    path,
+                    item.path.as_str(),
+                    item.name.as_str(),
+                    item.size,
+                    item.size_formatted.as_str(),
+                    item.is_dir as i64,
+                    item.mtime,
+                ])?;
+            }
+        }
+
+        // item_count / size 为近似值（用于统计与容量控制，不参与正确性）
+        let item_delta = upserted.len() as i64 - removed_paths.len() as i64;
+        tx.execute(
+            "UPDATE scan_meta
+             SET dir_mtime = ?1,
+                 mft_available = ?2,
+                 verified_usn = ?3,
+                 created_at = ?4,
+                 item_count = MAX(item_count + ?5, 0),
+                 size = MAX(size + ?6, 0)
+             WHERE scan_path = ?7",
+            params![
+                dir_mtime,
+                mft_available as i64,
+                verified_usn.max(0),
+                chrono::Utc::now().timestamp(),
+                item_delta,
+                added_size - removed_size,
+                path,
+            ],
+        )?;
+
+        tx.commit()?;
+        Self::refresh_size_counter(conn, &self.current_bytes);
+        Ok(true)
+    }
+
+    /// USN 校验通过后刷新有效期与已校验 USN（不重写条目）
+    pub fn touch_meta(&self, path: &str, dir_mtime: i64, verified_usn: i64) -> Result<()> {
+        let guard = self.conn.lock();
+        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
+        conn.execute(
+            "UPDATE scan_meta
+             SET dir_mtime = ?1, verified_usn = MAX(verified_usn, ?2), created_at = ?3
+             WHERE scan_path = ?4",
+            params![dir_mtime, verified_usn, chrono::Utc::now().timestamp(), path],
+        )?;
+        Ok(())
+    }
+
+    fn load_scan(
+        conn: &Connection,
+        path: &str,
+        dir_mtime: i64,
+        ignore_mtime: bool,
+    ) -> Option<(ScanResult, i64)> {
+        let meta: Option<(i64, i64, i64)> = conn
             .query_row(
-                "SELECT dir_mtime, mft_available FROM scan_meta WHERE scan_path = ?1",
+                "SELECT dir_mtime, mft_available, verified_usn FROM scan_meta WHERE scan_path = ?1",
                 params![path],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .ok()
             .flatten();
 
-        let (cached_mtime, mft_available) = meta?;
+        let (cached_mtime, mft_available, verified_usn) = meta?;
         if !ignore_mtime && cached_mtime < dir_mtime {
             return None;
         }
@@ -233,25 +378,32 @@ impl DiskCache {
         let items: Vec<Item> = rows.filter_map(|r| r.ok()).collect();
         let total_size: i64 = items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum();
 
-        Some(ScanResult {
-            items,
-            total_size,
-            total_size_formatted: crate::scan::format_size(total_size),
-            scan_time: 0.0,
-            path: CompactString::from(path),
-            mft_available: mft_available != 0,
-            timing: None,
-            perf_metrics: None,
-        })
+        Some((
+            ScanResult {
+                items,
+                total_size,
+                total_size_formatted: crate::scan::format_size(total_size),
+                scan_time: 0.0,
+                path: CompactString::from(path),
+                mft_available: mft_available != 0,
+                timing: None,
+                perf_metrics: None,
+            },
+            verified_usn.max(0),
+        ))
     }
 
-    pub fn insert(&self, path: &str, result: &ScanResult, dir_mtime: i64) -> Result<()> {
-        let data_size: usize = result
-            .items
-            .iter()
-            .map(|i| i.path.len() + i.name.len() + i.size_formatted.len() + 48)
-            .sum::<usize>()
-            + 128;
+    /// 写入某目录的完整扫描结果。
+    /// `verified_usn` 表示这份数据已被 USN 校验到的位置（0 = 未知）。
+    pub fn insert(
+        &self,
+        path: &str,
+        items: &[Item],
+        mft_available: bool,
+        dir_mtime: i64,
+        verified_usn: i64,
+    ) -> Result<()> {
+        let data_size: usize = Self::estimate_items_size(items);
 
         self.maybe_cleanup(data_size)?;
 
@@ -268,7 +420,7 @@ impl DiskCache {
                  (scan_path, path, name, size, size_formatted, is_dir, mtime)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
-            for item in &result.items {
+            for item in items {
                 stmt.execute(params![
                     path,
                     item.path.as_str(),
@@ -283,49 +435,70 @@ impl DiskCache {
 
         tx.execute(
             "INSERT OR REPLACE INTO scan_meta
-             (scan_path, dir_mtime, created_at, size, mft_available, item_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (scan_path, dir_mtime, created_at, size, mft_available, item_count, verified_usn)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 path,
                 dir_mtime,
                 chrono::Utc::now().timestamp(),
                 data_size as i64,
-                result.mft_available as i64,
-                result.items.len() as i64,
+                mft_available as i64,
+                items.len() as i64,
+                verified_usn.max(0),
             ],
         )?;
 
         tx.commit()?;
 
-        let mut current = self.current_size_mb.lock();
-        *current += data_size / 1024 / 1024;
+        // 以数据库真实值为准同步内存计数，避免长期漂移
+        if let Ok(total) = conn.query_row(
+            "SELECT COALESCE(SUM(size), 0) FROM scan_meta",
+            [],
+            |row| row.get::<_, i64>(0),
+        ) {
+            *self.current_bytes.lock() = total.max(0) as u64;
+        }
 
         Ok(())
     }
 
-    pub fn get_derived(&self, child_path: &str, _dir_mtime: i64) -> Option<ScanResult> {
+    /// 从上层目录的磁盘缓存推导子目录结果。
+    ///
+    /// 新鲜度：仅当"父缓存写入时间 >= 子目录自身 mtime"时才允许推导，
+    /// 否则子目录可能在上层扫描之后发生过变更，必须走完整的缓存/USN/扫描链路。
+    /// 返回 (扫描结果, 父缓存已校验 USN)。
+    pub fn get_derived(&self, child_path: &str, dir_mtime: i64) -> Option<(ScanResult, i64)> {
         let guard = self.conn.lock();
         let conn = guard.as_ref()?;
 
         let mut stmt = conn
-            .prepare("SELECT scan_path, mft_available FROM scan_meta")
+            .prepare("SELECT scan_path, mft_available, created_at, verified_usn FROM scan_meta")
             .ok()?;
-        let metas: Vec<(String, i64)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        let metas: Vec<(String, i64, i64, i64)> = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .ok()?
             .filter_map(|r| r.ok())
             .collect();
 
-        let mut best: Option<(String, i64)> = None;
-        for (scan_path, mft_available) in metas {
+        let mut best: Option<(String, i64, i64, i64)> = None;
+        for (scan_path, mft_available, created_at, verified_usn) in metas {
             if scan_path.len() < child_path.len() && is_same_or_child(&scan_path, child_path) {
-                if best.as_ref().map_or(true, |b| scan_path.len() > b.0.len()) {
-                    best = Some((scan_path, mft_available));
+                if best
+                    .as_ref()
+                    .map_or(true, |b| scan_path.len() > b.0.len())
+                {
+                    best = Some((scan_path, mft_available, created_at, verified_usn));
                 }
             }
         }
 
-        let (scan_path, mft_available) = best?;
+        let (scan_path, mft_available, created_at, verified_usn) = best?;
+        // 父缓存写入时间早于子目录 mtime：可能已过期，不用推导
+        if created_at < dir_mtime {
+            return None;
+        }
         let prefix = {
             let trimmed = child_path.trim_end_matches('/');
             if trimmed.is_empty() {
@@ -376,16 +549,19 @@ impl DiskCache {
         let items: Vec<Item> = rows.filter_map(|r| r.ok()).collect();
         let total_size: i64 = items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum();
 
-        Some(ScanResult {
-            items,
-            total_size,
-            total_size_formatted: crate::scan::format_size(total_size),
-            scan_time: 0.0,
-            path: CompactString::from(child_path),
-            mft_available: mft_available != 0,
-            timing: None,
-            perf_metrics: None,
-        })
+        Some((
+            ScanResult {
+                items,
+                total_size,
+                total_size_formatted: crate::scan::format_size(total_size),
+                scan_time: 0.0,
+                path: CompactString::from(child_path),
+                mft_available: mft_available != 0,
+                timing: None,
+                perf_metrics: None,
+            },
+            verified_usn.max(0),
+        ))
     }
 
     fn cleanup_old_entries(&self) -> Result<()> {
@@ -406,35 +582,71 @@ impl DiskCache {
             params![cutoff.timestamp()],
         )?;
 
+        Self::refresh_size_counter(conn, &self.current_bytes);
         Ok(())
     }
 
+    /// 以数据库为准刷新内存中的缓存字节计数
+    fn refresh_size_counter(conn: &Connection, counter: &Mutex<u64>) {
+        if let Ok(total) = conn.query_row(
+            "SELECT COALESCE(SUM(size), 0) FROM scan_meta",
+            [],
+            |row| row.get::<_, i64>(0),
+        ) {
+            *counter.lock() = total.max(0) as u64;
+        }
+    }
+
+    /// 容量控制：超限时按最久未访问顺序删除整份目录缓存。
+    ///
+    /// 早期实现把"需要回收的 MB 数"当作行数 LIMIT 使用，且删除后不回退
+    /// 内存计数，导致计数只增不减、之后每次写入都触发淘汰（缓存抖动）。
     fn maybe_cleanup(&self, new_entry_size: usize) -> Result<()> {
-        let max_bytes = self.max_size_mb * 1024 * 1024;
-        let new_size = *self.current_size_mb.lock() * 1024 * 1024 + new_entry_size;
-
-        if new_size > max_bytes {
-            let guard = self.conn.lock();
-            let Some(conn) = guard.as_ref() else {
-                return Ok(());
-            };
-
-            let to_remove = (new_size - max_bytes + max_bytes / 4) / 1024 / 1024;
-
-            conn.execute(
-                "DELETE FROM scan_items WHERE scan_path IN (
-                    SELECT scan_path FROM scan_meta ORDER BY created_at ASC LIMIT ?1
-                 )",
-                params![to_remove.max(1)],
-            )?;
-            conn.execute(
-                "DELETE FROM scan_meta WHERE scan_path IN (
-                    SELECT scan_path FROM scan_meta ORDER BY created_at ASC LIMIT ?1
-                 )",
-                params![to_remove.max(1)],
-            )?;
+        let max_bytes = (self.max_size_mb as u64) * 1024 * 1024;
+        let current = *self.current_bytes.lock();
+        let projected = current.saturating_add(new_entry_size as u64);
+        if projected <= max_bytes {
+            return Ok(());
         }
 
+        // 回收到容量的 75%，留出 25% 余量，避免每次写入都触发淘汰
+        let target = max_bytes - max_bytes / 4;
+
+        let mut guard = self.conn.lock();
+        let Some(conn) = guard.as_mut() else {
+            return Ok(());
+        };
+
+        let tx = conn.transaction()?;
+        {
+            let mut stmt =
+                tx.prepare("SELECT scan_path, size FROM scan_meta ORDER BY created_at ASC")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+
+            let mut victims: Vec<String> = Vec::new();
+            let mut remaining = projected;
+            for row in rows {
+                if remaining <= target {
+                    break;
+                }
+                let (victim_path, victim_size) = row?;
+                remaining = remaining.saturating_sub(victim_size.max(0) as u64);
+                victims.push(victim_path);
+            }
+
+            for victim in &victims {
+                tx.execute(
+                    "DELETE FROM scan_items WHERE scan_path = ?1",
+                    params![victim],
+                )?;
+                tx.execute("DELETE FROM scan_meta WHERE scan_path = ?1", params![victim])?;
+            }
+        }
+        tx.commit()?;
+
+        Self::refresh_size_counter(conn, &self.current_bytes);
         Ok(())
     }
 
@@ -443,7 +655,7 @@ impl DiskCache {
         let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         conn.execute("DELETE FROM scan_items", [])?;
         conn.execute("DELETE FROM scan_meta", [])?;
-        *self.current_size_mb.lock() = 0;
+        *self.current_bytes.lock() = 0;
         Ok(())
     }
 
@@ -498,20 +710,26 @@ impl DiskCache {
             "DELETE FROM scan_meta WHERE scan_path = ?1 OR scan_path LIKE ?2 ESCAPE '\\'",
             params![path, path_child_pattern(path)],
         )?;
+        Self::refresh_size_counter(conn, &self.current_bytes);
         Ok(())
     }
 
     // ─── 快照操作 ──────────────────────────────────────────
 
-    /// 保存一次扫描结果作为快照
+    /// 保存一次扫描结果作为快照。
+    ///
+    /// 只序列化条目列表（`Vec<Item>`），总量/格式化文本等元信息以列形式存储，
+    /// 避免整包 `ScanResult` 里的重复字段。
     pub fn insert_snapshot(
         &self,
         path: &str,
-        result: &ScanResult,
+        items: &[Item],
+        total_size: i64,
+        total_size_formatted: &str,
         file_count: usize,
         dir_count: usize,
     ) -> Result<i64> {
-        let data = bincode::serialize(result)?;
+        let data = bincode::serialize(items)?;
         let now = chrono::Utc::now().timestamp();
 
         let guard = self.conn.lock();
@@ -523,9 +741,9 @@ impl DiskCache {
                 path,
                 now,
                 data,
-                result.total_size,
-                result.total_size_formatted.as_str(),
-                result.items.len(),
+                total_size,
+                total_size_formatted,
+                items.len(),
                 file_count,
                 dir_count,
             ],
@@ -580,21 +798,40 @@ impl DiskCache {
     }
 
     /// 获取指定 ID 的快照完整数据
+    /// 读取快照完整数据。
+    /// 新格式只存 `Vec<Item>`，总数/路径等来自 meta 列；
+    /// 同时兼容旧版本存储的整包 `ScanResult`。
     pub fn get_snapshot(&self, id: i64) -> Option<ScanResult> {
         let guard = self.conn.lock();
         let conn = guard.as_ref()?;
 
-        let data: Option<Vec<u8>> = conn
+        let row: Option<(String, i64, String, Vec<u8>)> = conn
             .query_row(
-                "SELECT data FROM snapshots WHERE id = ?1",
+                "SELECT path, total_size, total_size_formatted, data FROM snapshots WHERE id = ?1",
                 params![id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .ok()
             .flatten();
 
-        data.and_then(|d| bincode::deserialize(&d).ok())
+        let (path, total_size, size_formatted, data) = row?;
+
+        if let Ok(items) = bincode::deserialize::<Vec<Item>>(&data) {
+            return Some(ScanResult {
+                items,
+                total_size,
+                total_size_formatted: CompactString::from(size_formatted.as_str()),
+                scan_time: 0.0,
+                path: CompactString::from(path.as_str()),
+                mft_available: false,
+                timing: None,
+                perf_metrics: None,
+            });
+        }
+
+        // 旧格式回退
+        bincode::deserialize::<ScanResult>(&data).ok()
     }
 
     /// 删除指定快照
@@ -631,37 +868,6 @@ impl DiskCache {
         Ok(entries)
     }
 
-    /// 全量重建全局索引时批量写入（事务内先清空再插入）
-    pub fn save_global_index_batch(&self, entries: &[IndexEntry]) -> Result<()> {
-        let mut guard = self.conn.lock();
-        let conn = guard.as_mut().ok_or_else(Self::disabled_err)?;
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM global_index", [])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO global_index
-                 (path, name, name_lower, ext, size, is_dir, drive, mtime, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            )?;
-            for e in entries {
-                let drive = Self::extract_drive(&e.path).unwrap_or('?').to_string();
-                stmt.execute(params![
-                    e.path,
-                    e.name,
-                    e.name_lower,
-                    e.ext,
-                    e.size,
-                    e.is_dir as i64,
-                    drive,
-                    e.mtime,
-                    chrono::Utc::now().timestamp(),
-                ])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
     /// 流式全量重建：避免把整个内存索引 clone 成一个大 Vec 再写入。
     pub fn save_global_index_stream(
         &self,
@@ -696,30 +902,6 @@ impl DiskCache {
             }
         }
         tx.commit()?;
-        Ok(())
-    }
-
-    /// 单条 upsert（USN 增量同步）
-    pub fn upsert_global_index_entry(&self, entry: &IndexEntry) -> Result<()> {
-        let guard = self.conn.lock();
-        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
-        let drive = Self::extract_drive(&entry.path).unwrap_or('?').to_string();
-        conn.execute(
-            "INSERT OR REPLACE INTO global_index
-             (path, name, name_lower, ext, size, is_dir, drive, mtime, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                entry.path,
-                entry.name,
-                entry.name_lower,
-                entry.ext,
-                entry.size,
-                entry.is_dir as i64,
-                drive,
-                entry.mtime,
-                chrono::Utc::now().timestamp(),
-            ],
-        )?;
         Ok(())
     }
 
@@ -775,14 +957,6 @@ impl DiskCache {
         Ok(())
     }
 
-    /// 按绝对路径删除条目（USN 删除/重命名旧名称）
-    pub fn remove_global_index_by_path(&self, path: &str) -> Result<()> {
-        let guard = self.conn.lock();
-        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
-        conn.execute("DELETE FROM global_index WHERE path = ?1", params![path])?;
-        Ok(())
-    }
-
     /// 按前缀删除条目（USN 增量失败时重建某路径）
     pub fn remove_global_index_by_prefix(&self, prefix: &str) -> Result<()> {
         let guard = self.conn.lock();
@@ -794,12 +968,29 @@ impl DiskCache {
         Ok(())
     }
 
-    /// 清空全局索引
-    pub fn clear_global_index(&self) -> Result<()> {
+    /// 保存全局索引元数据（JSON），用于重启后恢复"是否全盘构建"等语义
+    pub fn save_index_meta(&self, meta_json: &str) -> Result<()> {
         let guard = self.conn.lock();
         let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
-        conn.execute("DELETE FROM global_index", [])?;
+        conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('meta', ?1)",
+            params![meta_json],
+        )?;
         Ok(())
+    }
+
+    /// 读取全局索引元数据
+    pub fn load_index_meta(&self) -> Option<String> {
+        let guard = self.conn.lock();
+        let conn = guard.as_ref()?;
+        conn.query_row(
+            "SELECT value FROM index_meta WHERE key = 'meta'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
     }
 
     fn extract_drive(path: &str) -> Option<char> {

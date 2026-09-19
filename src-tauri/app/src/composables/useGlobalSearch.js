@@ -100,7 +100,9 @@ export function useGlobalSearch() {
     if (ready.value) {
       const data = state.index.data
       const total = (data?.fileCount || 0) + (data?.dirCount || 0)
-      return `全局索引就绪 · ${total.toLocaleString()} 项`
+      // partial = 只索引了主界面扫描过的目录，不代表全盘
+      const scope = data?.partial ? '（部分目录）' : ''
+      return `全局索引就绪 · ${total.toLocaleString()} 项${scope}`
     }
     return ''
   })

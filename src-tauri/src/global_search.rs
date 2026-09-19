@@ -1,6 +1,6 @@
 // 全局文件搜索索引管理器
 //
-// 复用 fs::try_mft_scan / scan::scan_lite 扫描所有 NTFS 卷，构建常驻内存索引，
+// 复用 fs::try_mft_scan 扫描所有 NTFS 卷，构建常驻内存索引，
 // 支持按文件名毫秒级跨盘搜索（Everything 式）。索引构建一次后常驻，
 // 后续搜索仅为内存过滤；刷新通过 global_search_ensure_index / refresh 全量重建。
 
@@ -48,6 +48,9 @@ pub struct ReadyData {
     /// MFT 扫描失败的盘（需管理员或非 NTFS），以及枚举到的全部 NTFS 盘符（诊断用）
     pub failed_drives: Vec<String>,
     pub all_drives: Vec<String>,
+    /// true = 仅包含"主界面扫描过的目录"，并非全盘索引。
+    /// 前端据此提示"部分目录"，避免用户误以为跨盘搜索已完整。
+    pub partial: bool,
 }
 
 /// 索引状态（前端据 kind 判断）
@@ -60,11 +63,14 @@ pub enum IndexState {
     Failed { reason: String },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 struct IndexMeta {
     drive_count: usize,
     failed_drives: Vec<String>,
     all_drives: Vec<String>,
+    /// 是否由"全盘索引构建"产生（false = 只散落了主界面扫描过的目录）
+    full_build: bool,
 }
 
 pub struct GlobalIndex {
@@ -101,6 +107,12 @@ impl GlobalIndex {
         match crate::disk_cache::DiskCache::instance().load_global_index() {
             Ok(entries) if !entries.is_empty() => {
                 eprintln!("[GlobalIndex] 从磁盘恢复 {} 条索引", entries.len());
+                // 恢复元数据（是否全盘构建 / 盘符列表），否则会把部分索引误判为全盘
+                if let Some(json) = crate::disk_cache::DiskCache::instance().load_index_meta() {
+                    if let Ok(meta) = serde_json::from_str::<IndexMeta>(&json) {
+                        *self.meta.write() = meta;
+                    }
+                }
                 // 一次性批量写入，避免每条一次写锁 + clone
                 self.upsert_batch_internal(entries);
                 self.update_ready_state();
@@ -126,7 +138,16 @@ impl GlobalIndex {
             drive_count: meta.drive_count,
             failed_drives: meta.failed_drives.clone(),
             all_drives: meta.all_drives.clone(),
+            partial: !meta.full_build,
         });
+    }
+
+    /// 持久化索引元数据（重启后可恢复"是否全盘构建"的语义）
+    fn persist_meta(&self) {
+        let meta = self.meta.read().clone();
+        if let Ok(json) = serde_json::to_string(&meta) {
+            let _ = crate::disk_cache::DiskCache::instance().save_index_meta(&json);
+        }
     }
 
     /// 添加或替换一条索引。entries 与 name_index 在同一把锁临界区内更新，
@@ -250,58 +271,6 @@ impl GlobalIndex {
         self.dir_count.store(0, Ordering::Relaxed);
     }
 
-    /// 按文件名搜索（大小写不敏感，包含匹配），取前 limit 条。
-    pub fn search(&self, query: &str, limit: usize) -> Vec<IndexEntry> {
-        let q = query.trim();
-        if q.is_empty() || limit == 0 {
-            return Vec::new();
-        }
-        let q_lower = q.to_lowercase();
-
-        let entries = self.entries.read();
-
-        // 短查询（<=2 字符）分桶效果差，直接用全量并行扫描
-        let results: Vec<IndexEntry> = if q_lower.chars().count() <= 2 {
-            let values: Vec<&IndexEntry> = entries.values().collect();
-            values
-                .par_iter()
-                .filter_map(|e| {
-                    if e.name_lower.contains(&q_lower) {
-                        Some((*e).clone())
-                    } else {
-                        None
-                    }
-                })
-                .take_any(limit)
-                .collect()
-        } else {
-            // 按首字符分桶，仅扫描候选桶
-            let name_index = self.name_index.read();
-            let first_char = q_lower.chars().next().unwrap_or('\0');
-            let candidate_keys: Vec<String> = name_index
-                .get(&first_char)
-                .map(|set| set.iter().cloned().collect())
-                .unwrap_or_default();
-            drop(name_index);
-
-            candidate_keys
-                .par_iter()
-                .filter_map(|key| {
-                    entries.get(key).and_then(|e| {
-                        if e.name_lower.contains(&q_lower) {
-                            Some(e.clone())
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .take_any(limit)
-                .collect()
-        };
-
-        results
-    }
-
     /// 准备开始构建索引（设置 Loading 状态）
     pub fn set_loading(&self) {
         *self.state.write() = IndexState::Loading { drive: String::new(), scanned: 0 };
@@ -366,12 +335,17 @@ impl GlobalIndex {
         };
     }
 
-    /// 所有盘扫描完毕后标记为就绪，并后台持久化到 SQLite
-    pub fn finish_building(&self, drives: &[char]) {
-        let mut meta = self.meta.write();
-        meta.drive_count = drives.len();
-        meta.all_drives = drives.iter().map(|c| c.to_string()).collect();
-        drop(meta);
+    /// 所有盘扫描完毕后标记为就绪，并后台持久化到 SQLite。
+    /// `ok_drives` 为成功建索引的盘，`failed_drives` 为失败/跳过的 NTFS 盘。
+    pub fn finish_building(&self, ok_drives: &[char], failed_drives: &[char]) {
+        {
+            let mut meta = self.meta.write();
+            meta.drive_count = ok_drives.len();
+            meta.all_drives = ok_drives.iter().map(|c| c.to_string()).collect();
+            meta.failed_drives = failed_drives.iter().map(|c| c.to_string()).collect();
+            meta.full_build = true;
+        }
+        self.persist_meta();
         self.update_ready_state();
 
         // 流式持久化：后台 SQLite 写入，前台分批发送，避免整表 clone
@@ -438,8 +412,21 @@ impl GlobalIndex {
 
         self.upsert_batch_internal(batch);
 
-        // 保留已有的盘符元数据，仅更新计数
-        self.update_ready_state();
+        // 状态处理：
+        // - 正在建索引：只更新进度，等 finish_building 统一置 Ready；
+        // - 其它情况：置 Ready，但保留 full_build 标记，
+        //   前端会提示"部分目录"，用户仍可点刷新重建全盘索引。
+        let is_loading = matches!(*self.state.read(), IndexState::Loading { .. });
+        if is_loading {
+            let total = self.entries_len();
+            *self.state.write() = IndexState::Loading {
+                drive: String::new(),
+                scanned: total,
+            };
+        } else {
+            self.update_ready_state();
+        }
+        self.persist_meta();
     }
 
     /// 更新或插入单条条目（供 USN 增量同步使用）
@@ -454,14 +441,6 @@ impl GlobalIndex {
     /// 按绝对路径移除条目（供 USN 增量同步使用）
     pub fn remove_by_path(&self, path: &str) {
         self.remove_path_internal(path);
-        if matches!(*self.state.read(), IndexState::Ready(..)) {
-            self.update_ready_state();
-        }
-    }
-
-    /// 按前缀移除条目（供 USN 增量同步或重建使用）
-    pub fn remove_by_prefix(&self, prefix: &str) {
-        self.remove_prefix_internal(prefix);
         if matches!(*self.state.read(), IndexState::Ready(..)) {
             self.update_ready_state();
         }
@@ -515,9 +494,20 @@ impl GlobalIndex {
     /// 支持 Everything 式过滤语法与相关性排序的搜索。
     /// 过滤语法：ext:zip size:>100MB type:file dir:xxx name:xxx mtime:>7d NOT .tmp
     pub fn search_with_filter(&self, query: &str, limit: usize) -> Vec<IndexEntry> {
+        if limit == 0 {
+            return Vec::new();
+        }
         let filters = parse_search_filter(query);
+        // 过滤条件为空（例如输入只有 AND/OR 或未识别的空 token）：
+        // 直接返回空结果，绝不能退化成"全量按大小返回前 N 条"。
+        if filters.is_empty() {
+            return Vec::new();
+        }
+
+        // 只把"正向文本条件"用于首字符分桶。
+        // 早期实现会取到 `NOT foo` 里的 foo，导致结果被限制在 f 桶内。
         let text = filters.iter().find_map(|f| match &f.kind {
-            SearchFilterKind::Text(t) => Some(t.as_str()),
+            SearchFilterKind::Text(t) if !f.negate => Some(t.as_str()),
             _ => None,
         });
         let q_lower = text.map(|t| t.to_lowercase()).unwrap_or_default();
@@ -576,15 +566,22 @@ impl GlobalIndex {
 
         // 按相关性排序：完全匹配 > 前缀匹配 > 包含匹配，同级按大小降序；
         // 同分按名称/路径字典序兜底，保证同一查询多次搜索结果顺序稳定
-        candidates.sort_unstable_by(|a, b| {
+        let cmp = |a: &IndexEntry, b: &IndexEntry| {
             let sa = relevance_score(a, &q_lower);
             let sb = relevance_score(b, &q_lower);
             sb.cmp(&sa)
                 .then_with(|| a.name_lower.cmp(&b.name_lower))
                 .then_with(|| a.path.cmp(&b.path))
-        });
+        };
 
-        candidates.into_iter().take(limit).collect()
+        // 候选远多于 limit 时先做 O(n) 部分选择，避免对百万级候选做全量排序
+        if candidates.len() > limit {
+            candidates.select_nth_unstable_by(limit, cmp);
+            candidates.truncate(limit);
+        }
+        candidates.sort_unstable_by(cmp);
+
+        candidates
     }
 }
 
@@ -792,7 +789,9 @@ pub fn parse_search_filter(input: &str) -> Vec<SearchFilter> {
                 }
                 "size" => parse_size(value).map(|(op, bytes)| SearchFilterKind::Size { op, bytes }),
                 "mtime" => parse_mtime(value).map(|(op, seconds)| SearchFilterKind::Mtime { op, seconds }),
-                _ => None,
+                // 未识别的 `key:value` 不再被静默丢弃（丢弃会让过滤条件变空，
+                // 进而退化成"返回全量中最大的若干项"），而是按纯文本处理。
+                _ => Some(SearchFilterKind::Text(word.to_lowercase())),
             };
             if let Some(kind) = kind {
                 filters.push(SearchFilter { kind, negate });
@@ -856,6 +855,86 @@ fn compare_op(a: i64, op: FilterOp, b: i64) -> bool {
         FilterOp::Lte => a <= b,
         FilterOp::Eq => a == b,
         FilterOp::Ne => a != b,
+    }
+}
+
+/// 本地（当前目录）过滤：与全局搜索共用同一套 Everything 式语法。
+///
+/// 与 `apply_filters` 的区别：直接作用于 `Item` 的字段，不需要构造 `IndexEntry`；
+/// 且纯文本条件同时匹配"文件名或完整路径"（与 README 的本地过滤说明一致）。
+pub fn item_matches_filters(
+    name: &str,
+    path: &str,
+    size: i64,
+    is_dir: bool,
+    mtime: i64,
+    filters: &[SearchFilter],
+) -> bool {
+    for f in filters {
+        let matched = match &f.kind {
+            SearchFilterKind::Text(t) => {
+                contains_ignore_case(name, t) || contains_ignore_case(path, t)
+            }
+            SearchFilterKind::Name(n) => contains_ignore_case(name, n),
+            SearchFilterKind::Prefix(p) => starts_with_ignore_case_ci(name, p),
+            SearchFilterKind::Suffix(sfx) => ends_with_ignore_case_ci(name, sfx),
+            SearchFilterKind::Ext(e) => !is_dir && extension_matches(name, e),
+            SearchFilterKind::Dir(d) => contains_ignore_case(path, d),
+            SearchFilterKind::Type { is_dir: want_dir } => is_dir == *want_dir,
+            SearchFilterKind::Size { op, bytes } => compare_op(size, *op, *bytes),
+            SearchFilterKind::Mtime { op, seconds } => {
+                let now = chrono::Utc::now().timestamp();
+                compare_op(now - mtime, *op, *seconds)
+            }
+        };
+        if matched == f.negate {
+            return false;
+        }
+    }
+    true
+}
+
+/// 大小写不敏感的包含匹配（ASCII 零分配快速路径 + 非 ASCII 回退）
+fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if haystack.is_ascii() && needle_lower.is_ascii() {
+        let h = haystack.as_bytes();
+        let n = needle_lower.as_bytes();
+        if n.len() > h.len() {
+            return false;
+        }
+        return h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n));
+    }
+    haystack.to_lowercase().contains(needle_lower)
+}
+
+fn starts_with_ignore_case_ci(haystack: &str, prefix_lower: &str) -> bool {
+    if haystack
+        .get(..prefix_lower.len())
+        .is_some_and(|h| h.eq_ignore_ascii_case(prefix_lower))
+    {
+        return true;
+    }
+    !haystack.is_ascii() && haystack.to_lowercase().starts_with(prefix_lower)
+}
+
+fn ends_with_ignore_case_ci(haystack: &str, suffix_lower: &str) -> bool {
+    if haystack.len() >= suffix_lower.len()
+        && haystack
+            .get(haystack.len() - suffix_lower.len()..)
+            .is_some_and(|h| h.eq_ignore_ascii_case(suffix_lower))
+    {
+        return true;
+    }
+    !haystack.is_ascii() && haystack.to_lowercase().ends_with(suffix_lower)
+}
+
+fn extension_matches(name: &str, ext_lower: &str) -> bool {
+    match name.rsplit_once('.') {
+        Some((_, ext)) => ext.eq_ignore_ascii_case(ext_lower),
+        None => false,
     }
 }
 

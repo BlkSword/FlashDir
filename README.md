@@ -28,7 +28,7 @@ USN Journal 增量刷新让重复扫描接近秒级；内置开发者目录分�
 |------|-----------|---------|-------------|-------------|
 | MFT 直读扫描 | ✅ | ✅ | ❌ | ✅ |
 | USN 增量刷新 | ✅ | ❌ | ❌ | ✅ |
-| Treemap 可视化 | ❌ | ✅ | ✅ (最佳) | ✅ |
+| 目录树 / 分页列表 | 一般 | ✅ | ✅ (Treemap 最佳) | ✅ |
 | 开发者目录识别 | ❌ | ❌ | ❌ | ✅ |
 | 快照对比 / 增长追踪 | ❌ | ❌ | ❌ | ✅ |
 | Everything 式过滤 | ✅ | ❌ | ❌ | ✅ |
@@ -58,17 +58,17 @@ USN Journal 增量刷新让重复扫描接近秒级；内置开发者目录分�
 1. 输入目录路径或点击**浏览**选择
 2. 点击**扫描**
 3. 在右侧面板切换视图：
-   - **📊 统计** — 文件类型分布 + Top 5 大文件
-   - **🗺️ 热图** — Canvas Treemap，点击钻入子目录
-   - **🛠️ 开发者** — 自动识别 18 类开发工具目录的空间占用
-   - **📸 快照** — 保存扫描历史、对比任意两次扫描的增长变化
-   - **🔁 重复** — 按大小 + 内容哈希识别重复文件，估算可回收空间
+   - **总览** — 总量/文件数/目录数 + Top 5 大文件
+   - **开发者** — 自动识别 18 类开发工具目录的空间占用
+   - **快照** — 保存扫描历史、对比任意两次扫描的增长变化
+   - **重复** — 按大小 + 内容哈希识别重复文件，估算可回收空间
+4. 工具栏的 **刷新** 按钮会忽略内存/磁盘/USN 缓存，强制重新扫描当前目录
+   （日常"扫描"会优先走缓存与 USN 增量校验）
 4. 点击顶部工具栏的搜索框，或使用 **Ctrl+K** 打开**全局搜索**：
    - 跨盘搜索所有已索引文件
    - 支持 `*.pdf`、`report*`、`*2024`、`ext:zip`、`size:>1GB` 等语法
    - 首次使用需建立全盘索引（约几秒至几十秒）
 5. 点击工具栏右侧的**诊断**按钮，可查看缓存、索引、USN 检查点、权限与数据目录状态，便于排查问题。
-6. 点击工具栏的**监听**按钮，可对当前目录进行近实时变更监听（基于 USN 增量刷新，约 5 秒一次）。
 
 > 💡 以**管理员身份运行**可启用 MFT 直读模式，扫描速度通常提升 **30-60 倍**，同时全局搜索也能索引所有 NTFS 卷。
 
@@ -157,15 +157,6 @@ SIZE     TYPE       NAME
 | 纯文本 | `年报` | 按文件名或路径搜索 |
 | 否定 | `NOT .tmp` | 排除匹配项 |
 
-### 🗺️ Treemap 热图
-
-- 按大小比例布局的矩形色块图，一眼识别空间大户
-- 颜色编码：按文件扩展名自动配色（📄 zip=棕色 📄 mp4=红色 📄 js=黄色 📁 目录=灰色）
-- **点击钻入**：点击任意目录方块，放大查看该目录内部的文件分布
-- **面包屑导航**：支持回退到上级目录
-- Canvas 高性能渲染，10 万+文件流畅交互
-- 鼠标悬停显示文件名和精确大小
-
 ### 🛠️ 开发者磁盘分析
 
 自动识别 18 类常见开发工具目录和缓存，按类别聚合空间占用：
@@ -204,13 +195,6 @@ SIZE     TYPE       NAME
 
 ---
 
-### 👁️ 目录变更监听
-
-- 点击工具栏“监听”按钮，对当前扫描目录启动近实时监听
-- 内部复用 `scan_directory` 的 USN 增量刷新路径，低频扫描开销小
-- 检测到变更后通过 `dir-changes` 事件推送新增/删除/修改数量
-- 再次点击按钮停止监听
-
 ### 🔁 重复文件检测
 
 - 基于“先按大小分组，再对候选文件做内容哈希”的两阶段算法
@@ -243,27 +227,35 @@ SIZE     TYPE       NAME
 FlashDir 采用**四级扫描流水线**，自动选择最优策略：
 
 ```
-scan_directory()
-  ├─ 第一级 —— 内存缓存（LRU）
-  │     < 1ms 命中，最多 30 个目录 / 200MB
+scan_directory_view()
+  ├─ 第零级 —— USN Journal 增量校验 ⚡（最高优先级）
+  │     只要该目录缓存记录了"已校验 USN"，就先读取 Journal 增量：
+  │     目录 mtime 无法反映"文件内容被修改"，只有 USN 能捕捉这类变更
+  │     仅应用落在被扫描目录内的变更，避免其它目录的变更污染结果
+  │     变更超过 5000 条 / Journal 已回滚 → 自动回退全量 MFT 扫描
   │
-  ├─ 第二级 —— 磁盘缓存（SQLite + bincode 序列化）
-  │     < 5ms 命中，最多 500MB / 7 天过期
+  ├─ 第一级 —— 内存缓存（LRU，共享 Arc 零拷贝）
+  │     最多 30 个目录 / 200MB
   │
-  ├─ 第三级 —— USN Journal 增量更新 ⚡
-  │     读取上次扫描后的变更文件，通过 MFT FRN 链解析路径
-  │     二阶段应用算法（先删后增），< 50ms 返回最新结果
-  │     变更超过 5000 条或检查点超过 1 小时时自动回退
+  ├─ 第二级 —— 磁盘缓存（SQLite 条目级缓存，非整包 BLOB）
+  │     最多 500MB / 7 天过期（按最久未访问整份淘汰）
+  │
+  ├─ 第三级 —— 上层目录缓存推导（内存/磁盘，入口级过滤）
+  │     父缓存写入时间必须 >= 子目录自身 mtime，否则视为过期
   │
   ├─ 第四级 A —— NTFS $MFT 直接读取 ⚡（Windows 管理员 + NTFS）
   │     通过 $MFT 自身的 $DATA data runs 处理 MFT 碎片
   │     从未命名 $DATA 属性读取真实文件大小
   │     优先使用 Win32 长名，避免 DOS 8.3 短名
-  │     扫描完成后保存 USN 检查点，供增量更新使用
+  │     扫描完成后保存 USN 检查点，并写入该目录的"已校验 USN"
   │
   └─ 第四级 B —— FindFirstFileExW 快速遍历（Windows 普通）
         原生 API，零额外系统调用，比 PowerShell 快约 3 倍
 ```
+
+> 目录遍历（非管理员）无法读取 USN Journal，因此这类缓存
+> `verified_usn = 0`，只能按目录 mtime 判断新鲜度；需要"内容级新鲜度"时
+> 请以管理员身份运行，或点击工具栏 **刷新** 强制全量重扫。
 
 ### MFT 直读原理
 
@@ -278,15 +270,20 @@ scan_directory()
 
 ### USN Journal 增量更新
 
-首次 MFT 扫描完成后，FlashDir 保存一个 USN（更新序列号）检查点。后续扫描时：
+每次 MFT 扫描完成后，FlashDir 会保存一个 USN 检查点，并把"扫描完成时该卷
+的 USN 位置"记录到该目录的缓存元数据里（`verified_usn`）。后续扫描这个目录时：
 
-1. 从磁盘缓存加载过期的扫描结果（即使 mtime 不匹配）
-2. 读取 USN Journal 中检查点之后的增量变更记录
-3. 通过 MFT FRN → 路径解析引擎，将 USN 记录的父目录引用号转换为完整路径
-4. 二阶段应用算法：Phase 1 处理删除/重命名旧名，Phase 2 处理创建/重命名新名/数据变更
-5. 重新聚合目录大小，写回两级缓存
+1. 取该目录缓存（优先内存，其次磁盘）作为基底，读取 `verified_usn`
+2. 从该 USN 位置开始循环读取 Journal 增量（输出缓冲区前 8 字节是下次读取起点，
+   之后才是 `USN_RECORD` 数组）
+3. 通过 MFT FRN → 路径解析引擎把父目录引用号还原成完整路径
+4. **只保留落在被扫描目录子树内的变更**，避免把卷上其它目录的改动混进结果
+5. 二阶段应用算法：Phase 1 处理删除/重命名旧名，Phase 2 处理创建/重命名新名/数据变更
+6. 重新聚合目录大小，写回两级缓存，并把 `verified_usn` 推进到本次读到的位置
 
-这就是 Everything 在文件变更后秒级刷新索引的技术——现在 FlashDir 也用上了。
+因为是"按目录记录已校验 USN"，所以判断是严谨的：不会出现"缓存快照比检查点更旧、
+却从检查点之后读增量"导致漏变更的情况。若 Journal 已回滚（最早可读 USN 已超过
+校验点）或变更超过 5000 条，会自动回退到全量 MFT 扫描。
 
 ### 快照差异引擎
 
@@ -313,7 +310,6 @@ FlashDir/
 │   │       │   ├── GlobalSearchDropdown.vue # Everything 式跨盘全局搜索
 │   │       │   ├── FileList.vue      # 可排序虚拟列表
 │   │       │   ├── StatsTab.vue       # 文件类型分布图表
-│   │       │   ├── Treemap.vue       # Canvas Treemap 热图
 │   │       │   ├── DevAnalyzer.vue   # 开发者工具目录分析
 │   │       │   ├── SnapshotCompare.vue # 快照对比与增长追踪
 │   │       │   ├── Sidebar.vue       # 目录树导航
@@ -323,12 +319,10 @@ FlashDir/
 │   │       │   └── HistoryList.vue   # 扫描历史
 │   │       ├── composables/
 │   │       │   ├── useTauri.js       # Tauri IPC 封装
-│   │       │   ├── useSortWorker.js  # 列表排序/过滤工具
 │   │       │   └── useGlobalSearch.js# 全局搜索状态单源
 │   │       ├── utils/
 │   │       │   ├── format.js         # 格式化工具
-│   │       │   ├── smartFilter.js    # Everything 式智能过滤
-│   │       │   └── scanBinary.js     # 自定义二进制扫描结果解码
+│   │       │   └── format.js         # 格式化 / 防抖等通用工具
 │   │       ├── main.js               # Vue 入口
 │   │       └── style.css             # 全局样式
 │   │
@@ -366,7 +360,7 @@ FlashDir/
 | 文件系统 | NTFS $MFT 直读 · USN Journal 增量 · FRN 路径解析 · FindFirstFileExW 快速遍历 |
 | 缓存 | LRU（内存）· SQLite + bincode（磁盘 + 快照多版本） |
 | 分析引擎 | KnownPattern 分类器（18 类）· HashMap O(n) 差异引擎 |
-| 可视化 | Canvas Treemap · 统计面板 |
+| 可视化 | 分页文件表 · 占比条 · 统计面板 · 目录树懒加载 |
 | 过滤搜索 | Everything-style 语法解析 · 本地 `ext:`/`size:`/`type:`/`dir:` + 全局 `*.pdf`/`prefix*`/`*suffix`/`NOT` |
 | 内存优化 | mimalloc 分配器 · SmartString 栈存储 · Arc 共享 |
 
@@ -425,17 +419,22 @@ const MAX_DISK_CACHE_MB: usize = 500;    // 最大 500 MB
 const CACHE_EXPIRE_DAYS: i64 = 7;        // 7 天过期
 
 // USN 增量更新
-const MAX_USN_CHANGES: usize = 5000;     // 超过此数回退到全量 MFT
-const CHECKPOINT_EXPIRE_SECS: i64 = 3600;// 检查点超过 1 小时过期
+const MAX_USN_CHANGES: usize = 5000;     // 单次增量超过此数回退到全量 MFT
+// 每个目录缓存记录自己的"已校验 USN"（scan_meta.verified_usn），
+// 不再依赖"检查点 1 小时过期"这种时间启发式
 
 // 快照
 const MAX_SNAPSHOTS_PER_PATH: usize = 50;// 每目录最多 50 个快照
 const SNAPSHOT_EXPIRE_DAYS: i64 = 30;    // 快照保留 30 天
 
 // 数据目录
-// ~/.flashdir/cache_v2.db     — 磁盘缓存 + 快照
+// ~/.flashdir/cache_v2.db     — 磁盘缓存(scan_meta/scan_items) + 快照(snapshots)
+//                                + 全局索引(global_index/index_meta)
 // ~/.flashdir/history.json    — 扫描历史
 // ~/.flashdir/usn_checkpoint_<盘符>.json — USN 检查点
+
+// 平台
+// 当前仅支持 Windows 10/11；fs/fallback_walker.rs 只提供目录遍历层回退
 ```
 
 ---

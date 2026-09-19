@@ -1,6 +1,11 @@
 // 非 Windows 平台的目录遍历回退方案
 // 使用标准库 fs::read_dir（在 Linux/macOS 上也已足够高效，
 // getdents64 系统调用本身就会返回 d_type）
+//
+// 说明：FlashDir 当前是 Windows 优先项目（MFT / USN / FindFirstFileExW 均为
+// Windows 专有）。本模块只覆盖"目录遍历"这一层回退，字段必须与
+// windows_walker::FastDirEntry 保持一致（此前 struct 漏了 mtime 字段，
+// 而调用处已经传了 mtime，非 Windows 下无法编译）。
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,6 +18,8 @@ pub struct FastDirEntry {
     pub size: u64,
     pub is_dir: bool,
     pub is_symlink: bool,
+    /// 修改时间（Unix 秒级时间戳，0 = 未知），与 Windows 遍历器保持一致
+    pub mtime: i64,
 }
 
 /// 使用标准库遍历目录（非 Windows 平台）

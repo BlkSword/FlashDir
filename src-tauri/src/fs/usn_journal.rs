@@ -75,6 +75,9 @@ struct ReadUsnJournalData {
     usn_journal_id: u64,
 }
 
+/// USN_RECORD_V2 固定头部长度（FileName 之前的字节数 = sizeof(USN_RECORD_V2) - 2）
+const USN_V2_FIXED_SIZE: usize = 60;
+
 /// USN_RECORD 头部（可变长度，以 FileName 结尾）
 #[repr(C)]
 struct UsnRecordHeader {
@@ -190,13 +193,21 @@ impl UsnJournal {
         }
     }
 
-    /// 读取 USN Journal 中指定 USN 之后的所有变更记录
+    /// 读取 USN Journal 中指定 USN 之后的变更记录（单批，最多 max_records 条）。
+    ///
+    /// 关键点：`FSCTL_READ_USN_JOURNAL` 的输出缓冲区以 8 字节 `USN`（下次读取起点）
+    /// 开头，其后才是 `USN_RECORD` 数组 —— 见 winioctl.h 中的宏注释
+    /// `FSCTL_READ_USN_JOURNAL ... // READ_USN_JOURNAL_DATA, USN`。
+    /// 早期实现从 offset 0 开始解析，把 next-USN 的低 32 位当成 RecordLength，
+    /// 导致增量更新被静默跳过，或按错位字段解析出垃圾记录。
+    ///
+    /// 返回 `(变更记录, 下次读取起点)`。
     pub fn read_changes_since(
         &self,
         start_usn: i64,
         journal_id: u64,
         max_records: usize,
-    ) -> io::Result<Vec<UsnChangeRecord>> {
+    ) -> io::Result<(Vec<UsnChangeRecord>, i64)> {
         let mut read_data = ReadUsnJournalData {
             start_usn,
             reason_mask: 0xFFFFFFFF, // 所有变更类型
@@ -207,6 +218,7 @@ impl UsnJournal {
         };
 
         // 为 USN 记录分配缓冲区（每条记录最大约 512 字节）
+        let max_records = max_records.max(1);
         let buffer_size = (max_records * 512).min(4 * 1024 * 1024); // 最多 4MB
         let mut buffer: Vec<u8> = vec![0u8; buffer_size];
 
@@ -228,25 +240,50 @@ impl UsnJournal {
                 let err = GetLastError();
                 // ERROR_HANDLE_EOF (38) = 没有更多记录，这是正常的
                 if err == 38 {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), start_usn));
                 }
                 return Err(io::Error::from_raw_os_error(err as i32));
             }
 
-            // 解析返回的 USN 记录
-            let mut records = Vec::new();
-            let mut offset = 0usize;
+            let returned = bytes_returned as usize;
+            // 前 8 字节为下次读取起点（可能只有这 8 字节，表示无新记录）
+            if returned < 8 {
+                return Ok((Vec::new(), start_usn));
+            }
+            let next_usn = i64::from_le_bytes([
+                buffer[0], buffer[1], buffer[2], buffer[3],
+                buffer[4], buffer[5], buffer[6], buffer[7],
+            ]);
 
-            while offset + mem::size_of::<UsnRecordHeader>() <= bytes_returned as usize {
+            // 解析返回的 USN 记录（从 offset 8 开始）
+            let mut records = Vec::new();
+            let mut offset = 8usize;
+
+            while offset + USN_V2_FIXED_SIZE <= returned {
                 let header = &*(buffer.as_ptr().add(offset) as *const UsnRecordHeader);
 
-                if header.record_length == 0 || header.record_length as usize > buffer_size - offset {
+                let record_len = header.record_length as usize;
+                if record_len < USN_V2_FIXED_SIZE || offset + record_len > returned {
                     break;
                 }
+                // 只支持 USN_RECORD_V2（输入结构体为 V0，驱动固定返回 V2 记录）
+                if header.major_version != 2 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("不支持的 USN 记录版本: {}", header.major_version),
+                    ));
+                }
 
-                // 提取文件名
+                // 提取文件名（严格边界校验，避免脏日志越界 panic）
                 let name_offset = header.file_name_offset as usize;
                 let name_len = header.file_name_length as usize;
+                if name_offset < USN_V2_FIXED_SIZE
+                    || name_len % 2 != 0
+                    || name_offset + name_len > record_len
+                {
+                    offset += record_len;
+                    continue;
+                }
                 let name_bytes = &buffer[offset + name_offset..offset + name_offset + name_len];
 
                 let u16_slice: Vec<u16> = name_bytes
@@ -266,10 +303,10 @@ impl UsnJournal {
                     attributes: header.file_attributes,
                 });
 
-                offset += header.record_length as usize;
+                offset += record_len;
             }
 
-            Ok(records)
+            Ok((records, next_usn))
         }
     }
 
@@ -303,45 +340,105 @@ pub fn get_checkpoint(drive_letter: char) -> Option<UsnCheckpoint> {
     journal.create_checkpoint(vol_serial).ok()
 }
 
-/// 从检查点读取增量变更
-/// 返回 (变更记录列表, 新的检查点)
+/// 单次增量检查允许累积的最大变更数。
+/// 超过该值说明"增量"已不划算，调用方应回退到全量 MFT 扫描。
+pub const MAX_USN_CHANGES: usize = 5000;
+
+/// 一次 USN 增量读取的结果
+#[derive(Debug, Clone)]
+pub struct UsnDelta {
+    /// 变更记录（最多 MAX_USN_CHANGES + 1 条）
+    pub changes: Vec<UsnChangeRecord>,
+    /// 已消费到的位置：下次从此 USN 继续读取
+    pub next_usn: i64,
+    /// Journal 中仍可读取的最早 USN；低于它说明增量窗口已失效
+    pub lowest_valid_usn: i64,
+}
+
+/// USN 增量读取失败原因
+#[derive(Debug)]
+pub enum UsnReadError {
+    /// Journal 被重建：增量不可用，必须全量扫描
+    JournalReset,
+    /// 盘符指向了另一块磁盘：增量不可用，必须全量扫描
+    VolumeChanged,
+    /// 其它 I/O 错误（可稍后重试）
+    Io(io::Error),
+}
+
+impl std::fmt::Display for UsnReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UsnReadError::JournalReset => f.write_str("USN Journal 已被重置，需要全量扫描"),
+            UsnReadError::VolumeChanged => f.write_str("卷序列号变化，需要全量扫描"),
+            UsnReadError::Io(e) => {
+                f.write_str("读取 USN Journal 失败: ")?;
+                std::fmt::Display::fmt(e, f)
+            }
+        }
+    }
+}
+
+impl std::error::Error for UsnReadError {}
+
+/// 从 `start_usn` 开始读取增量变更，循环拉取直到追平 Journal 当前状态，
+/// 或变更数超过 `MAX_USN_CHANGES`（此时调用方应回退全量扫描）。
+///
+/// 注意：读取起点是调用方为"某个目录缓存"记录的已校验 USN（per-path），
+/// 而不是全局 checkpoint 的 max_usn —— 只有这样，"该目录已校验到 U" 的
+/// 判断才是严谨的：如果缓存只是"某个更早时刻的快照"，从全局 checkpoint
+/// 之后读增量会漏掉两者之间的变更。
 pub fn read_incremental_changes(
     drive_letter: char,
     checkpoint: &UsnCheckpoint,
-) -> io::Result<(Vec<UsnChangeRecord>, UsnCheckpoint)> {
-    let journal = UsnJournal::open(drive_letter)?;
+    start_usn: i64,
+) -> Result<UsnDelta, UsnReadError> {
+    let journal = UsnJournal::open(drive_letter).map_err(UsnReadError::Io)?;
 
     // 验证 Journal ID 未变（Journal 未被重置）
-    let current = journal.query_journal()?;
+    let current = journal.query_journal().map_err(UsnReadError::Io)?;
     if current.usn_journal_id != checkpoint.journal_id {
-        // Journal 被重置了，需要全量扫描
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "USN Journal was reset, full scan required",
-        ));
+        return Err(UsnReadError::JournalReset);
     }
 
     // 验证卷序列号未变（防止盘符指向了另一块磁盘）
-    let vol_serial = get_volume_serial(drive_letter)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Cannot get volume serial"))?;
+    let vol_serial = get_volume_serial(drive_letter).ok_or(UsnReadError::VolumeChanged)?;
     if vol_serial != checkpoint.volume_serial {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Volume serial changed, full scan required",
-        ));
+        return Err(UsnReadError::VolumeChanged);
     }
 
-    // 读取增量变更
-    let changes = journal.read_changes_since(
-        checkpoint.max_usn,
-        checkpoint.journal_id,
-        100_000, // 最多处理 10 万条变更
-    )?;
+    let mut changes: Vec<UsnChangeRecord> = Vec::new();
+    let mut start = start_usn;
+    let mut next_usn = start_usn;
+    const BATCH_RECORDS: usize = 1024;
 
-    // 创建新检查点
-    let new_checkpoint = journal.create_checkpoint(vol_serial)?;
+    loop {
+        let (mut records, resume) = journal
+            .read_changes_since(start, current.usn_journal_id, BATCH_RECORDS)
+            .map_err(UsnReadError::Io)?;
 
-    Ok((changes, new_checkpoint))
+        if resume <= start {
+            // 没有进展：已到 Journal 末尾
+            break;
+        }
+
+        next_usn = resume;
+        start = resume;
+        changes.append(&mut records);
+
+        if changes.len() > MAX_USN_CHANGES {
+            break;
+        }
+        if start >= current.next_usn {
+            break;
+        }
+    }
+
+    Ok(UsnDelta {
+        changes,
+        next_usn,
+        lowest_valid_usn: current.lowest_valid_usn,
+    })
 }
 
 /// 获取 NTFS 卷序列号（Volume Serial Number）

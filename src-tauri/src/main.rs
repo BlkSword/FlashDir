@@ -125,6 +125,7 @@ async fn main() {
                 }
 
                 let mut ok_drives: Vec<char> = Vec::new();
+                let mut failed_drives: Vec<char> = Vec::new();
                 for &drive in &drives {
                     let root = format!("{}:\\", drive);
                     let app_h = app_handle.clone();
@@ -147,6 +148,7 @@ async fn main() {
                             );
                         }
                         _ => {
+                            failed_drives.push(drive);
                             let _ = app_h.emit(
                                 "global-search-progress",
                                 serde_json::json!({ "drive": drive.to_string(), "scanned": global_search::instance().entries_len(), "phase": "skipped" }),
@@ -158,7 +160,7 @@ async fn main() {
                 if ok_drives.is_empty() {
                     idx.set_failed("需要管理员权限才能读取 NTFS MFT".to_string());
                 } else {
-                    idx.finish_building(&ok_drives);
+                    idx.finish_building(&ok_drives, &failed_drives);
                 }
                 let _ = app_handle.emit(
                     "global-search-progress",
@@ -168,8 +170,6 @@ async fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::scan_directory,
-            commands::scan_directory_binary,
             commands::scan_directory_paged,
             commands::get_dir_children,
             commands::get_history_summary,
@@ -183,7 +183,6 @@ async fn main() {
             commands::restart_as_admin,
             commands::analyze_dev_disk,
             commands::find_duplicates,
-            commands::save_snapshot,
             commands::save_snapshot_from_cache,
             commands::list_snapshots,
             commands::compare_snapshots,
@@ -193,7 +192,6 @@ async fn main() {
             commands::global_search_ensure_index,
             commands::global_search,
             commands::global_search_refresh,
-            commands::global_search_add_scan,
             commands::global_search_add_scan_from_cache,
         ])
         .run(tauri::generate_context!())

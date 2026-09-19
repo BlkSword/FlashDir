@@ -46,6 +46,16 @@
 
     <button v-if="loading" class="fd-btn" @click="$emit('cancel-scan')">取消</button>
 
+    <button
+      v-else
+      class="fd-btn"
+      :disabled="!path"
+      title="忽略所有缓存（内存/磁盘/USN），强制重新扫描当前目录"
+      @click="$emit('force-scan')"
+    >
+      刷新
+    </button>
+
     <button class="fd-btn" @click="$emit('browse')">浏览…</button>
 
     <div class="fd-path-bar">
@@ -105,6 +115,7 @@ const focusGlobalSearch = () => {
 
 defineEmits([
   'scan',
+  'force-scan',
   'cancel-scan',
   'browse',
   'navigate',

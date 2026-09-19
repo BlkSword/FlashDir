@@ -18,8 +18,7 @@ use windows_sys::Win32::Foundation::{GetLastError, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     FindFirstFileExW, FindNextFileW, FindClose,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-    FIND_FIRST_EX_CASE_SENSITIVE, FIND_FIRST_EX_LARGE_FETCH,
-    WIN32_FIND_DATAW,
+    FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW,
 };
 
 /// 快速目录条目 —— 一次 FindFirstFileExW 调用获取全部信息
@@ -45,6 +44,10 @@ pub struct FastDirEntry {
 /// - 使用 FindExInfoBasic：只返回基本信息（不包含短文件名），减少 I/O
 /// - 使用 FIND_FIRST_EX_LARGE_FETCH：批量预取，减少内核往返
 /// - 从 WIN32_FIND_DATAW 直接读取 size 和 attributes，零额外 syscall
+///
+/// 注意：这里不再传 `FIND_FIRST_EX_CASE_SENSITIVE`。该标志只在"目录已启用
+/// 大小写敏感"（WSL 场景）时有明确语义，普通 NTFS 目录上属于无意义/未定义
+/// 行为；去掉后行为与资源管理器一致，也不影响大小写不敏感卷上的匹配。
 pub fn read_dir_entries(dir_path: &Path) -> io::Result<Vec<FastDirEntry>> {
     // 构建搜索模式：<dir>\* 的 UTF-16 宽字符路径
     let search_pattern: Vec<u16> = dir_path
@@ -68,7 +71,7 @@ pub fn read_dir_entries(dir_path: &Path) -> io::Result<Vec<FastDirEntry>> {
             &mut find_data as *mut _ as *mut _,
             FIND_EX_SEARCH_NAME_MATCH,
             std::ptr::null(),
-            FIND_FIRST_EX_LARGE_FETCH | FIND_FIRST_EX_CASE_SENSITIVE,
+            FIND_FIRST_EX_LARGE_FETCH,
         );
 
         if handle == INVALID_HANDLE_VALUE {
@@ -120,7 +123,13 @@ pub fn read_dir_entries(dir_path: &Path) -> io::Result<Vec<FastDirEntry>> {
                     // ERROR_NO_MORE_FILES — 正常结束
                     break;
                 }
-                // 其他错误视为部分读取成功
+                // 其它错误：保留已读到的部分，但必须显式告警，
+                // 否则调用方会把"半截目录"当成完整目录，静默漏扫。
+                eprintln!(
+                    "[Walker] 目录 {} 枚举中断 (Win32 错误 {}), 已返回部分结果",
+                    dir_path.display(),
+                    err
+                );
                 break;
             }
         }

@@ -176,6 +176,9 @@
             <span v-if="indexMeta.failedDrives?.length" class="fd-footer-warn">
               （{{ indexMeta.failedDrives.join(', ') }} 跳过）
             </span>
+            <span v-if="indexMeta.partial" class="fd-footer-warn">
+              （仅部分目录，点右侧刷新可重建全盘索引）
+            </span>
           </span>
           <span v-else class="fd-footer-meta">↑↓ 选择 · Enter 打开 · Ctrl+Enter 所在文件夹 · Esc 关闭</span>
           <span class="fd-footer-spacer"></span>
@@ -381,11 +384,10 @@ const ensureIndex = async () => {
   try {
     const s = await gs.ensureIndex()
     if (s?.kind === 'failed') {
-      // 建索引失败通常是权限不足，尝试以管理员身份重启
+      // 建索引失败通常是权限不足，尝试以管理员身份重启。
+      // 提权成功后旧进程会在 Rust 侧自行退出（避免双实例 + 双托盘）。
       try {
         await gs.restartAsAdmin()
-        setTimeout(() => window.close(), 500)
-        return
       } catch {}
     }
   } catch (e) {

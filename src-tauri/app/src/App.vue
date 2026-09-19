@@ -8,6 +8,7 @@
       :can-go-up="canGoUp"
       :loading="loading"
       @scan="handleScan"
+      @force-scan="handleForceRescan"
       @cancel-scan="handleCancelScan"
       @browse="handleBrowse"
       @navigate="handleNavigate"
@@ -199,6 +200,8 @@ const loadPage = async () => {
       sortColumn: sortConfig.value.column,
       sortDirection: sortConfig.value.direction,
       filter: searchKeyword.value.trim(),
+      // 分页/排序/过滤请求不写入历史记录
+      recordHistory: false,
     })
 
     pageItems.value = result.items || []
@@ -264,7 +267,7 @@ const handleLoadTreeChildren = async (node) => {
   }
 }
 
-const handleScan = async (path, addToHistory = true) => {
+const handleScan = async (path, addToHistory = true, forceRefresh = false) => {
   if (!path || path.trim() === '') {
     message.warning('请输入有效的目录路径')
     return
@@ -286,12 +289,14 @@ const handleScan = async (path, addToHistory = true) => {
 
     const result = await invoke('scan_directory_paged', {
       path: path.trim(),
-      forceRefresh: false,
+      forceRefresh,
       page: 1,
       pageSize: pageSize.value,
       sortColumn: sortConfig.value.column,
       sortDirection: sortConfig.value.direction,
       filter: searchKeyword.value.trim(),
+      // 用户主动扫描 → 记录历史
+      recordHistory: true,
     })
 
     pageItems.value = result.items || []
@@ -325,6 +330,12 @@ const handleScan = async (path, addToHistory = true) => {
     loading.value = false
     scanPhase.value = { phase: '', message: '' }
   }
+}
+
+// 忽略所有缓存（内存/磁盘/USN），强制全量重扫当前目录
+const handleForceRescan = async () => {
+  if (!currentPath.value) return
+  await handleScan(currentPath.value, true, true)
 }
 
 const handleSearchInput = debounce((keyword) => {

@@ -143,6 +143,8 @@ pub struct MftScanner {
     /// $MFT 自身的 $DATA data runs；用于同时支持全量顺序读取和单条记录定位。
     /// 为空时回退到连续读取（兼容极少数解析失败的场景）。
     mft_data_runs: Vec<(u64, u64)>,
+    /// 本次扫描的取消代号（见 crate::cancel 的 generation 模型）
+    cancel_id: u64,
 }
 
 /// MFT 扫描的最终结果
@@ -252,12 +254,18 @@ impl MftScanner {
                 mft_valid_size,
                 mft_record_size: vol_data.bytes_per_file_record_segment,
                 mft_data_runs: Vec::new(),
+                cancel_id: 0,
             };
             // 提前解析并缓存 $MFT data runs，供全量扫描和单条记录读取共用。
             // 解析失败时保持空列表，后续回退到连续读取。
             scanner.mft_data_runs = scanner.read_mft_data_runs().unwrap_or_default();
             Ok(scanner)
         }
+    }
+
+    /// 绑定本次扫描的取消代号，使取消检查按"代"生效
+    pub fn set_cancel_id(&mut self, cancel_id: u64) {
+        self.cancel_id = cancel_id;
     }
 
     /// 执行 MFT 扫描，返回所有文件的元数据
@@ -412,7 +420,7 @@ impl MftScanner {
                 let records_in_fragment = (fragment_size / record_size as u64) as usize;
 
                 for fragment_batch_start in (0..records_in_fragment).step_by(batch_records) {
-                    if crate::cancel::is_requested() {
+                    if crate::cancel::is_requested_for(self.cancel_id) {
                         return Err(io::Error::new(
                             io::ErrorKind::Interrupted,
                             "scan cancelled",
@@ -450,16 +458,20 @@ impl MftScanner {
 
                     for i in 0..records_in_batch {
                         let record_offset = i * record_size;
+                        // 先占位编号：即使本条记录因短读未取全，编号也必须与记录在
+                        // $MFT 中的位置严格对应（FRN 低 48 位直接按记录号索引），
+                        // 否则后续 fragment 的编号会整体错位。
+                        let record_number = global_record_index;
+                        global_record_index += 1;
                         if record_offset + record_size > bytes_read as usize {
-                            break;
+                            continue;
                         }
                         let record_data = &mut buffer[record_offset..record_offset + record_size];
                         apply_mft_fixup(record_data);
 
-                        if let Some(entry) = parse_mft_record(record_data, global_record_index as usize) {
-                            index.insert(global_record_index, entry);
+                        if let Some(entry) = parse_mft_record(record_data, record_number as usize) {
+                            index.insert(record_number, entry);
                         }
-                        global_record_index += 1;
                     }
                 }
             }
@@ -1182,16 +1194,24 @@ pub fn restart_as_admin() -> bool {
 /// 尝试使用 MFT 直接扫描（Windows 管理员权限下）
 /// 失败时返回 None，调用者应回退到目录遍历方式
 pub fn try_mft_scan(root_path: &str) -> Option<MftScanResult> {
+    let scan_id = crate::cancel::begin();
+    try_mft_scan_with_cancel(root_path, scan_id)
+}
+
+/// 与 `try_mft_scan` 相同，但复用调用方已有的取消代号：
+/// 避免为子步骤新开一代，从而不会清掉/覆盖在飞扫描的取消状态。
+pub fn try_mft_scan_with_cancel(root_path: &str, cancel_id: u64) -> Option<MftScanResult> {
     // 提取盘符
     let drive_letter = extract_drive_letter(root_path)?;
 
-    let scanner = match MftScanner::open(drive_letter) {
+    let mut scanner = match MftScanner::open(drive_letter) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[MFT] 无法打开卷 {}: {}", drive_letter, e);
             return None;
         }
     };
+    scanner.set_cancel_id(cancel_id);
 
     match scanner.scan() {
         Ok(result) => {

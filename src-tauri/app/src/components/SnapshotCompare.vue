@@ -203,7 +203,7 @@
 import { ref, watch, onMounted } from 'vue'
 import { message } from 'ant-design-vue'
 import { useTauri } from '../composables/useTauri'
-import { formatSize, formatTime, debounce } from '../utils/format.js'
+import { formatSize, formatTime, formatError } from '../utils/format.js'
 
 const { invoke } = useTauri()
 
@@ -263,24 +263,14 @@ const handleSaveSnapshot = async () => {
   }
   saving.value = true
   try {
-    // 优先从后端内存缓存保存，避免把百万级 items 经 JSON 回传
+    // 只从后端内存缓存保存：
+    // 旧实现会在缓存缺失时把"当前分页的 100 条"当作全量快照回传，
+    // 生成残缺但看起来正常的快照。这里直接报错，要求重新扫描。
     await invoke('save_snapshot_from_cache', { path: props.currentPath })
     message.success('快照已保存')
     await loadSnapshots()
   } catch (error) {
-    // 缓存被逐出时回退到旧接口，保证功能可用
-    try {
-      await invoke('save_snapshot', {
-        path: props.currentPath,
-        items: props.items,
-        totalSize: props.totalSize,
-        totalSizeFormatted: formatSize(props.totalSize)
-      })
-      message.success('快照已保存')
-      await loadSnapshots()
-    } catch (fallbackError) {
-      message.error('保存快照失败: ' + (fallbackError || error))
-    }
+    message.error('保存快照失败: ' + formatError(error))
   } finally {
     saving.value = false
   }
