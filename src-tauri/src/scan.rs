@@ -761,6 +761,12 @@ pub async fn scan_directory_view(
     if !force_refresh {
         let usn_start = std::time::Instant::now();
         if let Some(base) = load_usn_base(&root_dir) {
+            if base.verified_usn == 0 {
+                eprintln!(
+                    "[USN] {} 的缓存没有已校验 USN（非 MFT 扫描或检查点缺失），退回 mtime 新鲜度",
+                    root_dir
+                );
+            }
             if base.verified_usn > 0 {
                 emit_scan_phase(&app_handle, "usn", "USN 增量校验", None);
                 match try_usn_incremental_update(
@@ -1148,6 +1154,11 @@ fn try_mft_scan_path(
     // 删除不存在的项是 no-op、创建/改名/大小都以当前 MFT 记录为准），
     // 而不会因为"快照时间早于检查点"被永久跳过。
     let pre_scan_checkpoint = crate::fs::get_checkpoint(drive);
+    if pre_scan_checkpoint.is_none() {
+        eprintln!(
+            "[USN] 未能获取扫描前的 Journal 状态（卷忙/权限/Journal 不可用），该目录本次不记录已校验 USN，将退回 mtime 新鲜度"
+        );
+    }
 
     // 尝试 MFT 全卷扫描（复用调用方的取消代号）
     let mft_result = crate::fs::try_mft_scan_with_cancel(&root_path_str, scan_id)?;
@@ -1425,8 +1436,20 @@ fn try_usn_incremental_update(
     // 读取检查点（用于校验 Journal ID / 卷序列号）
     let cp_path = usn_checkpoint_path(drive);
     let checkpoint: crate::fs::UsnCheckpoint = {
-        let data = std::fs::read_to_string(&cp_path).ok()?;
-        serde_json::from_str(&data).ok()?
+        let data = match std::fs::read_to_string(&cp_path) {
+            Ok(data) => data,
+            Err(e) => {
+                eprintln!("[USN] 读取检查点失败 {}: {}（退回常规缓存逻辑）", cp_path.display(), e);
+                return None;
+            }
+        };
+        match serde_json::from_str(&data) {
+            Ok(cp) => cp,
+            Err(e) => {
+                eprintln!("[USN] 解析检查点失败 {}: {}（退回常规缓存逻辑）", cp_path.display(), e);
+                return None;
+            }
+        }
     };
 
     let delta = match crate::fs::read_incremental_changes(drive, &checkpoint, verified_usn) {

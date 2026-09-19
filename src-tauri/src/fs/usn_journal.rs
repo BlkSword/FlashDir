@@ -354,8 +354,12 @@ pub fn get_checkpoint(drive_letter: char) -> Option<UsnCheckpoint> {
 }
 
 /// 单次增量检查允许累积的最大变更数。
-/// 超过该值说明"增量"已不划算，调用方应回退到全量 MFT 扫描。
-pub const MAX_USN_CHANGES: usize = 5000;
+///
+/// 实测（C 盘、NVMe）：增量应用约 **1.67ms/条**（每条变更要随机读一次 MFT 记录
+/// 解析 FRN→路径，外加最终整块重写 blob 缓存），而全量 MFT 扫描只要 2.4–3.5s。
+/// 因此约 2000 条变更时两者持平；这里取 1200 留出余量，超过就直接全量扫描，
+/// 既更快也更稳（避免大量随机读把磁盘打满）。
+pub const MAX_USN_CHANGES: usize = 1200;
 
 /// 一次 USN 增量读取的结果
 #[derive(Debug, Clone)]
