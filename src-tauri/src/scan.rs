@@ -2200,6 +2200,59 @@ mod tests {
         assert!(is_same_or_child("C:/", "C:/"));
     }
 
+    /// 合成数据基准：目录大小聚合 / 排序 / format_size 的代价。
+    /// 运行：cargo test --release --lib -- --ignored --nocapture bench_aggregate
+    #[test]
+    #[ignore = "benchmark: 合成 40 万条目"]
+    fn bench_aggregate_and_format() {
+        use std::time::Instant;
+
+        // 30 万文件 + 10 万目录，深度 6，模拟 C 盘规模
+        let mut items: Vec<Item> = Vec::with_capacity(400_000);
+        for d in 0..100_000 {
+            let p = format!("C:/root/d{}/d{}/d{}", d % 100, d % 1000, d);
+            items.push(Item {
+                path: CompactString::from(p),
+                name: CompactString::from(format!("d{}", d)),
+                size: 0,
+                size_formatted: CompactString::new(),
+                is_dir: true,
+                mtime: 0,
+            });
+        }
+        for f in 0..300_000 {
+            let p = format!("C:/root/d{}/d{}/d{}/f{}.dat", f % 100, f % 1000, f % 100, f);
+            items.push(Item {
+                path: CompactString::from(p),
+                name: CompactString::from(format!("f{}.dat", f)),
+                size: 1024 + (f % 4096) as i64,
+                size_formatted: CompactString::new(),
+                is_dir: false,
+                mtime: 0,
+            });
+        }
+
+        let t = Instant::now();
+        let total = aggregate_directory_sizes(&mut items);
+        eprintln!(
+            "[bench] 聚合目录大小({} 条, 总 {}): {:?}",
+            items.len(),
+            total,
+            t.elapsed()
+        );
+
+        let t = Instant::now();
+        items.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+        eprintln!("[bench] 按大小排序: {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let mut acc = 0usize;
+        for i in 0..items.len() {
+            acc += format_size(items[i].size).len();
+        }
+        eprintln!("[bench] format_size x{}: {:?} (acc={})", items.len(), t.elapsed(), acc);
+    }
+
     #[test]
     fn test_aggregate_directory_sizes() {
         let mut items = vec![

@@ -1266,6 +1266,54 @@ mod tests {
         assert_eq!(r2.len(), 1);
     }
 
+    /// 真实数据基准：从 ~/.flashdir/cache_v2.db 加载持久化索引（百万级），
+    /// 测量索引构建与各类查询语法下的延迟。
+    /// 运行：cargo test --release --lib -- --ignored --nocapture bench_real_global_search
+    #[test]
+    #[ignore = "benchmark: 依赖本机持久化索引"]
+    fn bench_real_global_search() {
+        use std::time::Instant;
+
+        let entries = match crate::disk_cache::DiskCache::instance().load_global_index() {
+            Ok(e) if !e.is_empty() => e,
+            other => {
+                eprintln!("[bench] 无法加载持久化索引: {:?}", other.map(|e| e.len()));
+                return;
+            }
+        };
+        eprintln!("[bench] SQLite 读出索引条目: {}", entries.len());
+
+        let idx = GlobalIndex::new();
+        let t = Instant::now();
+        idx.upsert_batch_internal(entries);
+        eprintln!("[bench] 构建内存索引(HashMap+首字符桶): {:?}", t.elapsed());
+
+        let queries = [
+            "report",       // 长文本 → 首字符桶
+            "a",            // 短文本(<=2) → 全量并行扫描
+            "ab",
+            "*.pdf",        // 纯 filter → 全量扫描
+            "size:>1GB",    // 纯 filter
+            "NOT *.tmp",    // 纯否定 → 全量
+            "node_modules",
+            "ext:zip size:>10MB",
+            "dir:windows",
+            "readme.md",
+        ];
+        for _round in 0..2 {
+            for q in queries {
+                let t = Instant::now();
+                let r = idx.search_with_filter(q, 500);
+                eprintln!(
+                    "[bench] 查询 {:<22} 命中 {:>6}  耗时 {:?}",
+                    q,
+                    r.len(),
+                    t.elapsed()
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_is_same_or_child() {
         assert!(is_same_or_child("C:/foo", "C:/foo"));
