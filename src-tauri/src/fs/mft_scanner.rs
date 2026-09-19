@@ -16,7 +16,7 @@
 //   - 文件实际大小 (real_size)
 //   - 文件属性 (可判断是否为目录)
 
-use std::collections::{HashMap, HashSet};
+use rayon::prelude::*;
 use std::io;
 use std::mem;
 use std::path::PathBuf;
@@ -129,9 +129,12 @@ fn filetime_to_unix(ft: u64) -> i64 {
     ((ft as i64 - 116444736000000000) / 10_000_000).max(0)
 }
 
-/// FRN → MftEntry 的索引（FRN 去掉序列号的高位作为 key）
-/// FRN 结构: [48-bit record number][16-bit sequence number]
-type MftIndex = HashMap<u64, MftEntry>;
+/// MFT 记录索引：**按记录号直接下标访问**的扁平数组。
+///
+/// 早期用 HashMap<u64, MftEntry>，760k 条记录要哈希 760k 次 u64 键，
+/// 且遍历顺序随机、缓存不友好；记录号本身就是连续下标，直接用 Vec。
+/// （Vec 中 None 表示该记录未使用/无法解析。）
+type MftIndex = Vec<Option<MftEntry>>;
 
 /// MFT 扫描器 —— 打开 NTFS 卷并顺序读取 $MFT
 pub struct MftScanner {
@@ -157,7 +160,12 @@ pub struct MftScanResult {
     pub dir_count: usize,
     /// 读取的 MFT 数据总字节数
     pub data_read: u64,
+    /// 读取 + 解析 MFT 记录耗时（秒）
+    pub read_secs: f64,
+    /// 构建完整路径耗时（秒）
+    pub path_secs: f64,
 }
+
 
 /// 单个文件的 MFT 信息
 #[derive(Debug, Clone)]
@@ -270,13 +278,15 @@ impl MftScanner {
 
     /// 执行 MFT 扫描，返回所有文件的元数据
     pub fn scan(&self) -> io::Result<MftScanResult> {
-        // 第一步：读取所有 MFT 记录，建立 FRN → MftEntry 索引
+        // 第一步：顺序读取 $MFT 并解析记录（rayon 并行解析）
+        let read_start = std::time::Instant::now();
         let index = self.read_all_records()?;
+        let read_secs = read_start.elapsed().as_secs_f64();
 
-        // 计数
+        // 计数（扁平数组直接遍历，无哈希开销）
         let mut file_count = 0usize;
         let mut dir_count = 0usize;
-        for entry in index.values() {
+        for entry in index.iter().flatten() {
             if entry.is_dir {
                 dir_count += 1;
             } else {
@@ -284,16 +294,21 @@ impl MftScanner {
             }
         }
 
-        // 第二步：构建父子关系树，DFS 解析完整路径
+        // 第二步：用"父链 + 记忆化"构建完整路径（无 children_map / DFS clone）
+        let path_start = std::time::Instant::now();
         let files = Self::build_path_hierarchy(&index);
+        let path_secs = path_start.elapsed().as_secs_f64();
 
         Ok(MftScanResult {
             files,
             file_count,
             dir_count,
             data_read: self.mft_valid_size,
+            read_secs,
+            path_secs,
         })
     }
+
 
     /// 读取 $MFT 自身的 $DATA 属性 data runs，返回 [(start_lcn, cluster_count)]。
     /// $MFT 文件记录号是 0，通过 FSCTL_GET_NTFS_FILE_RECORD 读取可正确处理 MFT 碎片。
@@ -396,7 +411,7 @@ impl MftScanner {
     fn read_all_records(&self) -> io::Result<MftIndex> {
         let record_size = self.mft_record_size as usize;
         let max_records = (self.mft_valid_size as usize) / record_size;
-        let mut index: MftIndex = HashMap::with_capacity(max_records);
+        let mut records: MftIndex = std::iter::repeat_with(|| None).take(max_records).collect();
 
         // 获取 $MFT 的 data runs（碎片位置）；优先使用 open 时缓存的 runs
         let data_runs = if self.mft_data_runs.is_empty() {
@@ -405,8 +420,8 @@ impl MftScanner {
             self.mft_data_runs.clone()
         };
 
-        // 分配读取缓冲区：一次读 256 条记录（256KB）
-        let batch_records = 256usize;
+        // 一次读 1024 条记录（1MB），减少 syscall；解析用 rayon 并行
+        let batch_records = 1024usize;
         let batch_size = batch_records * record_size;
         let mut buffer: Vec<u8> = vec![0u8; batch_size];
 
@@ -427,10 +442,12 @@ impl MftScanner {
                         ));
                     }
 
-                    let records_in_batch = (records_in_fragment - fragment_batch_start).min(batch_records);
+                    let records_in_batch =
+                        (records_in_fragment - fragment_batch_start).min(batch_records);
                     let read_size = records_in_batch * record_size;
 
-                    let seek_offset = fragment_start_offset + (fragment_batch_start * record_size) as u64;
+                    let seek_offset =
+                        fragment_start_offset + (fragment_batch_start * record_size) as u64;
                     let mut distance_to_move: i64 = seek_offset as i64;
                     let result = SetFilePointerEx(
                         self.volume_handle,
@@ -440,6 +457,7 @@ impl MftScanner {
                     );
 
                     if result == 0 {
+                        global_record_index += records_in_batch as u64;
                         continue;
                     }
 
@@ -452,113 +470,144 @@ impl MftScanner {
                         std::ptr::null_mut(),
                     );
 
+                    // 记录编号必须与 $MFT 中的位置严格对应（FRN 低 48 位即记录号），
+                    // 因此无论读取成功与否都要按批次条数推进编号。
+                    let base = global_record_index as usize;
+                    global_record_index += records_in_batch as u64;
                     if result == 0 || bytes_read == 0 {
                         continue;
                     }
 
-                    for i in 0..records_in_batch {
-                        let record_offset = i * record_size;
-                        // 先占位编号：即使本条记录因短读未取全，编号也必须与记录在
-                        // $MFT 中的位置严格对应（FRN 低 48 位直接按记录号索引），
-                        // 否则后续 fragment 的编号会整体错位。
-                        let record_number = global_record_index;
-                        global_record_index += 1;
-                        if record_offset + record_size > bytes_read as usize {
-                            continue;
-                        }
-                        let record_data = &mut buffer[record_offset..record_offset + record_size];
-                        apply_mft_fixup(record_data);
-
-                        if let Some(entry) = parse_mft_record(record_data, record_number as usize) {
-                            index.insert(record_number, entry);
-                        }
+                    let complete = (bytes_read as usize) / record_size;
+                    let limit = records_in_batch
+                        .min(complete)
+                        .min(records.len().saturating_sub(base));
+                    if limit == 0 {
+                        continue;
                     }
+
+                    // 并行解析本批次：每个线程只改自己那条记录对应的槽位
+                    buffer[..limit * record_size]
+                        .par_chunks_mut(record_size)
+                        .zip(records[base..base + limit].par_iter_mut())
+                        .enumerate()
+                        .for_each(|(i, (record_data, slot))| {
+                            apply_mft_fixup(record_data);
+                            *slot = parse_mft_record(record_data, base + i);
+                        });
                 }
             }
         }
 
-        Ok(index)
+        Ok(records)
     }
+
 
     /// 构建完整路径（优化版：先建树，再 DFS）
     /// 产生的路径为 volume-relative，如 "Users/xxx/Documents"，不带盘符，也不带根目录前缀。
-    pub(crate) fn build_path_hierarchy(index: &MftIndex) -> Vec<MftFileInfo> {
-        // 第一步：构建 parent_frn → children 的映射
-        let mut children_map: HashMap<u64, Vec<u64>> = HashMap::new();
-        for (&frn, entry) in index.iter() {
-            children_map
-                .entry(entry.parent_frn)
-                .or_default()
-                .push(frn);
+    /// 构建完整路径（父链 + 记忆化，O(n) 摊还）。
+    ///
+    /// 旧实现：children_map（FRN→Vec<FRN>）+ 从根 DFS，每个子节点都会 clone 父路径。
+    /// 新实现：对每条记录沿父链向上走，遇到"已解析"就复用其路径；
+    /// 环/断链的父链标记为不可达。产生的路径同样是 volume-relative。
+    fn build_path_hierarchy(index: &MftIndex) -> Vec<MftFileInfo> {
+        const ROOT_FRN: usize = 5;
+        let n = index.len();
+        // 0=未处理 1=处理中（可检测环） 2=已解析 3=不可达
+        let mut state = vec![0u8; n];
+        let mut paths: Vec<Option<String>> = std::iter::repeat_with(|| None).take(n).collect();
+
+        for start in 0..n {
+            if start == ROOT_FRN || index[start].is_none() || state[start] != 0 {
+                continue;
+            }
+
+            // 沿父链向上，直到根 / 已解析节点 / 环 / 断链
+            let mut chain: Vec<usize> = Vec::new();
+            let mut cur = start;
+            let mut base_path: Option<String> = None;
+            let mut broken = false;
+            loop {
+                match state[cur] {
+                    2 => {
+                        base_path = paths[cur].clone();
+                        break;
+                    }
+                    1 | 3 => {
+                        broken = true;
+                        break;
+                    }
+                    _ => {}
+                }
+                state[cur] = 1;
+                chain.push(cur);
+
+                let entry = match index[cur].as_ref() {
+                    Some(entry) => entry,
+                    None => {
+                        broken = true;
+                        break;
+                    }
+                };
+                let parent = entry.parent_frn as usize;
+                if parent == ROOT_FRN {
+                    base_path = Some(String::new());
+                    break;
+                }
+                if parent >= n || index[parent].is_none() {
+                    broken = true;
+                    break;
+                }
+                cur = parent;
+            }
+
+            if broken {
+                for &node in &chain {
+                    state[node] = 3;
+                }
+                continue;
+            }
+
+            // 自顶向下拼接（chain 是自底向上的，反转即可）
+            let mut acc = base_path.unwrap_or_default();
+            for &node in chain.iter().rev() {
+                let name = index[node]
+                    .as_ref()
+                    .map(|entry| entry.name.as_str())
+                    .unwrap_or("");
+                let full = if acc.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{}/{}", acc, name)
+                };
+                paths[node] = Some(full.clone());
+                state[node] = 2;
+                acc = full;
+            }
         }
 
-        // 第二步：从根目录 (FRN=5) 的直接子项开始 DFS，current_path 为空。
-        // 这样可以得到 "Users/xxx" 而不是 "./Users/xxx" 或 "/Users/xxx"。
-        let mut files = Vec::with_capacity(index.len());
-        let mut visited = HashSet::new();
-        let root_frn = 5u64;
-        visited.insert(root_frn);
-        if let Some(children) = children_map.get(&root_frn) {
-            for &child_frn in children {
-                Self::dfs_resolve(child_frn, String::new(), index, &children_map, &mut files, &mut visited, 0);
+        // 取出结果（路径 String 直接 move，不额外 clone）
+        let mut files = Vec::with_capacity(n);
+        for (i, entry) in index.iter().enumerate() {
+            if i == ROOT_FRN {
+                continue;
+            }
+            if let Some(entry) = entry {
+                if let Some(path) = paths[i].take() {
+                    files.push(MftFileInfo {
+                        path,
+                        name: entry.name.clone(),
+                        size: entry.real_size,
+                        is_dir: entry.is_dir,
+                        mtime: entry.mtime,
+                    });
+                }
             }
         }
         files
     }
-
-    fn dfs_resolve(
-        frn: u64,
-        current_path: String,
-        index: &MftIndex,
-        children_map: &HashMap<u64, Vec<u64>>,
-        files: &mut Vec<MftFileInfo>,
-        visited: &mut HashSet<u64>,
-        depth: usize,
-    ) {
-        const MAX_DEPTH: usize = 128;
-        if depth > MAX_DEPTH {
-            return;
-        }
-        // 防止 MFT 父链中的环导致重复遍历
-        if !visited.insert(frn) {
-            return;
-        }
-
-        if let Some(entry) = index.get(&frn) {
-            let full_path = if current_path.is_empty() {
-                entry.name.clone()
-            } else {
-                format!("{}/{}", current_path, entry.name)
-            };
-
-            // 文件和目录都加入输出（目录的 size=0，后续聚合计算）
-            files.push(MftFileInfo {
-                path: full_path.clone(),
-                name: entry.name.clone(),
-                size: entry.real_size,
-                is_dir: entry.is_dir,
-                mtime: entry.mtime,
-            });
-
-            // 只有目录才递归处理子节点，避免循环/栈溢出
-            if entry.is_dir {
-                if let Some(children) = children_map.get(&frn) {
-                    for &child_frn in children {
-                        Self::dfs_resolve(
-                            child_frn,
-                            full_path.clone(),
-                            index,
-                            children_map,
-                            files,
-                            visited,
-                            depth + 1,
-                        );
-                    }
-                }
-            }
-        }
-    }
 }
+
 
 impl Drop for MftScanner {
     fn drop(&mut self) {
@@ -1244,10 +1293,12 @@ pub fn try_mft_scan_with_cancel(root_path: &str, cancel_id: u64) -> Option<MftSc
     match scanner.scan() {
         Ok(result) => {
             eprintln!(
-                "[MFT] 扫描完成: {} 文件, {} 目录, {:.1}MB MFT 数据",
+                "[MFT] 扫描完成: {} 文件, {} 目录, {:.1}MB MFT 数据 (读取+解析 {:.2}s, 建路径 {:.2}s)",
                 result.file_count,
                 result.dir_count,
-                result.data_read as f64 / 1024.0 / 1024.0
+                result.data_read as f64 / 1024.0 / 1024.0,
+                result.read_secs,
+                result.path_secs
             );
             Some(result)
         }
