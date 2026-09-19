@@ -4,7 +4,7 @@
 // 支持按文件名毫秒级跨盘搜索（Everything 式）。索引构建一次后常驻，
 // 后续搜索仅为内存过滤；刷新通过 global_search_ensure_index / refresh 全量重建。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -524,77 +524,64 @@ impl GlobalIndex {
             _ => None,
         });
         let q_lower = text.map(|t| t.to_lowercase()).unwrap_or_default();
+        let has_text = !q_lower.is_empty();
 
         let entries = self.entries.read();
 
-        let mut candidates: Vec<IndexEntry> = if q_lower.is_empty() {
-            // 无文本条件：全量并行过滤（例如 *.pdf / size:>1GB 等纯 filter 查询）
-            let values: Vec<&IndexEntry> = entries.values().collect();
-            values
-                .par_iter()
-                .filter_map(|e| {
-                    if apply_filters(e, &filters) {
-                        Some((*e).clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else if q_lower.chars().count() <= 2 {
-            let values: Vec<&IndexEntry> = entries.values().collect();
-            values
-                .par_iter()
-                .filter_map(|e| {
-                    if e.name_lower.contains(&q_lower) && apply_filters(e, &filters) {
-                        Some((*e).clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            let name_index = self.name_index.read();
-            let first_char = q_lower.chars().next().unwrap_or('\0');
-            let candidate_keys: Vec<String> = name_index
-                .get(&first_char)
-                .map(|set| set.iter().cloned().collect())
-                .unwrap_or_default();
-            drop(name_index);
+        let matches = |e: &IndexEntry| -> bool {
+            (!has_text || e.name_lower.contains(&q_lower)) && apply_filters(e, &filters)
+        };
 
-            candidate_keys
+        // 每线程维护一个大小为 limit 的 top-K 堆，最后归并；
+        // 只会 clone 最终 ≤limit 条，而不是克隆全部命中。
+        let results = if !has_text || q_lower.chars().count() <= 2 {
+            // 无文本条件（*.pdf / size:>1GB 等）或短查询：全量并行过滤
+            let values: Vec<&IndexEntry> = entries.values().collect();
+            values
                 .par_iter()
-                .filter_map(|key| {
-                    entries.get(key).and_then(|e| {
-                        if e.name_lower.contains(&q_lower) && apply_filters(e, &filters) {
-                            Some(e.clone())
-                        } else {
-                            None
+                .fold(
+                    || TopK::new(limit),
+                    |mut acc, e| {
+                        if matches(e) {
+                            acc.push(e, relevance_score(e, &q_lower));
                         }
-                    })
-                })
-                .collect()
+                        acc
+                    },
+                )
+                .reduce(|| TopK::new(limit), TopK::merge)
+                .into_entries()
+        } else if let Some(first_char) = q_lower.chars().next() {
+            // 长文本：只扫首字符桶。
+            // 注意这里收集的是 &String 引用（几百 KB），不再 clone 每个候选路径。
+            let name_index = self.name_index.read();
+            let results = match name_index.get(&first_char) {
+                Some(bucket) => {
+                    let keys: Vec<&String> = bucket.iter().collect();
+                    keys.par_iter()
+                        .fold(
+                            || TopK::new(limit),
+                            |mut acc, key| {
+                                if let Some(e) = entries.get(key.as_str()) {
+                                    if matches(e) {
+                                        acc.push(e, relevance_score(e, &q_lower));
+                                    }
+                                }
+                                acc
+                            },
+                        )
+                        .reduce(|| TopK::new(limit), TopK::merge)
+                        .into_entries()
+                }
+                None => Vec::new(),
+            };
+            drop(name_index);
+            results
+        } else {
+            Vec::new()
         };
 
         drop(entries);
-
-        // 按相关性排序：完全匹配 > 前缀匹配 > 包含匹配，同级按大小降序；
-        // 同分按名称/路径字典序兜底，保证同一查询多次搜索结果顺序稳定
-        let cmp = |a: &IndexEntry, b: &IndexEntry| {
-            let sa = relevance_score(a, &q_lower);
-            let sb = relevance_score(b, &q_lower);
-            sb.cmp(&sa)
-                .then_with(|| a.name_lower.cmp(&b.name_lower))
-                .then_with(|| a.path.cmp(&b.path))
-        };
-
-        // 候选远多于 limit 时先做 O(n) 部分选择，避免对百万级候选做全量排序
-        if candidates.len() > limit {
-            candidates.select_nth_unstable_by(limit, cmp);
-            candidates.truncate(limit);
-        }
-        candidates.sort_unstable_by(cmp);
-
-        candidates
+        results
     }
 }
 
@@ -844,7 +831,8 @@ fn apply_filters(entry: &IndexEntry, filters: &[SearchFilter]) -> bool {
             SearchFilterKind::Prefix(p) => entry.name_lower.starts_with(p),
             SearchFilterKind::Suffix(s) => entry.name_lower.ends_with(s),
             SearchFilterKind::Ext(e) => !entry.is_dir && entry.ext == *e,
-            SearchFilterKind::Dir(d) => entry.path.to_lowercase().contains(d),
+            // 用无分配的 ASCII 快速路径，避免每条目一次 String 分配
+            SearchFilterKind::Dir(d) => contains_ignore_case(&entry.path, d),
             SearchFilterKind::Type { is_dir } => entry.is_dir == *is_dir,
             SearchFilterKind::Size { op, bytes } => compare_op(entry.size, *op, *bytes),
             SearchFilterKind::Mtime { op, seconds } => {
@@ -948,6 +936,100 @@ fn extension_matches(name: &str, ext_lower: &str) -> bool {
     match name.rsplit_once('.') {
         Some((_, ext)) => ext.eq_ignore_ascii_case(ext_lower),
         None => false,
+    }
+}
+
+/// 搜索结果 top-K 收集器。
+///
+/// BinaryHeap 的 Ord 定义为"越差越大"，因此堆顶始终是当前最差候选：
+/// 堆未满时直接压入；已满时只在"新候选优于堆顶"时替换，单次 O(log k)。
+struct TopK<'a> {
+    limit: usize,
+    heap: BinaryHeap<Candidate<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct Candidate<'a> {
+    entry: &'a IndexEntry,
+    score: i64,
+}
+
+impl<'a> Candidate<'a> {
+    /// 与最终排序一致的"更优"判断：
+    /// 相关性分数降序 → name_lower 升序 → path 升序
+    fn better_than(&self, other: &Self) -> bool {
+        self.score > other.score
+            || (self.score == other.score
+                && (self.entry.name_lower < other.entry.name_lower
+                    || (self.entry.name_lower == other.entry.name_lower
+                        && self.entry.path < other.entry.path)))
+    }
+}
+
+impl PartialEq for Candidate<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        !self.better_than(other) && !other.better_than(self)
+    }
+}
+impl Eq for Candidate<'_> {}
+impl PartialOrd for Candidate<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Candidate<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if self.better_than(other) {
+            std::cmp::Ordering::Less
+        } else if other.better_than(self) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    }
+}
+
+impl<'a> TopK<'a> {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            heap: BinaryHeap::with_capacity(limit.min(1024)),
+        }
+    }
+
+    fn push(&mut self, entry: &'a IndexEntry, score: i64) {
+        let candidate = Candidate { entry, score };
+        if self.heap.len() < self.limit {
+            self.heap.push(candidate);
+        } else if let Some(worst) = self.heap.peek() {
+            if candidate.better_than(worst) {
+                self.heap.pop();
+                self.heap.push(candidate);
+            }
+        }
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        for candidate in other.heap {
+            if self.heap.len() < self.limit {
+                self.heap.push(candidate);
+            } else if let Some(worst) = self.heap.peek() {
+                if candidate.better_than(worst) {
+                    self.heap.pop();
+                    self.heap.push(candidate);
+                }
+            }
+        }
+        self
+    }
+
+    /// 升序出堆（最优在前），此时才 clone 结果条目
+    fn into_entries(self) -> Vec<IndexEntry> {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|c| c.entry.clone())
+            .collect()
     }
 }
 
