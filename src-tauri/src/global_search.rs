@@ -4,7 +4,7 @@
 // 支持按文件名毫秒级跨盘搜索（Everything 式）。索引构建一次后常驻，
 // 后续搜索仅为内存过滤；刷新通过 global_search_ensure_index / refresh 全量重建。
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::mpsc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -74,10 +74,14 @@ struct IndexMeta {
 }
 
 pub struct GlobalIndex {
-    /// 以绝对路径为 key 的条目存储，保证去重
-    entries: RwLock<HashMap<String, IndexEntry>>,
-    /// 文件名首字符分桶索引：char -> set of path keys
-    name_index: RwLock<HashMap<char, HashSet<String>>>,
+    /// 条目 arena：Vec 连续存储，搜索顺序/并行扫描时缓存局部性好
+    entries: RwLock<Vec<IndexEntry>>,
+    /// 绝对路径 → arena 下标（去重 + 按路径增删）
+    by_path: RwLock<HashMap<String, u32>>,
+    /// 文件名首字符分桶：char → arena 下标列表。
+    /// 早期是 HashSet<String>，相当于把每个路径再存一份（百万级额外分配）；
+    /// 改存 u32 下标后不再复制路径，分桶查询也省掉了按路径哈希查找。
+    name_index: RwLock<HashMap<char, Vec<u32>>>,
     state: RwLock<IndexState>,
     meta: RwLock<IndexMeta>,
     /// 增量维护的文件/目录计数，避免每次状态刷新都 O(n) 全量重数
@@ -85,10 +89,23 @@ pub struct GlobalIndex {
     dir_count: AtomicUsize,
 }
 
+/// 从绝对路径取文件名（存储态不再保存 name，结果/诊断时才派生）
+fn name_from_path(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(_, name)| name.to_string())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// 取小写文件名的首字符（空名归入 char::MIN 桶）
+fn bucket_char(name_lower: &str) -> char {
+    name_lower.chars().next().unwrap_or(char::MIN)
+}
+
 impl GlobalIndex {
     fn new() -> Self {
         GlobalIndex {
-            entries: RwLock::new(HashMap::new()),
+            entries: RwLock::new(Vec::new()),
+            by_path: RwLock::new(HashMap::new()),
             name_index: RwLock::new(HashMap::new()),
             state: RwLock::new(IndexState::NotLoaded),
             meta: RwLock::new(IndexMeta::default()),
@@ -96,6 +113,7 @@ impl GlobalIndex {
             dir_count: AtomicUsize::new(0),
         }
     }
+
 
     /// 从 SQLite 磁盘缓存异步恢复持久化索引。
     /// 应在后台任务中调用，避免阻塞启动路径。
@@ -163,38 +181,42 @@ impl GlobalIndex {
         }
     }
 
-    /// 添加或替换一条索引。entries 与 name_index 在同一把锁临界区内更新，
-    /// 保证并发 search() 不会观察到两半不一致的中间态。
-    /// 锁顺序：永远先 entries 后 name_index，避免死锁。
+    /// 添加或替换一条索引。entries / by_path / name_index 在同一锁临界区内更新。
+    /// 锁顺序：永远先 entries 再 by_path 再 name_index，避免死锁。
     fn upsert_internal(&self, entry: IndexEntry) {
-        let first_char = entry.name_lower.chars().next().unwrap_or('\0');
+        let first_char = bucket_char(&entry.name_lower);
+        let path = entry.path.clone();
+        let is_dir = entry.is_dir;
 
         let mut entries = self.entries.write();
+        let mut by_path = self.by_path.write();
         let mut name_index = self.name_index.write();
 
-        let old_entry = entries.insert(entry.path.clone(), entry.clone());
-
-        if let Some(old) = &old_entry {
-            let old_char = old.name_lower.chars().next().unwrap_or('\0');
-            if old_char != first_char {
-                if let Some(set) = name_index.get_mut(&old_char) {
-                    set.remove(&old.path);
+        match by_path.get(&path).copied() {
+            Some(idx) => {
+                let old = &entries[idx as usize];
+                if old.is_dir != is_dir {
+                    self.bump_count(old.is_dir, -1);
+                    self.bump_count(is_dir, 1);
                 }
+                let old_char = bucket_char(&old.name_lower);
+                entries[idx as usize] = entry;
+                if old_char != first_char {
+                    // 换桶：从旧桶摘掉，加入新桶（不做 contains 线性扫描）
+                    if let Some(bucket) = name_index.get_mut(&old_char) {
+                        bucket.retain(|&i| i != idx);
+                    }
+                    name_index.entry(first_char).or_default().push(idx);
+                }
+                // 同桶更新：桶内已有该下标，无需处理
             }
-        }
-        name_index
-            .entry(first_char)
-            .or_insert_with(HashSet::new)
-            .insert(entry.path.clone());
-
-        // 增量维护计数
-        match &old_entry {
-            None => self.bump_count(entry.is_dir, 1),
-            Some(old) if old.is_dir != entry.is_dir => {
-                self.bump_count(old.is_dir, -1);
-                self.bump_count(entry.is_dir, 1);
+            None => {
+                let idx = entries.len() as u32;
+                entries.push(entry);
+                by_path.insert(path, idx);
+                name_index.entry(first_char).or_default().push(idx);
+                self.bump_count(is_dir, 1);
             }
-            _ => {}
         }
     }
 
@@ -207,71 +229,92 @@ impl GlobalIndex {
         }
     }
 
-    /// 批量 upsert：整批在同一个锁临界区内完成，且按值消费避免逐条 clone。
-    /// 建索引 / 追加扫描结果时使用（逐条 upsert_internal 意味着每条目两次写锁 + 一次克隆）。
+    /// 批量 upsert：整批在同一个锁临界区内完成（按值消费，避免逐条 clone）
     fn upsert_batch_internal(&self, batch: Vec<IndexEntry>) {
-        // 锁顺序与 upsert_internal 一致：先 entries 后 name_index
         let mut entries = self.entries.write();
+        let mut by_path = self.by_path.write();
         let mut name_index = self.name_index.write();
 
         for entry in batch {
-            let first_char = entry.name_lower.chars().next().unwrap_or('\0');
-            let is_dir = entry.is_dir;
+            let first_char = bucket_char(&entry.name_lower);
             let path = entry.path.clone();
+            let is_dir = entry.is_dir;
 
-            let old_entry = entries.insert(path.clone(), entry);
+            match by_path.get(&path).copied() {
+                Some(idx) => {
+                    let old = &entries[idx as usize];
+                    if old.is_dir != is_dir {
+                        self.bump_count(old.is_dir, -1);
+                        self.bump_count(is_dir, 1);
+                    }
+                    let old_char = bucket_char(&old.name_lower);
+                    entries[idx as usize] = entry;
+                    if old_char != first_char {
+                        if let Some(bucket) = name_index.get_mut(&old_char) {
+                            bucket.retain(|&i| i != idx);
+                        }
+                        name_index.entry(first_char).or_default().push(idx);
+                    }
+                }
+                None => {
+                    let idx = entries.len() as u32;
+                    entries.push(entry);
+                    by_path.insert(path, idx);
+                    name_index.entry(first_char).or_default().push(idx);
+                    self.bump_count(is_dir, 1);
+                }
+            }
+        }
+    }
 
-            if let Some(old) = &old_entry {
-                let old_char = old.name_lower.chars().next().unwrap_or('\0');
-                if old_char != first_char {
-                    if let Some(set) = name_index.get_mut(&old_char) {
-                        set.remove(&old.path);
+    /// 移除指定路径的索引（swap_remove 保持 arena 紧凑）
+    fn remove_path_internal(&self, path: &str) {
+        let mut entries = self.entries.write();
+        let mut by_path = self.by_path.write();
+        let mut name_index = self.name_index.write();
+
+        let Some(idx) = by_path.remove(path) else {
+            return;
+        };
+        let removed_is_dir = entries[idx as usize].is_dir;
+        let removed_char = bucket_char(&entries[idx as usize].name_lower);
+
+        let last = entries.len() - 1;
+        if idx as usize != last {
+            entries.swap_remove(idx as usize);
+            // 被换过来的条目：同步 by_path 与 name_index
+            let moved_path = entries[idx as usize].path.clone();
+            let moved_char = bucket_char(&entries[idx as usize].name_lower);
+            by_path.insert(moved_path, idx);
+            if let Some(bucket) = name_index.get_mut(&moved_char) {
+                for slot in bucket.iter_mut() {
+                    if *slot == last as u32 {
+                        *slot = idx;
+                        break;
                     }
                 }
             }
-            name_index
-                .entry(first_char)
-                .or_insert_with(HashSet::new)
-                .insert(path);
-
-            match &old_entry {
-                None => self.bump_count(is_dir, 1),
-                Some(old) if old.is_dir != is_dir => {
-                    self.bump_count(old.is_dir, -1);
-                    self.bump_count(is_dir, 1);
-                }
-                _ => {}
-            }
+        } else {
+            entries.pop();
         }
+
+        if let Some(bucket) = name_index.get_mut(&removed_char) {
+            bucket.retain(|&i| i != idx);
+        }
+        self.bump_count(removed_is_dir, -1);
     }
 
-    /// 移除指定路径的索引。
-    fn remove_path_internal(&self, path: &str) {
-        // 锁顺序与 upsert_internal 一致：先 entries 后 name_index
-        let mut entries = self.entries.write();
-        let mut name_index = self.name_index.write();
-
-        if let Some(old) = entries.remove(path) {
-            let old_char = old.name_lower.chars().next().unwrap_or('\0');
-            if let Some(set) = name_index.get_mut(&old_char) {
-                set.remove(path);
-            }
-            self.bump_count(old.is_dir, -1);
-        }
-    }
-
-    /// 按前缀移除索引（用于 USN 增量失败时重建某路径，或移除某盘）。
-    /// 只移除该路径本身及其子路径，避免 `C:/foo` 误伤 `C:/foobar`。
+    /// 按前缀移除索引（仅该路径本身及其子路径）
     fn remove_prefix_internal(&self, prefix: &str) {
-        let paths_to_remove: Vec<String> = {
-            let entries = self.entries.read();
-            entries
+        let paths: Vec<String> = {
+            let by_path = self.by_path.read();
+            by_path
                 .keys()
                 .filter(|k| is_same_or_child(prefix, k))
                 .cloned()
                 .collect()
         };
-        for path in paths_to_remove {
+        for path in paths {
             self.remove_path_internal(&path);
         }
     }
@@ -279,10 +322,12 @@ impl GlobalIndex {
     /// 清空所有索引数据。
     fn clear_internal(&self) {
         self.entries.write().clear();
+        self.by_path.write().clear();
         self.name_index.write().clear();
         self.file_count.store(0, Ordering::Relaxed);
         self.dir_count.store(0, Ordering::Relaxed);
     }
+
 
     /// 准备开始构建索引（设置 Loading 状态）
     pub fn set_loading(&self) {
@@ -301,12 +346,13 @@ impl GlobalIndex {
         let batch: Vec<IndexEntry> = mft_files
             .iter()
             .map(|f| {
-                let name = f.name.clone();
+                // 存储态不保留 name / ext（结果与诊断时由 path 派生），
+                // 只保留匹配所需的 name_lower，省掉百万级 String 分配。
                 IndexEntry {
                     path: normalize_abs_path(drive, &f.path),
-                    name: name.clone(),
-                    name_lower: name.to_lowercase(),
-                    ext: extension_of(&name),
+                    name: String::new(),
+                    name_lower: f.name.to_lowercase(),
+                    ext: String::new(),
                     size: f.size as i64,
                     is_dir: f.is_dir,
                     mtime: f.mtime,
@@ -326,17 +372,14 @@ impl GlobalIndex {
     pub fn append_scan(&self, drive: char, items: &[crate::scan::Item]) {
         let batch: Vec<IndexEntry> = items
             .iter()
-            .map(|item| {
-                let name = item.name.to_string();
-                IndexEntry {
-                    path: normalize_abs_path(drive, item.path.as_str()),
-                    name: name.clone(),
-                    name_lower: name.to_lowercase(),
-                    ext: extension_of(&name),
-                    size: item.size,
-                    is_dir: item.is_dir,
-                    mtime: item.mtime,
-                }
+            .map(|item| IndexEntry {
+                path: normalize_abs_path(drive, item.path.as_str()),
+                name: String::new(),
+                name_lower: item.name.to_lowercase(),
+                ext: String::new(),
+                size: item.size,
+                is_dir: item.is_dir,
+                mtime: item.mtime,
             })
             .collect();
         self.upsert_batch_internal(batch);
@@ -374,7 +417,7 @@ impl GlobalIndex {
         {
             let entries = self.entries.read();
             let mut chunk = Vec::with_capacity(CHUNK_SIZE);
-            for entry in entries.values() {
+            for entry in entries.iter() {
                 chunk.push(entry.clone());
                 if chunk.len() >= CHUNK_SIZE {
                     let _ = tx.send(std::mem::take(&mut chunk));
@@ -407,12 +450,11 @@ impl GlobalIndex {
                 } else {
                     format!("{}/{}", path_base, item.path.as_str())
                 };
-                let name = item.name.to_string();
                 IndexEntry {
                     path: abs_path,
-                    name: name.clone(),
-                    name_lower: name.to_lowercase(),
-                    ext: extension_of(&name),
+                    name: String::new(),
+                    name_lower: item.name.to_lowercase(),
+                    ext: String::new(),
                     size: item.size,
                     is_dir: item.is_dir,
                     mtime: item.mtime,
@@ -475,19 +517,8 @@ impl GlobalIndex {
         if paths.is_empty() {
             return;
         }
-        {
-            // 锁顺序与 upsert_internal 一致：先 entries 后 name_index
-            let mut entries = self.entries.write();
-            let mut name_index = self.name_index.write();
-            for path in paths {
-                if let Some(old) = entries.remove(path) {
-                    let old_char = old.name_lower.chars().next().unwrap_or('\0');
-                    if let Some(set) = name_index.get_mut(&old_char) {
-                        set.remove(path.as_str());
-                    }
-                    self.bump_count(old.is_dir, -1);
-                }
-            }
+        for path in paths {
+            self.remove_path_internal(path);
         }
         if matches!(*self.state.read(), IndexState::Ready(..)) {
             self.update_ready_state();
@@ -501,7 +532,12 @@ impl GlobalIndex {
 
     /// 返回前 n 个条目名称样本（诊断：搜索无结果时确认 name 字段是否正常）
     pub fn sample_names(&self, n: usize) -> Vec<String> {
-        self.entries.read().values().take(n).map(|e| e.name.clone()).collect()
+        self.entries
+            .read()
+            .iter()
+            .take(n)
+            .map(|e| name_from_path(&e.path))
+            .collect()
     }
 
     /// 支持 Everything 式过滤语法与相关性排序的搜索。
@@ -536,7 +572,7 @@ impl GlobalIndex {
         // 只会 clone 最终 ≤limit 条，而不是克隆全部命中。
         let results = if !has_text || q_lower.chars().count() <= 2 {
             // 无文本条件（*.pdf / size:>1GB 等）或短查询：全量并行过滤
-            let values: Vec<&IndexEntry> = entries.values().collect();
+            let values: Vec<&IndexEntry> = entries.iter().collect();
             values
                 .par_iter()
                 .fold(
@@ -555,23 +591,21 @@ impl GlobalIndex {
             // 注意这里收集的是 &String 引用（几百 KB），不再 clone 每个候选路径。
             let name_index = self.name_index.read();
             let results = match name_index.get(&first_char) {
-                Some(bucket) => {
-                    let keys: Vec<&String> = bucket.iter().collect();
-                    keys.par_iter()
-                        .fold(
-                            || TopK::new(limit),
-                            |mut acc, key| {
-                                if let Some(e) = entries.get(key.as_str()) {
-                                    if matches(e) {
-                                        acc.push(e, relevance_score(e, &q_lower));
-                                    }
+                Some(bucket) => bucket
+                    .par_iter()
+                    .fold(
+                        || TopK::new(limit),
+                        |mut acc, &idx| {
+                            if let Some(e) = entries.get(idx as usize) {
+                                if matches(e) {
+                                    acc.push(e, relevance_score(e, &q_lower));
                                 }
-                                acc
-                            },
-                        )
-                        .reduce(|| TopK::new(limit), TopK::merge)
-                        .into_entries()
-                }
+                            }
+                            acc
+                        },
+                    )
+                    .reduce(|| TopK::new(limit), TopK::merge)
+                    .into_entries(),
                 None => Vec::new(),
             };
             drop(name_index);
@@ -830,7 +864,15 @@ fn apply_filters(entry: &IndexEntry, filters: &[SearchFilter]) -> bool {
             SearchFilterKind::Name(n) => entry.name_lower.contains(n),
             SearchFilterKind::Prefix(p) => entry.name_lower.starts_with(p),
             SearchFilterKind::Suffix(s) => entry.name_lower.ends_with(s),
-            SearchFilterKind::Ext(e) => !entry.is_dir && entry.ext == *e,
+            // ext 不再单独存储：从 name_lower 现算（零分配）
+            SearchFilterKind::Ext(e) => {
+                !entry.is_dir
+                    && entry
+                        .name_lower
+                        .rsplit_once('.')
+                        .map(|(_, ext)| ext.eq_ignore_ascii_case(e))
+                        .unwrap_or(false)
+            }
             // 用无分配的 ASCII 快速路径，避免每条目一次 String 分配
             SearchFilterKind::Dir(d) => contains_ignore_case(&entry.path, d),
             SearchFilterKind::Type { is_dir } => entry.is_dir == *is_dir,
@@ -1023,12 +1065,16 @@ impl<'a> TopK<'a> {
         self
     }
 
-    /// 升序出堆（最优在前），此时才 clone 结果条目
+    /// 升序出堆（最优在前），此时才 clone 结果条目并补上文件名
     fn into_entries(self) -> Vec<IndexEntry> {
         self.heap
             .into_sorted_vec()
             .into_iter()
-            .map(|c| c.entry.clone())
+            .map(|c| {
+                let mut entry = c.entry.clone();
+                entry.name = name_from_path(&entry.path);
+                entry
+            })
             .collect()
     }
 }
