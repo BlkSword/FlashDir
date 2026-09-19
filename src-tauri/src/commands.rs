@@ -205,7 +205,7 @@ pub async fn scan_directory_paged(
 
     // Top 5 大文件必须独立按 size 挑选：
     // 早期实现直接取"当前排序后的前 5 个文件"，用户按名称排序时会拿到错的 Top5。
-    let top_files: Vec<flashdir::scan::Item> = {
+    let mut top_files: Vec<flashdir::scan::Item> = {
         let mut files: Vec<&flashdir::scan::Item> =
             filtered.iter().copied().filter(|i| !i.is_dir).collect();
         if files.len() > 5 {
@@ -215,6 +215,10 @@ pub async fn scan_directory_paged(
         files.sort_unstable_by(|a, b| b.size.cmp(&a.size));
         files.into_iter().cloned().collect()
     };
+    // 只有返回给前端的这几条需要格式化文本（全量条目的格式化已移除）
+    for item in top_files.iter_mut() {
+        item.size_formatted = flashdir::scan::format_size(item.size);
+    }
 
     if sort_column != "size" || sort_direction != "desc" {
         filtered.sort_unstable_by(|a, b| {
@@ -237,11 +241,14 @@ pub async fn scan_directory_paged(
 
     let start = (page - 1) * page_size;
     let end = start.saturating_add(page_size).min(total_items);
-    let page_items: Vec<flashdir::scan::Item> = if start < total_items {
+    let mut page_items: Vec<flashdir::scan::Item> = if start < total_items {
         filtered[start..end].iter().map(|i| (*i).clone()).collect()
     } else {
         Vec::new()
     };
+    for item in page_items.iter_mut() {
+        item.size_formatted = flashdir::scan::format_size(item.size);
+    }
 
     // 历史记录只在"用户主动扫描"时写入；分页/排序/过滤请求不重复记录
     if record_history.unwrap_or(false) {
@@ -309,7 +316,7 @@ pub async fn get_dir_children(path: String) -> Result<Vec<flashdir::scan::Item>,
     .await
     .map_err(|e| e.to_string())?;
 
-    let children: Vec<flashdir::scan::Item> = view
+    let mut children: Vec<flashdir::scan::Item> = view
         .items()
         .iter()
         .filter(|i| {
@@ -320,6 +327,9 @@ pub async fn get_dir_children(path: String) -> Result<Vec<flashdir::scan::Item>,
         })
         .cloned()
         .collect();
+    for child in children.iter_mut() {
+        child.size_formatted = flashdir::scan::format_size(child.size);
+    }
 
     Ok(children)
 }

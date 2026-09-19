@@ -178,7 +178,7 @@ fn print_table(items: &[scan::Item], total_size: i64, scan_time: f64, file_count
         writeln!(
             out,
             "{:>8} {:<10} {:<50}",
-            item.size_formatted.as_str(),
+            format_size(item.size),
             type_str,
             name
         )
@@ -226,7 +226,7 @@ fn print_json(items: &[scan::Item], total_size: i64, scan_time: f64, file_count:
                 name: i.name.to_string(),
                 path: i.path.to_string(),
                 size: i.size,
-                size_formatted: i.size_formatted.to_string(),
+                size_formatted: format_size(i.size),
                 is_dir: i.is_dir,
             })
             .collect(),

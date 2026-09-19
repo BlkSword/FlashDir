@@ -1062,10 +1062,8 @@ fn aggregate_directory_sizes(items: &mut Vec<Item>) -> i64 {
         items[i].size = dir_sizes[i];
     }
 
-    for item in items.iter_mut() {
-        item.size_formatted = format_size(item.size);
-    }
-
+    // 不再为每个条目预格式化 size_formatted（几十万次 format! + 分配）：
+    // 展示层按需格式化（前端有 formatSize 回退，后端分页/树只格式化返回的少量条目）。
     total_size
 }
 
