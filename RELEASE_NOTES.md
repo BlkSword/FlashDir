@@ -1,5 +1,35 @@
 # FlashDir Release Notes
 
+## Unreleased（三）—— 性能专项（实测驱动）
+
+> 所有改动都有 before/after 实测；完整数据见 README「性能实测」。
+
+### 全局搜索（114 万条真实索引）
+- 改为**每线程 top-K 堆 + 归并**，不再"克隆全部命中再排序截断"：
+  `NOT *.tmp` **706ms → 30ms**、单字符 `a` **448ms → 38ms**
+- `dir:` 过滤去掉逐条 `to_lowercase()`（百万次 String 分配）
+- 索引改 **arena**（`Vec<IndexEntry>` + `path→u32` + `首字符→Vec<u32>`），
+  不再复制 name/ext/桶内路径 → GUI 常驻 **938MB → 705MB**、
+  分桶查询 **12ms → 2ms**、索引构建 **1.89s → 1.08s**
+
+### 磁盘缓存
+- **每目录一行 blob**（bincode）替代"每条目一行 + 3 索引"：
+  C:/Windows 首扫 **47s → 3.4s**（写缓存 42s → 0.9s）、
+  缓存命中 **1.1-7.6s → 0.8s**
+- 缓存写入**后台线程**（FIFO + flush），GUI 扫描不再等待落盘
+- 删除 4 个从未被查询使用的索引；SQL 排序改内存排序（省 ~0.7s/30 万行）
+- 不再逐条预格式化 `sizeFormatted`（40 万条省 ~55ms，DB 行更小）
+
+### MFT 扫描
+- `HashMap<FRN, Entry>` → **记录号即下标的 Vec**；记录解析 rayon 并行
+- 路径构建：children_map + DFS（逐子节点 clone 父路径）→ **父链 + 记忆化**
+- C:/Windows 端到端 **6.45s → 3.4s**（读+解析 2.2s→1.3s、建路径 0.2s）
+
+### USN 增量
+- 阈值按实测校准：增量约 1.67ms/条 vs 全量 2.4-3.5s →
+  `MAX_USN_CHANGES` **5000 → 1200**（超过直接全量，更快更稳）
+- 新增"USN 不可用原因"诊断日志，避免无声退回 mtime 新鲜度
+
 ## Unreleased（二）—— 实机验证中发现的 USN 深层缺陷
 
 > 这一批问题都是"编译通过 + 实机跑一遍"才暴露出来的：USN 增量此前从未真正成功过。
