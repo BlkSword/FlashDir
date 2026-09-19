@@ -12,29 +12,37 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde::Serialize;
 
-/// 索引中的一项（绝对路径）
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// 索引中的一项（绝对路径）。
+///
+/// 存储态只保留 path + name_lower（匹配必需）：
+/// - `name` 由 path 派生（序列化给前端时现算），省掉 114 万次 String 分配；
+/// - `ext` 在 `ext:` 过滤时从 name_lower 现算。
+#[derive(Debug, Clone)]
 pub struct IndexEntry {
     pub path: String,
-    pub name: String,
     /// 小写文件名（搜索用，避免每次搜索对全量 name 做 to_lowercase）
-    #[serde(skip)]
     pub name_lower: String,
-    /// 缓存的小写扩展名（不含点），用于加速 `ext:` 过滤
-    #[serde(skip)]
-    pub ext: String,
     pub size: i64,
     pub is_dir: bool,
     /// 文件修改时间（Windows FILETIME 转换而来的 Unix 时间戳，目录为 0）
     pub mtime: i64,
 }
 
-/// 从文件名提取小写扩展名（不含点）；无扩展名返回空字符串。
-fn extension_of(name: &str) -> String {
-    name.rsplit_once('.')
-        .map(|(_, ext)| ext.to_lowercase())
-        .unwrap_or_default()
+impl Serialize for IndexEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        // 与前端约定一致的字段：path / name / size / isDir / mtime
+        let mut state = serializer.serialize_struct("IndexEntry", 5)?;
+        state.serialize_field("path", &self.path)?;
+        state.serialize_field("name", &name_from_path(&self.path))?;
+        state.serialize_field("size", &self.size)?;
+        state.serialize_field("isDir", &self.is_dir)?;
+        state.serialize_field("mtime", &self.mtime)?;
+        state.end()
+    }
 }
 
 /// 索引就绪时的元数据（独立 struct：enum 级 rename_all 在 serde 里只作用于 variant 名，
@@ -76,8 +84,10 @@ struct IndexMeta {
 pub struct GlobalIndex {
     /// 条目 arena：Vec 连续存储，搜索顺序/并行扫描时缓存局部性好
     entries: RwLock<Vec<IndexEntry>>,
-    /// 绝对路径 → arena 下标（去重 + 按路径增删）
-    by_path: RwLock<HashMap<String, u32>>,
+    /// 路径 128 位哈希 → arena 下标（去重 + 按路径增删）。
+    /// 用哈希代替路径字符串作 key：省掉 114 万份路径副本（约 130MB）；
+    /// 命中后再用 arena 里的 path 校验，128 位下冲突概率可忽略。
+    by_path: RwLock<HashMap<u128, u32>>,
     /// 文件名首字符分桶：char → arena 下标列表。
     /// 早期是 HashSet<String>，相当于把每个路径再存一份（百万级额外分配）；
     /// 改存 u32 下标后不再复制路径，分桶查询也省掉了按路径哈希查找。
@@ -87,6 +97,19 @@ pub struct GlobalIndex {
     /// 增量维护的文件/目录计数，避免每次状态刷新都 O(n) 全量重数
     file_count: AtomicUsize,
     dir_count: AtomicUsize,
+}
+
+/// 路径 → 128 位哈希（双 64 位 FNV-1a 拼接，冲突概率可忽略）
+fn path_hash(path: &str) -> u128 {
+    let mut a: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut b: u64 = 0x8422_2325_cbf2_9ce4;
+    for byte in path.as_bytes() {
+        a ^= *byte as u64;
+        a = a.wrapping_mul(0x0000_0100_0000_01b3);
+        b ^= *byte as u64;
+        b = b.wrapping_mul(0x0000_0100_0000_01b3).rotate_left(7);
+    }
+    ((a as u128) << 64) | b as u128
 }
 
 /// 从绝对路径取文件名（存储态不再保存 name，结果/诊断时才派生）
@@ -185,14 +208,22 @@ impl GlobalIndex {
     /// 锁顺序：永远先 entries 再 by_path 再 name_index，避免死锁。
     fn upsert_internal(&self, entry: IndexEntry) {
         let first_char = bucket_char(&entry.name_lower);
-        let path = entry.path.clone();
+        let hash = path_hash(&entry.path);
         let is_dir = entry.is_dir;
 
         let mut entries = self.entries.write();
         let mut by_path = self.by_path.write();
         let mut name_index = self.name_index.write();
 
-        match by_path.get(&path).copied() {
+        // 命中校验：哈希命中且路径一致才算更新（128 位下冲突可忽略）
+        let existing = by_path.get(&hash).copied().filter(|&idx| {
+            entries
+                .get(idx as usize)
+                .map(|e| e.path == entry.path)
+                .unwrap_or(false)
+        });
+
+        match existing {
             Some(idx) => {
                 let old = &entries[idx as usize];
                 if old.is_dir != is_dir {
@@ -213,7 +244,7 @@ impl GlobalIndex {
             None => {
                 let idx = entries.len() as u32;
                 entries.push(entry);
-                by_path.insert(path, idx);
+                by_path.insert(hash, idx);
                 name_index.entry(first_char).or_default().push(idx);
                 self.bump_count(is_dir, 1);
             }
@@ -237,10 +268,17 @@ impl GlobalIndex {
 
         for entry in batch {
             let first_char = bucket_char(&entry.name_lower);
-            let path = entry.path.clone();
+            let hash = path_hash(&entry.path);
             let is_dir = entry.is_dir;
 
-            match by_path.get(&path).copied() {
+            let existing = by_path.get(&hash).copied().filter(|&idx| {
+                entries
+                    .get(idx as usize)
+                    .map(|e| e.path == entry.path)
+                    .unwrap_or(false)
+            });
+
+            match existing {
                 Some(idx) => {
                     let old = &entries[idx as usize];
                     if old.is_dir != is_dir {
@@ -259,7 +297,7 @@ impl GlobalIndex {
                 None => {
                     let idx = entries.len() as u32;
                     entries.push(entry);
-                    by_path.insert(path, idx);
+                    by_path.insert(hash, idx);
                     name_index.entry(first_char).or_default().push(idx);
                     self.bump_count(is_dir, 1);
                 }
@@ -273,19 +311,34 @@ impl GlobalIndex {
         let mut by_path = self.by_path.write();
         let mut name_index = self.name_index.write();
 
-        let Some(idx) = by_path.remove(path) else {
-            return;
+        let hash = path_hash(path);
+        // 正常路径：哈希命中且路径一致；哈希冲突时线性兜底（实际不会发生）
+        let idx = match by_path.get(&hash).copied() {
+            Some(idx)
+                if entries
+                    .get(idx as usize)
+                    .map(|e| e.path == path)
+                    .unwrap_or(false) =>
+            {
+                idx
+            }
+            _ => match entries.iter().position(|e| e.path == path) {
+                Some(i) => i as u32,
+                None => return,
+            },
         };
+
         let removed_is_dir = entries[idx as usize].is_dir;
         let removed_char = bucket_char(&entries[idx as usize].name_lower);
+        by_path.remove(&hash);
 
         let last = entries.len() - 1;
         if idx as usize != last {
             entries.swap_remove(idx as usize);
             // 被换过来的条目：同步 by_path 与 name_index
-            let moved_path = entries[idx as usize].path.clone();
+            let moved_hash = path_hash(&entries[idx as usize].path);
             let moved_char = bucket_char(&entries[idx as usize].name_lower);
-            by_path.insert(moved_path, idx);
+            by_path.insert(moved_hash, idx);
             if let Some(bucket) = name_index.get_mut(&moved_char) {
                 for slot in bucket.iter_mut() {
                     if *slot == last as u32 {
@@ -307,17 +360,18 @@ impl GlobalIndex {
     /// 按前缀移除索引（仅该路径本身及其子路径）
     fn remove_prefix_internal(&self, prefix: &str) {
         let paths: Vec<String> = {
-            let by_path = self.by_path.read();
-            by_path
-                .keys()
-                .filter(|k| is_same_or_child(prefix, k))
-                .cloned()
+            let entries = self.entries.read();
+            entries
+                .iter()
+                .filter(|e| is_same_or_child(prefix, &e.path))
+                .map(|e| e.path.clone())
                 .collect()
         };
         for path in paths {
             self.remove_path_internal(&path);
         }
     }
+
 
     /// 清空所有索引数据。
     fn clear_internal(&self) {
@@ -350,9 +404,7 @@ impl GlobalIndex {
                 // 只保留匹配所需的 name_lower，省掉百万级 String 分配。
                 IndexEntry {
                     path: normalize_abs_path(drive, &f.path),
-                    name: String::new(),
                     name_lower: f.name.to_lowercase(),
-                    ext: String::new(),
                     size: f.size as i64,
                     is_dir: f.is_dir,
                     mtime: f.mtime,
@@ -374,9 +426,7 @@ impl GlobalIndex {
             .iter()
             .map(|item| IndexEntry {
                 path: normalize_abs_path(drive, item.path.as_str()),
-                name: String::new(),
                 name_lower: item.name.to_lowercase(),
-                ext: String::new(),
                 size: item.size,
                 is_dir: item.is_dir,
                 mtime: item.mtime,
@@ -452,9 +502,7 @@ impl GlobalIndex {
                 };
                 IndexEntry {
                     path: abs_path,
-                    name: String::new(),
                     name_lower: item.name.to_lowercase(),
-                    ext: String::new(),
                     size: item.size,
                     is_dir: item.is_dir,
                     mtime: item.mtime,
@@ -1070,11 +1118,8 @@ impl<'a> TopK<'a> {
         self.heap
             .into_sorted_vec()
             .into_iter()
-            .map(|c| {
-                let mut entry = c.entry.clone();
-                entry.name = name_from_path(&entry.path);
-                entry
-            })
+            // 存储态没有 name：序列化给前端时由 path 派生（见 IndexEntry 的 Serialize）
+            .map(|c| c.entry.clone())
             .collect()
     }
 }
@@ -1247,9 +1292,7 @@ mod tests {
     fn test_apply_filters() {
         let entry = IndexEntry {
             path: "C:/docs/report.pdf".to_string(),
-            name: "report.pdf".to_string(),
             name_lower: "report.pdf".to_string(),
-            ext: "pdf".to_string(),
             size: 1024 * 1024,
             is_dir: false,
             mtime: 0,
@@ -1277,9 +1320,7 @@ mod tests {
     fn test_apply_filters_wildcard() {
         let entry = IndexEntry {
             path: "C:/docs/report_2024.pdf".to_string(),
-            name: "report_2024.pdf".to_string(),
             name_lower: "report_2024.pdf".to_string(),
-            ext: "pdf".to_string(),
             size: 1024,
             is_dir: false,
             mtime: 0,
@@ -1337,9 +1378,7 @@ mod tests {
         for name in ["report_2024.pdf", "report_2023.pdf", "notes.txt", "archive.zip"] {
             idx.upsert(IndexEntry {
                 path: format!("C:/docs/{}", name),
-                name: name.to_string(),
                 name_lower: name.to_string(),
-                ext: name.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default(),
                 size: 1024,
                 is_dir: false,
                 mtime: 0,
@@ -1348,19 +1387,19 @@ mod tests {
 
         let r = idx.search_with_filter("*.pdf", 10);
         assert_eq!(r.len(), 2);
-        assert!(r.iter().all(|e| e.name.ends_with(".pdf")));
+        assert!(r.iter().all(|e| e.path.ends_with(".pdf")));
 
         let r = idx.search_with_filter("*2024.pdf", 10);
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].name, "report_2024.pdf");
+        assert!(r[0].path.ends_with("report_2024.pdf"));
 
         let r = idx.search_with_filter("report*", 10);
         assert_eq!(r.len(), 2);
-        assert!(r.iter().all(|e| e.name.starts_with("report")));
+        assert!(r.iter().all(|e| e.name_lower.starts_with("report")));
 
         let r = idx.search_with_filter("NOT *.pdf", 10);
         assert_eq!(r.len(), 2);
-        assert!(r.iter().all(|e| !e.name.ends_with(".pdf")));
+        assert!(r.iter().all(|e| !e.path.ends_with(".pdf")));
     }
 
     #[test]
@@ -1368,18 +1407,14 @@ mod tests {
         let idx = empty_instance_for_test();
         idx.upsert(IndexEntry {
             path: "C:/a.txt".to_string(),
-            name: "a.txt".to_string(),
             name_lower: "a.txt".to_string(),
-            ext: "txt".to_string(),
             size: 100,
             is_dir: false,
             mtime: 0,
         });
         idx.upsert(IndexEntry {
             path: "C:/ab.txt".to_string(),
-            name: "ab.txt".to_string(),
             name_lower: "ab.txt".to_string(),
-            ext: "txt".to_string(),
             size: 200,
             is_dir: false,
             mtime: 0,
@@ -1387,7 +1422,7 @@ mod tests {
         let r = idx.search_with_filter("a", 10);
         assert_eq!(r.len(), 2);
         // ab.txt 是前缀匹配，相关性高于 a.txt 的包含匹配
-        assert_eq!(r[0].name, "ab.txt");
+        assert!(r[0].path.ends_with("ab.txt"));
 
         idx.remove_by_path("C:/a.txt");
         let r2 = idx.search_with_filter("a", 10);

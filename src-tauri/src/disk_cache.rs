@@ -818,18 +818,16 @@ impl DiskCache {
         let guard = self.conn.lock();
         let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
         let mut stmt = conn.prepare(
-            "SELECT path, name, name_lower, ext, size, is_dir, mtime FROM global_index",
+            "SELECT path, name_lower, size, is_dir, mtime FROM global_index",
         )?;
         let entries = stmt
             .query_map([], |row| {
                 Ok(IndexEntry {
                     path: row.get(0)?,
-                    name: row.get(1)?,
-                    name_lower: row.get(2)?,
-                    ext: row.get(3)?,
-                    size: row.get(4)?,
-                    is_dir: row.get::<_, i64>(5)? != 0,
-                    mtime: row.get(6)?,
+                    name_lower: row.get(1)?,
+                    size: row.get(2)?,
+                    is_dir: row.get::<_, i64>(3)? != 0,
+                    mtime: row.get(4)?,
                 })
             })?
             .filter_map(|r| r.ok())
@@ -858,9 +856,9 @@ impl DiskCache {
                     let drive = Self::extract_drive(&e.path).unwrap_or('?').to_string();
                     stmt.execute(params![
                         e.path,
-                        e.name,
+                        "",
                         e.name_lower,
-                        e.ext,
+                        "",
                         e.size,
                         e.is_dir as i64,
                         drive,
@@ -893,9 +891,9 @@ impl DiskCache {
                 let drive = Self::extract_drive(&entry.path).unwrap_or('?').to_string();
                 stmt.execute(params![
                     entry.path,
-                    entry.name,
+                    "",
                     entry.name_lower,
-                    entry.ext,
+                    "",
                     entry.size,
                     entry.is_dir as i64,
                     drive,
