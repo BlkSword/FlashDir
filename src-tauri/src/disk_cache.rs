@@ -8,6 +8,95 @@ use std::sync::{Arc, OnceLock};
 use crate::scan::{CompactString, Item, ScanResult};
 use crate::global_search::IndexEntry;
 
+/// blob 文件所在目录：~/.flashdir/blobs
+fn blobs_dir() -> Option<std::path::PathBuf> {
+    let mut p = DiskCache::get_cache_path().ok()?;
+    p.pop();
+    p.push("blobs");
+    Some(p)
+}
+
+/// 路径 → blob 文件名（FNV-1a 64 位 + .bin）。
+/// 文件名内含 hash，文件头内含原始路径，读取时校验，避免 hash 冲突串数据。
+fn blob_file_name(path: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in path.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:016x}.bin", hash)
+}
+
+const BLOB_MAGIC: &[u8; 4] = b"FDBL";
+const BLOB_VERSION: u8 = 1;
+
+/// 组装 blob 文件内容：magic + version + path_len + path + bincode(items)
+fn encode_blob(path: &str, payload: &[u8]) -> Vec<u8> {
+    let path_bytes = path.as_bytes();
+    let mut buf = Vec::with_capacity(7 + path_bytes.len() + payload.len());
+    buf.extend_from_slice(BLOB_MAGIC);
+    buf.push(BLOB_VERSION);
+    buf.extend_from_slice(&(path_bytes.len().min(u16::MAX as usize) as u16).to_le_bytes());
+    buf.extend_from_slice(&path_bytes[..path_bytes.len().min(u16::MAX as usize)]);
+    buf.extend_from_slice(payload);
+    buf
+}
+
+/// 校验文件头并取出 payload（路径不匹配/版本不符 → None，当作缓存未命中）
+fn decode_blob<'a>(expected_path: &str, raw: &'a [u8]) -> Option<&'a [u8]> {
+    if raw.len() < 7 || &raw[..4] != BLOB_MAGIC || raw[4] != BLOB_VERSION {
+        return None;
+    }
+    let path_len = u16::from_le_bytes([raw[5], raw[6]]) as usize;
+    if raw.len() < 7 + path_len {
+        return None;
+    }
+    let path = std::str::from_utf8(&raw[7..7 + path_len]).ok()?;
+    if path != expected_path {
+        return None;
+    }
+    Some(&raw[7 + path_len..])
+}
+
+/// 原子写 blob 文件（tmp + rename）
+fn write_blob_file(name: &str, data: &[u8]) -> Result<()> {
+    let dir = blobs_dir().ok_or_else(|| anyhow::anyhow!("无法定位 blob 目录"))?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(name);
+    let tmp = dir.join(format!("{}.tmp", name));
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, &path)?;
+    Ok(())
+}
+
+fn delete_blob_file(name: &str) {
+    if let Some(dir) = blobs_dir() {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+}
+
+/// 清理孤儿 blob 文件（进程中断残留 / 行已被淘汰）
+fn cleanup_orphan_blobs(conn: &Connection) {
+    let Some(dir) = blobs_dir() else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT blob_file FROM scan_meta WHERE blob_file IS NOT NULL") {
+        if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+            for name in rows.flatten() {
+                keep.insert(name);
+            }
+        }
+    }
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".tmp") || !keep.contains(&name) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// 磁盘缓存管理器
 ///
 /// 初始化失败（HOME 不可写、DB 文件被占用、杀软干扰等）时降级为
@@ -60,6 +149,8 @@ impl DiskCache {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // 大 blob 写入会让 WAL 短时间涨到数百 MB；checkpoint 后截断到 64MB 以内
+        let _ = conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024i64);
 
         // 目录级磁盘缓存：每个扫描目录一行 blob（bincode(Vec<Item>)）。
         // 早期是"每条目一行 + 多索引"，30 万行的写入要几十秒、读取要数秒；
@@ -73,7 +164,7 @@ impl DiskCache {
                 mft_available INTEGER NOT NULL,
                 item_count INTEGER NOT NULL,
                 verified_usn INTEGER NOT NULL DEFAULT 0,
-                data BLOB
+                blob_file TEXT
             )",
             [],
         )?;
@@ -83,14 +174,19 @@ impl DiskCache {
             "ALTER TABLE scan_meta ADD COLUMN verified_usn INTEGER NOT NULL DEFAULT 0",
             [],
         );
-        let _ = conn.execute("ALTER TABLE scan_meta ADD COLUMN data BLOB", []);
+        let _ = conn.execute("ALTER TABLE scan_meta ADD COLUMN blob_file TEXT", []);
+        // 旧库把 blob 内嵌在 data 列：迁移为外部文件成本高，直接丢弃这些行（缓存可重建），
+        // 并 DROP 列以释放空间
+        let _ = conn.execute("DELETE FROM scan_meta WHERE data IS NOT NULL", []);
+        let _ = conn.execute("ALTER TABLE scan_meta DROP COLUMN data", []);
 
         // 旧版本条目级缓存表不再使用，直接删除以释放磁盘空间
         let _ = conn.execute("DROP TABLE IF EXISTS scan_items", []);
         let _ = conn.execute("DROP INDEX IF EXISTS idx_scan_items_path", []);
         let _ = conn.execute("DROP INDEX IF EXISTS idx_scan_items_scan_path", []);
-        // 无 blob 的历史行视为未命中，清理掉
-        let _ = conn.execute("DELETE FROM scan_meta WHERE data IS NULL", []);
+        // 无 blob 文件的历史行视为未命中，清理掉
+        let _ = conn.execute("DELETE FROM scan_meta WHERE blob_file IS NULL", []);
+        cleanup_orphan_blobs(&conn);
 
 
         // 旧版本整表 BLOB 缓存不再使用，直接删除以释放磁盘空间
@@ -211,9 +307,11 @@ impl DiskCache {
         dir_mtime: i64,
         ignore_mtime: bool,
     ) -> Option<(ScanResult, i64)> {
-        let row: Option<(i64, i64, i64, Option<Vec<u8>>)> = conn
+        // 元信息 + blob 文件名（blob 本体放在 ~/.flashdir/blobs/，避免占 DB/WAL）
+        let row: Option<(i64, i64, i64, Option<String>)> = conn
             .query_row(
-                "SELECT dir_mtime, mft_available, verified_usn, data FROM scan_meta WHERE scan_path = ?1",
+                "SELECT dir_mtime, mft_available, verified_usn, blob_file
+                 FROM scan_meta WHERE scan_path = ?1",
                 params![path],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
@@ -221,18 +319,25 @@ impl DiskCache {
             .ok()
             .flatten();
 
-        let (cached_mtime, mft_available, verified_usn, data) = row?;
+        let (cached_mtime, mft_available, verified_usn, blob_file) = row?;
         if !ignore_mtime && cached_mtime < dir_mtime {
             return None;
         }
-        let data = data?; // 旧版本遗留行（无 blob）视为未命中
+        let blob_file = blob_file?; // 旧版本遗留行视为未命中
+
+        // 顺序读外部文件（比 SQLite blob 路径快数倍），并校验文件头里的路径
+        let raw = {
+            let dir = blobs_dir()?;
+            std::fs::read(dir.join(&blob_file)).ok()?
+        };
+        let payload = decode_blob(path, &raw)?;
 
         let _ = conn.execute(
             "UPDATE scan_meta SET created_at = ?1 WHERE scan_path = ?2",
             params![chrono::Utc::now().timestamp(), path],
         );
 
-        let mut items: Vec<Item> = bincode::deserialize(&data).ok()?;
+        let mut items: Vec<Item> = bincode::deserialize(payload).ok()?;
         // SQLite ORDER BY 需 temp b-tree（30 万行 ~0.7s），内存排序只要 ~15ms
         items.sort_unstable_by(|a, b| b.size.cmp(&a.size));
         let total_size: i64 = items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum();
@@ -252,6 +357,38 @@ impl DiskCache {
         ))
     }
 
+    /// 仅供基准测试：最大 blob 对应的路径
+    pub fn largest_blob_path_for_bench(&self) -> Option<String> {
+        let guard = self.conn.lock();
+        let conn = guard.as_ref()?;
+        conn.query_row(
+            "SELECT scan_path FROM scan_meta WHERE blob_file IS NOT NULL ORDER BY size DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// 仅供基准测试：读取最大的那份 blob 文件字节
+    pub fn raw_largest_blob_for_bench(&self) -> Option<Vec<u8>> {
+        let name: String = {
+            let guard = self.conn.lock();
+            let conn = guard.as_ref()?;
+            conn.query_row(
+                "SELECT blob_file FROM scan_meta WHERE blob_file IS NOT NULL ORDER BY size DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()?
+        };
+        let dir = blobs_dir()?;
+        std::fs::read(dir.join(name)).ok()
+    }
+
     /// 写入某目录的完整扫描结果（单行 blob）。
     ///
     /// 相比"每条目一行 + 多索引"，大目录写入从数十秒降到百毫秒级，
@@ -265,17 +402,22 @@ impl DiskCache {
         dir_mtime: i64,
         verified_usn: i64,
     ) -> Result<()> {
-        let data = bincode::serialize(items)?;
-        let data_len = data.len() as u64;
+        let payload = bincode::serialize(items)?;
+        let file_name = blob_file_name(path);
+        let encoded = encode_blob(path, &payload);
+        let data_len = encoded.len() as u64;
 
         self.maybe_cleanup(data_len as usize)?;
+
+        // 先落文件再写元信息：文件写失败不会留下"指向不存在数据的新鲜缓存"
+        write_blob_file(&file_name, &encoded)?;
 
         let mut guard = self.conn.lock();
         let conn = guard.as_mut().ok_or_else(Self::disabled_err)?;
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT OR REPLACE INTO scan_meta
-             (scan_path, dir_mtime, created_at, size, mft_available, item_count, verified_usn, data)
+             (scan_path, dir_mtime, created_at, size, mft_available, item_count, verified_usn, blob_file)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 path,
@@ -285,7 +427,7 @@ impl DiskCache {
                 mft_available as i64,
                 items.len() as i64,
                 verified_usn.max(0),
-                data,
+                file_name,
             ],
         )?;
         tx.commit()?;
@@ -394,10 +536,20 @@ impl DiskCache {
         let Some(conn) = guard.as_ref() else {
             return Ok(());
         };
+        let expired: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT blob_file FROM scan_meta WHERE created_at < ?1 AND blob_file IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![cutoff.timestamp()], |row| row.get::<_, String>(0))?;
+            rows.flatten().collect()
+        };
         conn.execute(
             "DELETE FROM scan_meta WHERE created_at < ?1",
             params![cutoff.timestamp()],
         )?;
+        for blob in expired {
+            delete_blob_file(&blob);
+        }
 
         Self::refresh_size_counter(conn, &self.current_bytes);
         Ok(())
@@ -435,29 +587,40 @@ impl DiskCache {
         };
 
         let tx = conn.transaction()?;
-        {
-            let mut stmt =
-                tx.prepare("SELECT scan_path, size FROM scan_meta ORDER BY created_at ASC")?;
+        let victims = {
+            let mut stmt = tx.prepare(
+                "SELECT scan_path, size, blob_file FROM scan_meta ORDER BY created_at ASC",
+            )?;
             let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
             })?;
 
-            let mut victims: Vec<String> = Vec::new();
+            let mut victims: Vec<(String, Option<String>)> = Vec::new();
             let mut remaining = projected;
             for row in rows {
                 if remaining <= target {
                     break;
                 }
-                let (victim_path, victim_size) = row?;
+                let (victim_path, victim_size, victim_blob) = row?;
                 remaining = remaining.saturating_sub(victim_size.max(0) as u64);
-                victims.push(victim_path);
+                victims.push((victim_path, victim_blob));
             }
 
-            for victim in &victims {
+            for (victim, _) in &victims {
                 tx.execute("DELETE FROM scan_meta WHERE scan_path = ?1", params![victim])?;
             }
-        }
+            victims
+        };
         tx.commit()?;
+        for (_, blob) in victims {
+            if let Some(name) = blob {
+                delete_blob_file(&name);
+            }
+        }
 
         Self::refresh_size_counter(conn, &self.current_bytes);
         Ok(())
@@ -466,7 +629,16 @@ impl DiskCache {
     pub fn clear(&self) -> Result<()> {
         let guard = self.conn.lock();
         let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
+        let blobs: Vec<String> = {
+            let mut stmt =
+                conn.prepare("SELECT blob_file FROM scan_meta WHERE blob_file IS NOT NULL")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.flatten().collect()
+        };
         conn.execute("DELETE FROM scan_meta", [])?;
+        for blob in blobs {
+            delete_blob_file(&blob);
+        }
         *self.current_bytes.lock() = 0;
         Ok(())
     }
@@ -509,17 +681,6 @@ impl DiskCache {
             oldest_entry_timestamp: oldest_entry,
             enabled: true,
         }
-    }
-
-    pub fn invalidate(&self, path: &str) -> Result<()> {
-        let guard = self.conn.lock();
-        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
-        conn.execute(
-            "DELETE FROM scan_meta WHERE scan_path = ?1 OR scan_path LIKE ?2 ESCAPE '\\'",
-            params![path, path_child_pattern(path)],
-        )?;
-        Self::refresh_size_counter(conn, &self.current_bytes);
-        Ok(())
     }
 
     // ─── 快照操作 ──────────────────────────────────────────

@@ -907,9 +907,11 @@ pub async fn scan_directory_view(
         }
     }
 
-    // 没有可用缓存（或需要全量刷新）：失效旧缓存后执行全量扫描
+    // 没有可用缓存（或需要全量刷新）：失效内存缓存后执行全量扫描。
+    // 磁盘缓存不做级联失效：每行 blob 自带 dir_mtime + 已校验 USN，能独立判断新鲜度；
+    // 而级联失效在扫 C:/ 这类根路径时会把所有子目录缓存一起删掉
+    //（实测扫 C:/ 后 C:/Windows、C:/Users 的 blob 全被清空）。
     scan_cache().invalidate(&root_dir);
-    DiskCache::instance().invalidate(&root_dir).ok();
 
     // ── 2. 全量扫描：MFT 直读（Everything 式快速路径）失败则回退目录遍历 ──
     let canonical_path_clone = canonical_path.clone();
@@ -2304,6 +2306,50 @@ mod tests {
             acc += format_size(items[i].size).len();
         }
         eprintln!("[bench] format_size x{}: {:?} (acc={})", items.len(), t.elapsed(), acc);
+    }
+
+    /// 基准：磁盘缓存 blob 的反序列化成本拆解
+    /// 运行：cargo test --release --lib -- --ignored --nocapture bench_blob_decode
+    #[test]
+    #[ignore = "benchmark: 需要真实 blob 缓存"]
+    fn bench_blob_decode() {
+        use std::time::Instant;
+
+        let t = Instant::now();
+        let blob: Vec<u8> = match DiskCache::instance().raw_largest_blob_for_bench() {
+            Some(b) => b,
+            None => {
+                eprintln!("[bench] 无 blob 缓存，跳过");
+                return;
+            }
+        };
+        eprintln!(
+            "[bench] SQL 读取 blob {:.1} MB: {:?}",
+            blob.len() as f64 / 1024.0 / 1024.0,
+            t.elapsed()
+        );
+
+        // 完整加载路径（fetch + decode + 内存排序）
+        if let Some(path) = DiskCache::instance().largest_blob_path_for_bench() {
+            let t = Instant::now();
+            let loaded = DiskCache::instance().get_stale_with_usn(&path);
+            eprintln!(
+                "[bench] get_stale_with_usn({}) 完整加载: {:?} ({:?} 条)",
+                path,
+                t.elapsed(),
+                loaded.as_ref().map(|(r, _)| r.items.len())
+            );
+        }
+
+        // 1) 当前路径：bincode 反序列化整份 Vec<Item>（path+name+size_formatted）
+        let t = Instant::now();
+        let items: Vec<Item> = bincode::deserialize(&blob).unwrap();
+        let full = t.elapsed();
+        eprintln!("[bench] bincode 反序列化 {} 条: {:?}", items.len(), full);
+        drop(items);
+
+        // 说明：实测瓶颈在 SQLite 读取 blob（页缓存路径 ~900ms/147MB），
+        // 而非反序列化本身（~350ms/76 万条）。读取已改用增量 Blob API 直读。
     }
 
     #[test]
