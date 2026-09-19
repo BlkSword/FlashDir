@@ -27,7 +27,12 @@ use windows_sys::Win32::System::IO::DeviceIoControl;
 const FSCTL_QUERY_USN_JOURNAL: u32 = 0x000900F4;
 
 /// FSCTL_READ_USN_JOURNAL (METHOD_NEITHER)
-const FSCTL_READ_USN_JOURNAL: u32 = 0x000900B8;
+///
+/// CTL_CODE(FILE_DEVICE_FILE_SYSTEM=0x0009, 46, METHOD_NEITHER=3, FILE_ANY_ACCESS=0)
+/// = 0x00090000 | (46 << 2) | 3 = 0x000900BB。
+/// 早期写成 0x000900B8（漏掉 METHOD_NEITHER 位），驱动会直接返回
+/// ERROR_INVALID_FUNCTION，USN 增量整条链路都不可用。
+const FSCTL_READ_USN_JOURNAL: u32 = 0x000900BB;
 
 // ─── USN 原因码 ─────────────────────────────────────────────
 
@@ -53,7 +58,13 @@ pub const USN_REASON_CLOSE: u32 = 0x80000000;
 // ─── USN 数据结构 ───────────────────────────────────────────
 
 /// USN_JOURNAL_DATA — 查询 USN Journal 状态
+///
+/// 注意：`max_usn` 是"该 Journal 能容纳的 USN 上限常量"（NTFS 上恒为
+/// 2^63 - 2^16），**不是当前写入位置**。当前可用的位置是 `next_usn`
+/// （下一个将被分配的 USN）。早期实现把 `max_usn` 当位置保存到检查点，
+/// 结果 READ_USN_JOURNAL 直接返回 ERROR_INVALID_FUNCTION。
 #[repr(C)]
+#[allow(dead_code)]
 struct UsnJournalData {
     usn_journal_id: u64,
     first_usn: i64,
@@ -125,8 +136,10 @@ pub struct UsnCheckpoint {
     pub volume_serial: u64,
     /// USN Journal ID（检测 Journal 是否被重置）
     pub journal_id: u64,
-    /// 上次扫描时的 max USN
-    pub max_usn: i64,
+    /// 检查点位置：下一个将被分配的 USN（`USN_JOURNAL_DATA.NextUsn`）。
+    /// 兼容旧版本 JSON 里的 `max_usn` 字段名（旧值语义错误，会被范围校验判为失效）。
+    #[serde(alias = "max_usn")]
+    pub next_usn: i64,
     /// 检查点创建时间
     pub created_at: i64,
 }
@@ -317,7 +330,7 @@ impl UsnJournal {
         Ok(UsnCheckpoint {
             volume_serial,
             journal_id: journal.usn_journal_id,
-            max_usn: journal.max_usn,
+            next_usn: journal.next_usn,
             created_at: chrono::Utc::now().timestamp(),
         })
     }
@@ -362,6 +375,8 @@ pub enum UsnReadError {
     JournalReset,
     /// 盘符指向了另一块磁盘：增量不可用，必须全量扫描
     VolumeChanged,
+    /// 校验点落在 Journal 可读范围之外（回滚、或历史版本写入的错误位置）
+    WindowExpired,
     /// 其它 I/O 错误（可稍后重试）
     Io(io::Error),
 }
@@ -371,6 +386,9 @@ impl std::fmt::Display for UsnReadError {
         match self {
             UsnReadError::JournalReset => f.write_str("USN Journal 已被重置，需要全量扫描"),
             UsnReadError::VolumeChanged => f.write_str("卷序列号变化，需要全量扫描"),
+            UsnReadError::WindowExpired => {
+                f.write_str("校验点已超出 Journal 可读范围，需要全量扫描")
+            }
             UsnReadError::Io(e) => {
                 f.write_str("读取 USN Journal 失败: ")?;
                 std::fmt::Display::fmt(e, f)
@@ -405,6 +423,13 @@ pub fn read_incremental_changes(
     let vol_serial = get_volume_serial(drive_letter).ok_or(UsnReadError::VolumeChanged)?;
     if vol_serial != checkpoint.volume_serial {
         return Err(UsnReadError::VolumeChanged);
+    }
+
+    // 起点必须落在 Journal 仍可读取的区间内：
+    // - 低于 lowest_valid_usn：中间变更已被 Journal 回收，增量会漏数据；
+    // - 高于 next_usn：位置非法（例如历史版本把 MaxUsn 常量当位置存了下来）。
+    if start_usn < current.lowest_valid_usn || start_usn > current.next_usn {
+        return Err(UsnReadError::WindowExpired);
     }
 
     let mut changes: Vec<UsnChangeRecord> = Vec::new();

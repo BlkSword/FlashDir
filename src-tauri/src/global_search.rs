@@ -108,11 +108,24 @@ impl GlobalIndex {
             Ok(entries) if !entries.is_empty() => {
                 eprintln!("[GlobalIndex] 从磁盘恢复 {} 条索引", entries.len());
                 // 恢复元数据（是否全盘构建 / 盘符列表），否则会把部分索引误判为全盘
-                if let Some(json) = crate::disk_cache::DiskCache::instance().load_index_meta() {
-                    if let Ok(meta) = serde_json::from_str::<IndexMeta>(&json) {
-                        *self.meta.write() = meta;
+                let mut meta = match crate::disk_cache::DiskCache::instance().load_index_meta() {
+                    Some(json) => serde_json::from_str::<IndexMeta>(&json).unwrap_or_default(),
+                    None => {
+                        // 兼容旧库：升级前只有"全盘构建"才会持久化索引，且没有 full_build 标记，
+                        // 按全盘处理，避免老用户升级后看到"部分目录"
+                        IndexMeta {
+                            full_build: true,
+                            ..Default::default()
+                        }
                     }
+                };
+                if meta.all_drives.is_empty() {
+                    // 盘符列表缺失时用当前枚举结果补齐（仅诊断展示用）
+                    let drives = list_ntfs_drives();
+                    meta.drive_count = meta.drive_count.max(drives.len());
+                    meta.all_drives = drives.iter().map(|c| c.to_string()).collect();
                 }
+                *self.meta.write() = meta;
                 // 一次性批量写入，避免每条一次写锁 + clone
                 self.upsert_batch_internal(entries);
                 self.update_ready_state();

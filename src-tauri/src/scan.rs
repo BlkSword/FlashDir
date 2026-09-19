@@ -677,6 +677,9 @@ pub async fn scan_directory_view(
 
     emit_scan_phase(&app_handle, "preparing", "准备扫描", None);
 
+    // USN 判定"缓存不可信"时置位：必须跳过下面所有缓存分支，直接全量扫描
+    let mut force_full_scan = false;
+
     // ── 0. USN 增量优先（唯一能捕捉"文件内容变化 / 深层变化"的机制） ──
     if !force_refresh {
         let usn_start = std::time::Instant::now();
@@ -750,6 +753,7 @@ pub async fn scan_directory_view(
                     }
                     Some(UsnUpdate::Stale) => {
                         eprintln!("[USN] 增量窗口失效，转为全量扫描: {}", root_dir);
+                        force_full_scan = true;
                     }
                     None => {}
                 }
@@ -758,7 +762,7 @@ pub async fn scan_directory_view(
     }
 
     // ── 1. 缓存：内存 -> 上层推导 -> 磁盘推导 -> 磁盘 ──
-    if !force_refresh {
+    if !force_refresh && !force_full_scan {
         let cache_check_start = std::time::Instant::now();
         if let Some(cached) = scan_cache().get(&root_dir) {
             // 如果缓存来自目录遍历，但当前进程是管理员且 MFT 可用，
@@ -1203,11 +1207,11 @@ fn save_usn_checkpoint(
     if let Ok(json) = serde_json::to_string(&checkpoint) {
         let _ = write_usn_checkpoint_atomic(&checkpoint_path, &json);
         eprintln!(
-            "[USN] 检查点已保存: {}.{} (USN={})",
-            drive, checkpoint.journal_id, checkpoint.max_usn
+            "[USN] 检查点已保存: {}.{} (next_usn={})",
+            drive, checkpoint.journal_id, checkpoint.next_usn
         );
     }
-    checkpoint.max_usn
+    checkpoint.next_usn
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1338,7 +1342,8 @@ fn update_usn_checkpoint(
 ) {
     let updated = crate::fs::UsnCheckpoint {
         created_at: chrono::Utc::now().timestamp(),
-        max_usn: next_usn.max(checkpoint.max_usn),
+        // 已消费位置单调前进
+        next_usn: next_usn.max(checkpoint.next_usn),
         ..checkpoint.clone()
     };
     if let Ok(json) = serde_json::to_string(&updated) {
@@ -1376,7 +1381,8 @@ fn try_usn_incremental_update(
     let delta = match crate::fs::read_incremental_changes(drive, &checkpoint, verified_usn) {
         Ok(delta) => delta,
         Err(crate::fs::UsnReadError::JournalReset)
-        | Err(crate::fs::UsnReadError::VolumeChanged) => return Some(UsnUpdate::Stale),
+        | Err(crate::fs::UsnReadError::VolumeChanged)
+        | Err(crate::fs::UsnReadError::WindowExpired) => return Some(UsnUpdate::Stale),
         Err(crate::fs::UsnReadError::Io(e)) => {
             // 记录格式不受支持（例如未来版本 USN_RECORD）时不能"假装没变更"，
             // 必须走全量扫描；其它 I/O 错误才退回常规缓存逻辑。
@@ -1470,8 +1476,9 @@ fn try_usn_incremental_update(
     };
     scanner.set_cancel_id(scan_id);
 
-    // FRN → volume-relative 路径缓存（同一批变更中父目录通常重复出现）
-    let mut parent_path_cache: HashMap<u64, Option<String>> = HashMap::new();
+    // (FRN, 记录 USN) → volume-relative 路径缓存
+    // （同一父目录在不同 USN 下可能对应不同历史名称，因此缓存键带上 USN）
+    let mut parent_path_cache: HashMap<(u64, i64), Option<String>> = HashMap::new();
 
     // FILETIME（1601 起 100ns）→ Unix 秒
     let filetime_to_unix = |ft: i64| -> i64 { (ft - 116444736000000000) / 10_000_000 };
@@ -1482,6 +1489,21 @@ fn try_usn_incremental_update(
     // 目录改名时暂存其子树（key = FRN），等 NEW_NAME 记录出现后按新前缀重挂。
     // 否则改名后整棵子树会从缓存中消失（Windows 只为目录本身生成 USN 记录）。
     let mut renamed_subtrees: HashMap<u64, (String, Vec<Item>)> = HashMap::new();
+
+    // 窗口内的改名历史：FRN -> [(改名发生时的 USN, 旧名)]（按 USN 升序）。
+    // 作用：USN 记录只带"父目录 FRN + 自己的名字"，而 FRN→路径解析读的是
+    // **当前** MFT 名称；若父目录在同一窗口内被改名，早期记录会解析到新路径而
+    // 匹配不上缓存（典型表现：目录改名前的删除记录被静默丢弃）。
+    // 解析祖先路径时，对"改名 USN 晚于当前记录"的节点回退使用旧名即可还原当时路径。
+    let mut rename_history: HashMap<u64, Vec<(i64, String)>> = HashMap::new();
+    for change in &relevant {
+        if change.reason & crate::fs::USN_REASON_RENAME_OLD_NAME != 0 {
+            rename_history
+                .entry(change.file_ref)
+                .or_default()
+                .push((change.usn, change.name.clone()));
+        }
+    }
 
     // 每个 FRN 上"删除 / 改名旧名"的最大 USN。
     // 同一批次里"先创建后删除"（临时文件很常见）或"连续改名"时，
@@ -1513,9 +1535,13 @@ fn try_usn_incremental_update(
             // "目录改名后又被删除"：子树保持在删除状态，不再需要重挂
             renamed_subtrees.remove(&change.file_ref);
         }
-        let Some(parent_path) =
-            resolve_parent_path(&scanner, &mut parent_path_cache, change.parent_ref)
-        else {
+        let Some(parent_path) = resolve_parent_path_at(
+            &scanner,
+            &mut parent_path_cache,
+            change.parent_ref,
+            change.usn,
+            &rename_history,
+        ) else {
             continue;
         };
         let vol_path = if parent_path.is_empty() {
@@ -1597,9 +1623,13 @@ fn try_usn_incremental_update(
         if !is_create && !is_rename_new && !is_data_change {
             continue;
         }
-        let Some(parent_path) =
-            resolve_parent_path(&scanner, &mut parent_path_cache, change.parent_ref)
-        else {
+        let Some(parent_path) = resolve_parent_path_at(
+            &scanner,
+            &mut parent_path_cache,
+            change.parent_ref,
+            change.usn,
+            &rename_history,
+        ) else {
             continue;
         };
         let vol_path = if parent_path.is_empty() {
@@ -1769,19 +1799,83 @@ fn try_usn_incremental_update(
     })
 }
 
-/// FRN → volume-relative 路径（带缓存）
+/// FRN → volume-relative 路径（带缓存），并还原"记录发生时"的祖先名称。
 #[cfg(target_os = "windows")]
-fn resolve_parent_path(
+fn resolve_parent_path_at(
     scanner: &crate::fs::MftScanner,
-    cache: &mut HashMap<u64, Option<String>>,
+    cache: &mut HashMap<(u64, i64), Option<String>>,
     parent_ref: u64,
+    at_usn: i64,
+    rename_history: &HashMap<u64, Vec<(i64, String)>>,
 ) -> Option<String> {
-    if let Some(cached) = cache.get(&parent_ref) {
+    let key = (parent_ref, at_usn);
+    if let Some(cached) = cache.get(&key) {
         return cached.clone();
     }
-    let resolved = scanner.resolve_frn_path(parent_ref).ok().flatten();
-    cache.insert(parent_ref, resolved.clone());
+    let resolved = resolve_path_walk(scanner, parent_ref, at_usn, rename_history);
+    cache.insert(key, resolved.clone());
     resolved
+}
+
+/// 从 FRN 向上走到卷根，逐级取"该记录时间点"的名字
+#[cfg(target_os = "windows")]
+fn resolve_path_walk(
+    scanner: &crate::fs::MftScanner,
+    frn: u64,
+    at_usn: i64,
+    rename_history: &HashMap<u64, Vec<(i64, String)>>,
+) -> Option<String> {
+    const ROOT_FRN: u64 = 5;
+    const MAX_DEPTH: u32 = 64;
+
+    if frn == ROOT_FRN {
+        return Some(String::new());
+    }
+
+    let mut components: Vec<String> = Vec::new();
+    let mut current = frn;
+    let mut depth = 0u32;
+    loop {
+        if depth > MAX_DEPTH {
+            return None;
+        }
+        depth += 1;
+
+        let record = scanner.read_single_record(current).ok().flatten()?;
+        components.push(historical_name(
+            current,
+            record.name.as_str(),
+            at_usn,
+            rename_history,
+        ));
+        current = record.parent_frn;
+        if current == ROOT_FRN {
+            break;
+        }
+    }
+
+    components.reverse();
+    Some(components.join("/"))
+}
+
+/// 该 FRN 在 `at_usn` 时刻的名字：
+/// 若窗口内存在"改名 USN 晚于 at_usn"的事件，说明 MFT 里已是改名后的名字，
+/// 应回退到那次改名之前的旧名（取最早的那次）。
+#[cfg(target_os = "windows")]
+fn historical_name(
+    frn: u64,
+    mft_name: &str,
+    at_usn: i64,
+    rename_history: &HashMap<u64, Vec<(i64, String)>>,
+) -> String {
+    if let Some(events) = rename_history.get(&frn) {
+        for (usn, old_name) in events {
+            if *usn > at_usn {
+                return old_name.clone();
+            }
+        }
+    }
+    mft_name.to_string()
 }
 
 #[cfg(not(target_os = "windows"))]

@@ -1,5 +1,27 @@
 # FlashDir Release Notes
 
+## Unreleased（二）—— 实机验证中发现的 USN 深层缺陷
+
+> 这一批问题都是"编译通过 + 实机跑一遍"才暴露出来的：USN 增量此前从未真正成功过。
+
+- **`FSCTL_READ_USN_JOURNAL` 常量少了 METHOD_NEITHER 位**：应为 `0x000900BB`，
+  原值 `0x000900B8`（METHOD_BUFFERED）被驱动直接拒绝并返回
+  `ERROR_INVALID_FUNCTION`，导致增量链路永远走不通。
+- **`USN_JOURNAL_DATA.MaxUsn` 不是位置**：它是 Journal 的 USN 上限常量
+  （NTFS 上恒为 2^63-2^16）。检查点字段改为 `NextUsn`（下一个待分配 USN），
+  并新增范围校验：校验点低于 `LowestValidUsn` 或高于 `NextUsn` 时判为
+  窗口失效 → 全量扫描（历史版本写入的错误值会被自动纠正）。
+- **USN 判定"窗口失效"后必须真正跳过缓存**：此前只打日志、仍回落到 mtime 缓存，
+  继续返回旧数据；现在置位 `force_full_scan` 直接走全量 MFT。
+- **FRN→路径解析要还原"记录发生时"的祖先名称**：若父目录在同一增量窗口内被
+  改名，早期记录（删除/修改）会解析到改名后的新路径而匹配不上缓存，删除被
+  静默丢弃。现在按记录的 USN 回溯改名历史取旧名。
+- **单条 MFT 记录解析补 `$DATA` 大小回退**：`$FILE_NAME.RealSize` 对常驻/小文件
+  常为 0，全量解析器有回退而单条解析器没有，导致增量更新把文件大小写成 0。
+- 旧库兼容：没有 `index_meta` 时按"全盘索引"处理，避免升级后误显示"部分目录"。
+- 前端依赖：`tailwindcss@^3.4.29` 在 npm 上不存在（3.x 最新为 3.4.19），
+  `npm ci` 必然 404；已修正版本并重新生成 lockfile（vite 7.3.6 / vue 3.5.43）。
+
 ## Unreleased —— 正确性 / 新鲜度 / 性能修复
 
 ### 扫描新鲜度（重要）

@@ -2,7 +2,6 @@
 // 负责 IPC 边界：参数校验、历史记录、调用后端引擎、重活下沉到线程池
 
 use flashdir::scan::{self, HistoryItem, HistoryItemSummary};
-use flashdir::perf::PerformanceMonitor;
 use crate::AppState;
 use chrono::Utc;
 use std::collections::VecDeque;
@@ -126,7 +125,9 @@ fn push_history(state: &AppState, path: &str, total_size: i64, item_count: usize
     });
 }
 
-
+/// 分页扫描的响应体（需要 Serialize 才能作为 IPC 响应返回）
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScanPageResponse {
     pub items: Vec<flashdir::scan::Item>,
     pub total_items: usize,
@@ -744,9 +745,8 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
     Ok(())
 }
 
-/// 全局搜索：按文件名匹配，返回结果（索引未就绪时 ready=false）
-#[command]
-/// 全局搜索（使用 spawn_blocking：索引过滤/排序可能扫描百万级条目）
+/// 全局搜索：按文件名匹配，返回结果（索引未就绪时 ready=false）。
+/// 使用 spawn_blocking：索引过滤/排序可能扫描百万级条目。
 #[command]
 pub async fn global_search(query: String, limit: Option<usize>) -> GlobalSearchResponse {
     let limit = limit.unwrap_or(500);

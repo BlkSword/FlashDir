@@ -709,6 +709,9 @@ fn parse_mft_record_info(data: &[u8], frn: u64) -> Option<MftRecordInfo> {
 
     let mut attr_offset = first_attr_offset;
     let mut best_info: Option<MftRecordInfo> = None;
+    let mut best_is_win32 = false;
+    // 未命名 $DATA 的真实大小：$FILE_NAME.RealSize 对常驻/小文件经常是 0
+    let mut data_size: u64 = 0;
     loop {
         if attr_offset + 16 > data.len() {
             break;
@@ -725,6 +728,7 @@ fn parse_mft_record_info(data: &[u8], frn: u64) -> Option<MftRecordInfo> {
         }
 
         let non_resident = data[attr_offset + 8];
+        let attr_name_len = data[attr_offset + 9] as usize;
 
         if attr_type == ATTR_FILE_NAME && non_resident == 0 {
             let content_size =
@@ -771,12 +775,32 @@ fn parse_mft_record_info(data: &[u8], frn: u64) -> Option<MftRecordInfo> {
                 mtime,
             };
 
-            if name_type == 1 || name_type == 3 {
-                return Some(info);
-            }
-
-            if best_info.is_none() {
+            // 1 = Win32, 3 = Win32+DOS：优先长名，且第一个长名优先
+            let is_win32 = name_type == 1 || name_type == 3;
+            let should_replace = match best_info {
+                None => true,
+                Some(_) => is_win32 && !best_is_win32,
+            };
+            if should_replace {
                 best_info = Some(info);
+                best_is_win32 = is_win32;
+            }
+        } else if attr_type == ATTR_DATA && attr_name_len == 0 {
+            // 未命名 $DATA：resident 时 content length 即文件大小；
+            // non-resident 时 DataSize 位于属性头 0x30 处
+            let size = if non_resident == 0 {
+                if attr_offset + 0x14 <= data.len() {
+                    u32_from_le(&data[attr_offset + 0x10..attr_offset + 0x14]) as u64
+                } else {
+                    0
+                }
+            } else if attr_offset + 0x38 <= data.len() {
+                u64_from_le(&data[attr_offset + 0x30..attr_offset + 0x38])
+            } else {
+                0
+            };
+            if size > data_size {
+                data_size = size;
             }
         }
 
@@ -786,7 +810,11 @@ fn parse_mft_record_info(data: &[u8], frn: u64) -> Option<MftRecordInfo> {
         }
     }
 
-    if let Some(info) = best_info {
+    if let Some(mut info) = best_info {
+        // $FILE_NAME.RealSize 为 0 时用未命名 $DATA 的真实大小修正（目录不适用）
+        if !info.is_dir && data_size > info.real_size {
+            info.real_size = data_size;
+        }
         return Some(info);
     }
 
@@ -796,7 +824,7 @@ fn parse_mft_record_info(data: &[u8], frn: u64) -> Option<MftRecordInfo> {
             name: format!("<record_{}>", record_index),
             parent_frn: 5,
             is_dir,
-            real_size: 0,
+            real_size: data_size,
             mtime: 0,
         });
     }
