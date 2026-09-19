@@ -377,7 +377,10 @@ FlashDir/
 ### 构建全部
 
 ```bash
-# 安装依赖并构建桌面端 + CLI
+# 1) 前端（必须先构建，Rust 侧会在编译期内嵌 app/dist）
+cd src-tauri/app && npm ci && npm run build && cd ../..
+
+# 2) 安装根依赖（Tauri CLI）并构建桌面端 + CLI
 npm install
 npm run tauri:build
 
@@ -385,6 +388,15 @@ npm run tauri:build
 src-tauri/target/release/flashdir.exe   # GUI 桌面端
 src-tauri/target/release/cli.exe        # 命令行工具
 ```
+
+> ⚠️ 如果不用 Tauri CLI、直接 `cargo build`，**必须带上 `--features custom-protocol`**：
+> ```bash
+> cd src-tauri
+> cargo build --release --features custom-protocol
+> ```
+> 该 feature 用于让 Tauri 走生产分支、内嵌 `frontendDist`；不启用时
+> `generate_context!` 会按 dev 模式只嵌 `devUrl`，运行后会显示
+> “localhost 拒绝连接”。
 
 ### GUI 开发
 

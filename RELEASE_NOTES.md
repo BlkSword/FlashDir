@@ -21,6 +21,10 @@
 - 旧库兼容：没有 `index_meta` 时按"全盘索引"处理，避免升级后误显示"部分目录"。
 - 前端依赖：`tailwindcss@^3.4.29` 在 npm 上不存在（3.x 最新为 3.4.19），
   `npm ci` 必然 404；已修正版本并重新生成 lockfile（vite 7.3.6 / vue 3.5.43）。
+- **`Cargo.toml` 缺少 `custom-protocol` feature**：Tauri 用它判定 dev/prod，
+  直接 `cargo build --release` 会生成"dev 模式"二进制（只嵌 `devUrl`，
+  打开后显示 localhost 拒绝连接）。已补上标准 feature 声明，
+  并在 README 明确构建命令。
 
 ## Unreleased —— 正确性 / 新鲜度 / 性能修复
 
