@@ -282,6 +282,9 @@ async fn main() {
         }
     };
 
+    // 磁盘缓存由后台线程写入：CLI 退出前等待落盘，保证与旧行为一致
+    scan::flush_disk_cache_writes();
+
     let elapsed = total_start.elapsed().as_secs_f64();
 
     if !args.json {

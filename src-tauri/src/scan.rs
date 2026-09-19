@@ -537,6 +537,83 @@ fn scan_cache() -> &'static ScanCache {
     SCAN_CACHE.get_or_init(|| ScanCache::new(30, 200))
 }
 
+/// 磁盘缓存后台写入任务
+enum CacheWriteJob {
+    Write {
+        path: String,
+        items: Arc<Vec<Item>>,
+        mft_available: bool,
+        dir_mtime: i64,
+        verified_usn: i64,
+    },
+    Flush(std::sync::mpsc::Sender<()>),
+}
+
+/// 磁盘缓存写入线程（单线程、FIFO）：
+/// 整份扫描结果的落盘可能耗时数秒到数十秒（大目录几十万行），
+/// 放到后台线程后 GUI 扫描可以立即返回；同一路径的多次写入按提交顺序生效。
+fn cache_writer() -> &'static std::sync::mpsc::Sender<CacheWriteJob> {
+    static TX: OnceLock<std::sync::mpsc::Sender<CacheWriteJob>> = OnceLock::new();
+    TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<CacheWriteJob>();
+        std::thread::Builder::new()
+            .name("flashdir-cache-writer".to_string())
+            .spawn(move || {
+                for job in rx {
+                    match job {
+                        CacheWriteJob::Write {
+                            path,
+                            items,
+                            mft_available,
+                            dir_mtime,
+                            verified_usn,
+                        } => {
+                            if let Err(e) = DiskCache::instance().insert(
+                                &path,
+                                items.as_slice(),
+                                mft_available,
+                                dir_mtime,
+                                verified_usn,
+                            ) {
+                                eprintln!("[Cache] 写入磁盘缓存失败 {}: {}", path, e);
+                            }
+                        }
+                        CacheWriteJob::Flush(ack) => {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            })
+            .expect("spawn flashdir-cache-writer");
+        tx
+    })
+}
+
+/// 提交一次整份磁盘缓存写入（异步）
+pub fn schedule_disk_cache_write(
+    path: String,
+    items: Arc<Vec<Item>>,
+    mft_available: bool,
+    dir_mtime: i64,
+    verified_usn: i64,
+) {
+    let _ = cache_writer().send(CacheWriteJob::Write {
+        path,
+        items,
+        mft_available,
+        dir_mtime,
+        verified_usn,
+    });
+}
+
+/// 等待已提交的磁盘缓存写入全部完成（CLI 退出前调用；GUI 不需要）
+pub fn flush_disk_cache_writes() {
+    let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+    if cache_writer().send(CacheWriteJob::Flush(ack_tx)).is_ok() {
+        let _ = ack_rx.recv_timeout(std::time::Duration::from_secs(600));
+    }
+}
+
 /// 将任意路径规范化为内存/磁盘缓存使用的 key（canonical + 正斜杠）
 fn cache_key_for(path: &str) -> Option<String> {
     let canonical = std::fs::canonicalize(path).ok()?;
@@ -707,8 +784,6 @@ pub async fn scan_directory_view(
                     }
                     Some(UsnUpdate::Applied {
                         items,
-                        removed,
-                        upserted,
                         verified_usn: next,
                     }) => {
                         let cache_read_time = usn_start.elapsed().as_millis() as u64;
@@ -724,30 +799,15 @@ pub async fn scan_directory_view(
                             mft_available: true,
                             timing: None,
                         };
-                        // 只写变更行；基底不存在（缓存被淘汰）时回退整份写入
-                        let disk_cache = DiskCache::instance();
-                        let delta_ok = disk_cache
-                            .apply_items_delta(
-                                &root_dir,
-                                &removed,
-                                &upserted,
-                                true,
-                                mtime_timestamp,
-                                next,
-                            )
-                            .unwrap_or(false);
-                        if !delta_ok {
-                            disk_cache
-                                .insert(
-                                    &root_dir,
-                                    arc_result.items.as_slice(),
-                                    true,
-                                    mtime_timestamp,
-                                    next,
-                                )
-                                .ok();
-                        }
+                        // blob 缓存：整块重写（后台线程），内存缓存同步更新
                         scan_cache().insert_arc(root_dir.clone(), arc_result.clone(), next);
+                        schedule_disk_cache_write(
+                            root_dir.clone(),
+                            Arc::clone(&arc_result.items),
+                            true,
+                            mtime_timestamp,
+                            next,
+                        );
                         perf_monitor.end_scan();
                         return Ok(ScanView::from_arc(&arc_result, "usn", cache_read_time));
                     }
@@ -920,17 +980,16 @@ pub async fn scan_directory_view(
         timing: Some(timing.clone()),
     };
 
-    // 写入两级缓存：内存缓存直接共享同一份 Arc，不再克隆整份条目
-    DiskCache::instance()
-        .insert(
-            &root_dir,
-            arc_result.items.as_slice(),
-            mft_available,
-            mtime_timestamp,
-            verified_usn,
-        )
-        .ok();
+    // 内存缓存同步写入（后续分页/树/USN 校验都依赖它，共享 Arc 零拷贝）；
+    // 磁盘缓存整份落盘较慢（大目录数十秒），交给后台线程，扫描立即返回。
     scan_cache().insert_arc(root_dir.clone(), arc_result.clone(), verified_usn);
+    schedule_disk_cache_write(
+        root_dir.clone(),
+        Arc::clone(&arc_result.items),
+        mft_available,
+        mtime_timestamp,
+        verified_usn,
+    );
 
     perf_monitor.end_scan();
     Ok(ScanView {
@@ -1253,14 +1312,8 @@ fn write_usn_checkpoint_atomic(path: &std::path::Path, json: &str) -> std::io::R
 pub enum UsnUpdate {
     /// 增量窗口覆盖了缓存数据，且区间内没有影响该目录的变更
     Unchanged { verified_usn: i64 },
-    /// 变更已应用，返回新的条目集合与增量明细
-    /// （明细用于只把变更写回 SQLite，而不是重写整份目录）
-    Applied {
-        items: Vec<Item>,
-        removed: Vec<String>,
-        upserted: Vec<Item>,
-        verified_usn: i64,
-    },
+    /// 变更已应用，返回新的条目集合
+    Applied { items: Vec<Item>, verified_usn: i64 },
     /// 增量窗口已失效（Journal 回滚/校验点过旧），必须全量扫描
     Stale,
 }
@@ -1455,10 +1508,6 @@ fn try_usn_incremental_update(
 
     // ── 以下开始真正应用变更 ──
     // 构建可变的条目索引（只在确实存在变更时才克隆整份条目）
-    // 增量明细（用于只写变更行）
-    let mut delta_removed: Vec<String> = Vec::new();
-    let mut delta_upserted: Vec<Item> = Vec::new();
-
     let mut items_map: HashMap<CompactString, Item> =
         HashMap::with_capacity(base_items.len() + relevant.len());
     for item in base_items {
@@ -1567,7 +1616,6 @@ fn try_usn_incremental_update(
             let is_dir = items_map.get(&key).map(|item| item.is_dir).unwrap_or(false);
             items_map.remove(&key);
             applied += 1;
-            delta_removed.push(key.to_string());
             eprintln!(
                 "  [USN-{}] 移除: {}",
                 if is_delete { "DEL" } else { "RN_OLD" },
@@ -1587,7 +1635,6 @@ fn try_usn_incremental_update(
                 let mut subtree: Vec<Item> = Vec::with_capacity(children.len());
                 for child in children {
                     if let Some(item) = items_map.remove(&child) {
-                        delta_removed.push(child.to_string());
                         // 全局索引同样要移除这些路径（改名时会在新前缀下重新 upsert）
                         removed_abs_paths.push(child.to_string());
                         subtree.push(item);
@@ -1597,7 +1644,7 @@ fn try_usn_incremental_update(
                     // 改名：暂存子树，等 NEW_NAME 记录出现后按新前缀重挂
                     renamed_subtrees.insert(change.file_ref, (key.to_string(), subtree));
                 }
-                // 真删除：子树的 SQLite 行随 delta_removed 一并删除
+                // 真删除：子树不再重挂（blob 整块重写时会一并消失）
             }
         }
         removed_abs_paths.push(abs);
@@ -1668,7 +1715,6 @@ fn try_usn_incremental_update(
                 is_dir,
                 mtime: file_mtime,
             };
-            delta_upserted.push(new_item.clone());
             items_map.insert(item_key, new_item);
 
             // 目录改名：把暂存的子树改挂到新前缀下（Windows 不会为子项生成 USN 记录）
@@ -1691,7 +1737,6 @@ fn try_usn_incremental_update(
                                 is_dir: child.is_dir,
                                 mtime: child.mtime,
                             });
-                            delta_upserted.push(child.clone());
                             items_map.insert(child.path.clone(), child);
                         }
                     }
@@ -1730,7 +1775,6 @@ fn try_usn_incremental_update(
                         item.size = new_size;
                         item.size_formatted = format_size(new_size);
                         item.mtime = record.mtime;
-                        delta_upserted.push(item.clone());
                         let name = item.name.to_string();
                         upserted_entries.push(crate::global_search::IndexEntry {
                             path: abs.clone(),
@@ -1791,8 +1835,6 @@ fn try_usn_incremental_update(
 
     Some(UsnUpdate::Applied {
         items: new_items,
-        removed: delta_removed,
-        upserted: delta_upserted,
         verified_usn: next_usn,
     })
 }

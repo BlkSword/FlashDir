@@ -61,8 +61,9 @@ impl DiskCache {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
 
-        // 条目级磁盘缓存：每个扫描结果拆成 meta + items 两表，
-        // 避免大目录命中时必须反序列化整个 BLOB。
+        // 目录级磁盘缓存：每个扫描目录一行 blob（bincode(Vec<Item>)）。
+        // 早期是"每条目一行 + 多索引"，30 万行的写入要几十秒、读取要数秒；
+        // 单行 blob 写入/读取都在百毫秒级（USN 增量本来就持有全量条目，整块重写即可）。
         conn.execute(
             "CREATE TABLE IF NOT EXISTS scan_meta (
                 scan_path TEXT PRIMARY KEY,
@@ -71,37 +72,26 @@ impl DiskCache {
                 size INTEGER NOT NULL,
                 mft_available INTEGER NOT NULL,
                 item_count INTEGER NOT NULL,
-                verified_usn INTEGER NOT NULL DEFAULT 0
+                verified_usn INTEGER NOT NULL DEFAULT 0,
+                data BLOB
             )",
             [],
         )?;
 
-        // 兼容旧库：缺少 verified_usn 列时补上
+        // 兼容旧库：补齐列
         let _ = conn.execute(
             "ALTER TABLE scan_meta ADD COLUMN verified_usn INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = conn.execute("ALTER TABLE scan_meta ADD COLUMN data BLOB", []);
 
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS scan_items (
-                scan_path TEXT NOT NULL,
-                path TEXT NOT NULL,
-                name TEXT NOT NULL,
-                size INTEGER NOT NULL,
-                is_dir INTEGER NOT NULL,
-                mtime INTEGER NOT NULL,
-                PRIMARY KEY (scan_path, path)
-            )",
-            [],
-        )?;
-
-        // 兼容旧库：size_formatted 不再持久化（按需格式化即可）
-        let _ = conn.execute("ALTER TABLE scan_items DROP COLUMN size_formatted", []);
-
-        // 主键 (scan_path, path) 已覆盖 `WHERE scan_path=? [AND path LIKE ?]` 前缀查询；
-        // 多余索引会让每次缓存写入多 2 次 B-tree 插入（实测 200k 行 18s → 7.7s）
+        // 旧版本条目级缓存表不再使用，直接删除以释放磁盘空间
+        let _ = conn.execute("DROP TABLE IF EXISTS scan_items", []);
         let _ = conn.execute("DROP INDEX IF EXISTS idx_scan_items_path", []);
         let _ = conn.execute("DROP INDEX IF EXISTS idx_scan_items_scan_path", []);
+        // 无 blob 的历史行视为未命中，清理掉
+        let _ = conn.execute("DELETE FROM scan_meta WHERE data IS NULL", []);
+
 
         // 旧版本整表 BLOB 缓存不再使用，直接删除以释放磁盘空间
         conn.execute("DROP TABLE IF EXISTS scan_cache", [])?;
@@ -214,162 +204,36 @@ impl DiskCache {
     }
 
     /// 估算一批条目在缓存中的字节占用（含固定开销）
-    fn estimate_items_size(items: &[Item]) -> usize {
-        items
-            .iter()
-            .map(|i| i.path.len() + i.name.len() + 40)
-            .sum::<usize>()
-            + 128
-    }
-
-    /// USN 增量写回：只写变更的行，避免为了几十条变更重写整份目录缓存
-    /// （百万级条目的整份重写会带来秒级延迟与大量 WAL 写入）。
-    ///
-    /// 返回 `Ok(false)` 表示基底行已不存在（缓存被淘汰），调用方应回退整份写入。
-    pub fn apply_items_delta(
-        &self,
-        path: &str,
-        removed_paths: &[String],
-        upserted: &[Item],
-        mft_available: bool,
-        dir_mtime: i64,
-        verified_usn: i64,
-    ) -> Result<bool> {
-        let added_size = Self::estimate_items_size(upserted) as i64;
-        let removed_size: i64 = removed_paths
-            .iter()
-            .map(|p| (p.len() + 48) as i64)
-            .sum();
-
-        let mut guard = self.conn.lock();
-        let conn = guard.as_mut().ok_or_else(Self::disabled_err)?;
-        let tx = conn.transaction()?;
-
-        let base_exists: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM scan_meta WHERE scan_path = ?1",
-            params![path],
-            |row| row.get(0),
-        )?;
-        if base_exists == 0 {
-            // 事务未提交，drop 时自动回滚
-            return Ok(false);
-        }
-
-        {
-            let mut del = tx.prepare(
-                "DELETE FROM scan_items WHERE scan_path = ?1 AND path = ?2",
-            )?;
-            for removed in removed_paths {
-                del.execute(params![path, removed.as_str()])?;
-            }
-
-            let mut upsert = tx.prepare(
-                "INSERT OR REPLACE INTO scan_items
-                 (scan_path, path, name, size, is_dir, mtime)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            )?;
-            for item in upserted {
-                upsert.execute(params![
-                    path,
-                    item.path.as_str(),
-                    item.name.as_str(),
-                    item.size,
-                    item.is_dir as i64,
-                    item.mtime,
-                ])?;
-            }
-        }
-
-        // item_count / size 为近似值（用于统计与容量控制，不参与正确性）
-        let item_delta = upserted.len() as i64 - removed_paths.len() as i64;
-        tx.execute(
-            "UPDATE scan_meta
-             SET dir_mtime = ?1,
-                 mft_available = ?2,
-                 verified_usn = ?3,
-                 created_at = ?4,
-                 item_count = MAX(item_count + ?5, 0),
-                 size = MAX(size + ?6, 0)
-             WHERE scan_path = ?7",
-            params![
-                dir_mtime,
-                mft_available as i64,
-                verified_usn.max(0),
-                chrono::Utc::now().timestamp(),
-                item_delta,
-                added_size - removed_size,
-                path,
-            ],
-        )?;
-
-        tx.commit()?;
-        Self::refresh_size_counter(conn, &self.current_bytes);
-        Ok(true)
-    }
-
-    /// USN 校验通过后刷新有效期与已校验 USN（不重写条目）
-    pub fn touch_meta(&self, path: &str, dir_mtime: i64, verified_usn: i64) -> Result<()> {
-        let guard = self.conn.lock();
-        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
-        conn.execute(
-            "UPDATE scan_meta
-             SET dir_mtime = ?1, verified_usn = MAX(verified_usn, ?2), created_at = ?3
-             WHERE scan_path = ?4",
-            params![dir_mtime, verified_usn, chrono::Utc::now().timestamp(), path],
-        )?;
-        Ok(())
-    }
-
+    /// 读取某目录的缓存（单行 blob：bincode(Vec<Item>)）
     fn load_scan(
         conn: &Connection,
         path: &str,
         dir_mtime: i64,
         ignore_mtime: bool,
     ) -> Option<(ScanResult, i64)> {
-        let meta: Option<(i64, i64, i64)> = conn
+        let row: Option<(i64, i64, i64, Option<Vec<u8>>)> = conn
             .query_row(
-                "SELECT dir_mtime, mft_available, verified_usn FROM scan_meta WHERE scan_path = ?1",
+                "SELECT dir_mtime, mft_available, verified_usn, data FROM scan_meta WHERE scan_path = ?1",
                 params![path],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .ok()
             .flatten();
 
-        let (cached_mtime, mft_available, verified_usn) = meta?;
+        let (cached_mtime, mft_available, verified_usn, data) = row?;
         if !ignore_mtime && cached_mtime < dir_mtime {
             return None;
         }
+        let data = data?; // 旧版本遗留行（无 blob）视为未命中
 
         let _ = conn.execute(
             "UPDATE scan_meta SET created_at = ?1 WHERE scan_path = ?2",
             params![chrono::Utc::now().timestamp(), path],
         );
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT path, name, size, is_dir, mtime
-                 FROM scan_items WHERE scan_path = ?1",
-            )
-            .ok()?;
-
-        let rows = stmt
-            .query_map(params![path], |row| {
-                Ok(Item {
-                    path: CompactString::from(row.get::<_, String>(0)?),
-                    name: CompactString::from(row.get::<_, String>(1)?),
-                    size: row.get(2)?,
-                    // 不再持久化格式化文本：调用方按需 format_size
-                    size_formatted: CompactString::new(),
-                    is_dir: row.get::<_, i64>(3)? != 0,
-                    mtime: row.get(4)?,
-                })
-            })
-            .ok()?;
-
-        let mut items: Vec<Item> = rows.filter_map(|r| r.ok()).collect();
-        // SQLite 的 ORDER BY 会走 temp b-tree（实测 30 万行 ~0.7s），
-        // 内存排序只要 ~15ms，且调用方本来就要求 size 降序。
+        let mut items: Vec<Item> = bincode::deserialize(&data).ok()?;
+        // SQLite ORDER BY 需 temp b-tree（30 万行 ~0.7s），内存排序只要 ~15ms
         items.sort_unstable_by(|a, b| b.size.cmp(&a.size));
         let total_size: i64 = items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum();
 
@@ -388,8 +252,11 @@ impl DiskCache {
         ))
     }
 
-    /// 写入某目录的完整扫描结果。
-    /// `verified_usn` 表示这份数据已被 USN 校验到的位置（0 = 未知）。
+    /// 写入某目录的完整扫描结果（单行 blob）。
+    ///
+    /// 相比"每条目一行 + 多索引"，大目录写入从数十秒降到百毫秒级，
+    /// 读取也不再需要物化几十万行；代价是增量更新要重写整块
+    /// （USN 路径本来就持有全量条目，直接整块写回即可）。
     pub fn insert(
         &self,
         path: &str,
@@ -398,69 +265,48 @@ impl DiskCache {
         dir_mtime: i64,
         verified_usn: i64,
     ) -> Result<()> {
-        let data_size: usize = Self::estimate_items_size(items);
+        let data = bincode::serialize(items)?;
+        let data_len = data.len() as u64;
 
-        self.maybe_cleanup(data_size)?;
+        self.maybe_cleanup(data_len as usize)?;
 
         let mut guard = self.conn.lock();
         let conn = guard.as_mut().ok_or_else(Self::disabled_err)?;
         let tx = conn.transaction()?;
-
-        tx.execute("DELETE FROM scan_items WHERE scan_path = ?1", params![path])?;
-        tx.execute("DELETE FROM scan_meta WHERE scan_path = ?1", params![path])?;
-
-        {
-            let mut stmt = tx.prepare(
-                "INSERT OR REPLACE INTO scan_items
-                 (scan_path, path, name, size, is_dir, mtime)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            )?;
-            for item in items {
-                stmt.execute(params![
-                    path,
-                    item.path.as_str(),
-                    item.name.as_str(),
-                    item.size,
-                    item.is_dir as i64,
-                    item.mtime,
-                ])?;
-            }
-        }
-
         tx.execute(
             "INSERT OR REPLACE INTO scan_meta
-             (scan_path, dir_mtime, created_at, size, mft_available, item_count, verified_usn)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (scan_path, dir_mtime, created_at, size, mft_available, item_count, verified_usn, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 path,
                 dir_mtime,
                 chrono::Utc::now().timestamp(),
-                data_size as i64,
+                data_len as i64,
                 mft_available as i64,
                 items.len() as i64,
                 verified_usn.max(0),
+                data,
             ],
         )?;
-
         tx.commit()?;
 
-        // 以数据库真实值为准同步内存计数，避免长期漂移
-        if let Ok(total) = conn.query_row(
-            "SELECT COALESCE(SUM(size), 0) FROM scan_meta",
-            [],
-            |row| row.get::<_, i64>(0),
-        ) {
-            *self.current_bytes.lock() = total.max(0) as u64;
-        }
-
+        Self::refresh_size_counter(conn, &self.current_bytes);
         Ok(())
     }
 
-    /// 从上层目录的磁盘缓存推导子目录结果。
-    ///
-    /// 新鲜度：仅当"父缓存写入时间 >= 子目录自身 mtime"时才允许推导，
-    /// 否则子目录可能在上层扫描之后发生过变更，必须走完整的缓存/USN/扫描链路。
-    /// 返回 (扫描结果, 父缓存已校验 USN)。
+
+    pub fn touch_meta(&self, path: &str, dir_mtime: i64, verified_usn: i64) -> Result<()> {
+        let guard = self.conn.lock();
+        let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
+        conn.execute(
+            "UPDATE scan_meta
+             SET dir_mtime = ?1, verified_usn = MAX(verified_usn, ?2), created_at = ?3
+             WHERE scan_path = ?4",
+            params![dir_mtime, verified_usn, chrono::Utc::now().timestamp(), path],
+        )?;
+        Ok(())
+    }
+
     pub fn get_derived(&self, child_path: &str, dir_mtime: i64) -> Option<(ScanResult, i64)> {
         let guard = self.conn.lock();
         let conn = guard.as_ref()?;
@@ -502,48 +348,28 @@ impl DiskCache {
             }
         };
 
-        let child_exists: bool = conn
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM scan_items
-                    WHERE scan_path = ?1 AND path = ?2 AND is_dir = 1
-                 )",
-                params![scan_path, child_path],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
+        // 从 blob 载入父缓存（同时拿到父的已校验 USN）
+        let (parent, parent_usn) = Self::load_scan(conn, &scan_path, 0, true)?;
+        let verified_usn = verified_usn.max(parent_usn);
 
-        if !child_exists {
+        // 子目录本身必须作为目录条目存在于父结果中
+        if !parent
+            .items
+            .iter()
+            .any(|i| i.is_dir && i.path.as_str() == child_path)
+        {
             return None;
         }
 
-        let like = format!("{}%", escape_like(&prefix));
-        let mut stmt = conn
-            .prepare(
-                "SELECT path, name, size, is_dir, mtime
-                 FROM scan_items
-                 WHERE scan_path = ?1 AND path LIKE ?2 ESCAPE '\\'",
-            )
-            .ok()?;
 
-        let rows = stmt
-            .query_map(params![scan_path, like], |row| {
-                Ok(Item {
-                    path: CompactString::from(row.get::<_, String>(0)?),
-                    name: CompactString::from(row.get::<_, String>(1)?),
-                    size: row.get(2)?,
-                    // 不再持久化格式化文本：调用方按需 format_size
-                    size_formatted: CompactString::new(),
-                    is_dir: row.get::<_, i64>(3)? != 0,
-                    mtime: row.get(4)?,
-                })
-            })
-            .ok()?;
-
-        let mut items: Vec<Item> = rows.filter_map(|r| r.ok()).collect();
-        // SQLite 的 ORDER BY 会走 temp b-tree（实测 30 万行 ~0.7s），
-        // 内存排序只要 ~15ms，且调用方本来就要求 size 降序。
+        let mut items: Vec<Item> = parent
+            .items
+            .into_iter()
+            .filter(|i| i.path.starts_with(prefix.as_str()))
+            .collect();
         items.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+
+
         let total_size: i64 = items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum();
 
         Some((
@@ -568,12 +394,6 @@ impl DiskCache {
         let Some(conn) = guard.as_ref() else {
             return Ok(());
         };
-        conn.execute(
-            "DELETE FROM scan_items WHERE scan_path IN (
-                SELECT scan_path FROM scan_meta WHERE created_at < ?1
-             )",
-            params![cutoff.timestamp()],
-        )?;
         conn.execute(
             "DELETE FROM scan_meta WHERE created_at < ?1",
             params![cutoff.timestamp()],
@@ -634,10 +454,6 @@ impl DiskCache {
             }
 
             for victim in &victims {
-                tx.execute(
-                    "DELETE FROM scan_items WHERE scan_path = ?1",
-                    params![victim],
-                )?;
                 tx.execute("DELETE FROM scan_meta WHERE scan_path = ?1", params![victim])?;
             }
         }
@@ -650,7 +466,6 @@ impl DiskCache {
     pub fn clear(&self) -> Result<()> {
         let guard = self.conn.lock();
         let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
-        conn.execute("DELETE FROM scan_items", [])?;
         conn.execute("DELETE FROM scan_meta", [])?;
         *self.current_bytes.lock() = 0;
         Ok(())
@@ -699,10 +514,6 @@ impl DiskCache {
     pub fn invalidate(&self, path: &str) -> Result<()> {
         let guard = self.conn.lock();
         let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
-        conn.execute(
-            "DELETE FROM scan_items WHERE scan_path = ?1 OR scan_path LIKE ?2 ESCAPE '\\'",
-            params![path, path_child_pattern(path)],
-        )?;
         conn.execute(
             "DELETE FROM scan_meta WHERE scan_path = ?1 OR scan_path LIKE ?2 ESCAPE '\\'",
             params![path, path_child_pattern(path)],
