@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import Icon from './Icon.vue'
 import { formatSizeCompact } from '../utils/format.js'
@@ -16,6 +16,19 @@ const emit = defineEmits(['navigate', 'error'])
 // 节点：{ path, name, size, isDir, loaded, open, children }
 const nodes = ref([])
 const loading = ref(false)
+const focusIndex = ref(-1)
+
+/** 点击树区域时保证容器获得焦点（否则键盘事件收不到） */
+const ensureFocus = (e) => {
+  const el = e.currentTarget
+  if (el && el.focus) el.focus({ preventScroll: true })
+}
+
+const scrollToRow = async (idx) => {
+  await nextTick()
+  const el = document.querySelector(`.tree-scroll .tnode[data-idx="${idx}"]`)
+  el?.scrollIntoView({ block: 'nearest' })
+}
 
 const toNode = (item) => ({
   path: item.path,
@@ -58,7 +71,11 @@ const toggle = async (node) => {
   }
 }
 
-const click = (node) => emit('navigate', node.path)
+const click = (node) => {
+  const idx = visible.value.findIndex((r) => r.node.path === node.path)
+  if (idx >= 0) focusIndex.value = idx
+  emit('navigate', node.path)
+}
 
 // 选中项所在分支自动展开（最多 4 层，避免深路径时大量请求）
 const expandTo = async (target) => {
@@ -107,6 +124,58 @@ const visible = computed(() => {
   return out
 })
 
+/**
+ * 树内键盘导航：
+ * ↑↓ 移动焦点 · → 展开（已展开则进入首个子项）· ← 折叠（否则回到父项）
+ * Enter 扫描该目录 · Home/End 首尾
+ */
+async function onKey(e) {
+  const list = visible.value
+  if (!list.length) return
+  const cur = focusIndex.value
+  const row = list[cur]
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault()
+    const next = Math.min(list.length - 1, Math.max(0, (cur < 0 ? -1 : cur) + (e.key === 'ArrowDown' ? 1 : -1)))
+    focusIndex.value = next
+    scrollToRow(next)
+  } else if (e.key === 'ArrowRight') {
+    e.preventDefault()
+    if (!row) return
+    if (row.node.isDir && !row.node.open) {
+      await toggle(row.node)
+    } else if (cur + 1 < list.length && list[cur + 1].depth > row.depth) {
+      focusIndex.value = cur + 1
+      scrollToRow(cur + 1)
+    }
+  } else if (e.key === 'ArrowLeft') {
+    e.preventDefault()
+    if (!row) return
+    if (row.node.open) {
+      await toggle(row.node)
+    } else {
+      for (let i = cur - 1; i >= 0; i--) {
+        if (list[i].depth < row.depth) {
+          focusIndex.value = i
+          scrollToRow(i)
+          break
+        }
+      }
+    }
+  } else if (e.key === 'Enter') {
+    e.preventDefault()
+    if (row) emit('navigate', row.node.path)
+  } else if (e.key === 'Home') {
+    e.preventDefault()
+    focusIndex.value = 0
+    scrollToRow(0)
+  } else if (e.key === 'End') {
+    e.preventDefault()
+    focusIndex.value = list.length - 1
+    scrollToRow(list.length - 1)
+  }
+}
+
 /** 路径末段（模板里避免使用正则字面量：Vue 表达式解析器不支持） */
 const baseName = (p) => (p || '').split(/[\/]/).filter(Boolean).pop() || p || ''
 </script>
@@ -116,22 +185,24 @@ const baseName = (p) => (p || '').split(/[\/]/).filter(Boolean).pop() || p || ''
     <div class="tree-head">
       <Icon name="folder" :size="12" />
       <span>目录 · 按占用排序</span>
+      <span class="section-note" style="font-size:10px;margin-left:4px">↑↓ ←→ Enter</span>
       <span class="spacer" style="flex:1" />
       <button class="theme-btn" style="padding:0 2px" title="刷新目录树" @click="loadRoot">
         <Icon name="refresh" :size="12" />
       </button>
     </div>
-    <div class="tree-scroll">
+    <div class="tree-scroll" tabindex="0" @keydown="onKey" @click="ensureFocus">
       <div v-if="loading" class="tree-empty"><span class="spinner" style="display:inline-block;vertical-align:-3px" /> 正在读取…</div>
       <div v-else-if="!nodes.length" class="tree-empty">
         选择一个卷或目录后，这里会列出子目录占用。
       </div>
       <template v-else>
         <div
-          v-for="row in visible"
+          v-for="(row, i) in visible"
           :key="row.node.path"
           class="tnode"
-          :class="{ on: row.node.path === selectedPath }"
+          :class="{ on: row.node.path === selectedPath, focus: focusIndex === i }"
+          :data-idx="i"
           :style="{ paddingLeft: 6 + row.depth * 14 + 'px' }"
           :title="row.node.path"
           @click="click(row.node)"
@@ -144,6 +215,7 @@ const baseName = (p) => (p || '').split(/[\/]/).filter(Boolean).pop() || p || ''
           <span class="lbl">{{ row.node.name }}</span>
           <span class="sz">{{ formatSizeCompact(row.node.size) }}</span>
         </div>
+        <div v-if="!visible.length" class="tree-empty">该目录没有子目录。</div>
       </template>
 
       <template v-if="volumes.length">

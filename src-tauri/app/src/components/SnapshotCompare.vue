@@ -1,174 +1,199 @@
-<template>
-  <div class="snapshot-panel">
-    <div class="snapshot-panel-content">
-      <!-- 操作区 -->
-      <div class="snapshot-actions">
-        <button class="btn primary" :disabled="saving || !props.items || props.items.length === 0" @click="handleSaveSnapshot">
-          <span v-if="saving" class="spinner" />保存当前快照
-        </button>
-        <button class="btn" :disabled="snapshots.length < 2" @click="handleQuickCompare">对比最近两次</button>
-        <button class="btn" :disabled="comparingLatest || snapshots.length === 0 || !props.currentPath" @click="handleCompareLatest">
-          <span v-if="comparingLatest" class="spinner" />对比当前
-        </button>
-      </div>
+<script setup>
+import { ref, computed, watch, onMounted } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
+import Icon from './Icon.vue'
+import { formatSize, formatSizeCompact, formatDateTime, formatError } from '../utils/format.js'
+import { useToasts } from '../composables/useToasts.js'
 
-      <!-- 快照列表 -->
-      <div class="snapshot-list" v-if="snapshots.length > 0">
-        <div class="snapshot-section-title">
-          历史快照 ({{ snapshots.length }})
+const props = defineProps({
+  items: { type: Array, default: () => [] },
+  totalSize: { type: Number, default: 0 },
+  currentPath: { type: String, default: '' },
+})
+const emit = defineEmits(['refresh'])
+const toasts = useToasts()
+
+const snapshots = ref([])
+const selected = ref([])
+const diff = ref(null)
+const saving = ref(false)
+const comparing = ref(false)
+
+async function load() {
+  if (!props.currentPath) { snapshots.value = []; return }
+  try {
+    const list = await invoke('list_snapshots', { path: props.currentPath })
+    snapshots.value = (list || []).slice().sort((a, b) => b.scanTime - a.scanTime)
+    selected.value = []
+  } catch (e) {
+    snapshots.value = []
+  }
+}
+onMounted(load)
+watch(() => props.currentPath, () => { diff.value = null; load() })
+
+async function save() {
+  if (!props.currentPath || !props.items.length) { toasts.warn('请先扫描目录'); return }
+  saving.value = true
+  try {
+    await invoke('save_snapshot_from_cache', { path: props.currentPath })
+    toasts.ok('已保存当前快照')
+    await load()
+    emit('refresh')
+  } catch (e) {
+    toasts.err('保存快照失败：' + formatError(e))
+  } finally {
+    saving.value = false
+  }
+}
+
+function pick(id) {
+  const i = selected.value.indexOf(id)
+  if (i >= 0) selected.value.splice(i, 1)
+  else {
+    selected.value.push(id)
+    if (selected.value.length > 2) selected.value.shift()
+  }
+}
+
+async function compareSelected() {
+  if (selected.value.length !== 2) return
+  comparing.value = true
+  try {
+    const [a, b] = selected.value.slice().sort((x, y) => x - y)
+    diff.value = await invoke('compare_snapshots', { oldId: a, newId: b })
+  } catch (e) {
+    toasts.err('对比失败：' + formatError(e))
+  } finally {
+    comparing.value = false
+  }
+}
+
+async function compareLatest() {
+  if (snapshots.value.length < 2) { toasts.warn('至少需要两份快照'); return }
+  comparing.value = true
+  try {
+    diff.value = await invoke('compare_snapshots', {
+      oldId: snapshots.value[1].id,
+      newId: snapshots.value[0].id,
+    })
+  } catch (e) {
+    toasts.err('对比失败：' + formatError(e))
+  } finally {
+    comparing.value = false
+  }
+}
+
+async function compareCurrent() {
+  comparing.value = true
+  try {
+    const r = await invoke('compare_with_latest_snapshot_from_cache', { path: props.currentPath })
+    if (!r) toasts.warn('当前目录还没有历史快照')
+    diff.value = r || null
+  } catch (e) {
+    toasts.err('对比当前失败：' + formatError(e))
+  } finally {
+    comparing.value = false
+  }
+}
+
+async function remove(id) {
+  try {
+    await invoke('delete_snapshot', { id })
+    toasts.ok('已删除快照')
+    await load()
+  } catch (e) {
+    toasts.err('删除失败：' + formatError(e))
+  }
+}
+
+const added = computed(() => (diff.value?.added || []).slice().sort((a, b) => b.size - a.size).slice(0, 60))
+const removed = computed(() => (diff.value?.removed || []).slice().sort((a, b) => b.size - a.size).slice(0, 60))
+const modified = computed(() =>
+  (diff.value?.modified || []).slice().sort((a, b) => Math.abs(b.delta) - Math.abs(a.delta)).slice(0, 60)
+)
+const summary = computed(() => diff.value?.summary || null)
+const net = computed(() => diff.value?.netChange ?? 0)
+
+async function openPath(p) {
+  try { await invoke('open_path', { path: p }) } catch (e) { toasts.err('打开失败：' + formatError(e)) }
+}
+</script>
+
+<template>
+  <div class="snap">
+    <div class="snap-bar">
+      <button class="btn primary" :disabled="saving || !currentPath || !items.length" @click="save">
+        <span v-if="saving" class="spinner" />保存当前快照
+      </button>
+      <button class="btn" :disabled="comparing || snapshots.length < 2" @click="compareLatest">
+        <span v-if="comparing" class="spinner" />对比最近两次
+      </button>
+      <button class="btn" :disabled="comparing || !snapshots.length" @click="compareCurrent">对比当前</button>
+      <button class="btn" :disabled="selected.length !== 2 || comparing" @click="compareSelected">
+        对比所选（{{ selected.length }}/2）
+      </button>
+      <span class="spacer" style="flex:1" />
+      <span class="section-note">{{ snapshots.length }} 份快照</span>
+    </div>
+
+    <div class="snap-body">
+      <div class="snap-list">
+        <div v-if="!snapshots.length" class="section-note" style="padding:6px 0">
+          还没有快照。扫描目录后点"保存当前快照"，保存两份以上即可对比增长/清理情况。
         </div>
         <div
-          v-for="snap in snapshots"
-          :key="snap.id"
-          class="snapshot-item"
-          :class="{
-            'snapshot-selected': selectedIds.includes(snap.id),
-            'snapshot-latest': snap.id === snapshots[0]?.id
-          }"
-          @click="toggleSelect(snap.id)"
+          v-for="s in snapshots"
+          :key="s.id"
+          class="snap-row"
+          :class="{ on: selected.includes(s.id) }"
+          @click="pick(s.id)"
         >
-          <div class="snapshot-select">
-            <div
-              class="snapshot-checkbox"
-              :class="{ checked: selectedIds.includes(snap.id) }"
-            >
-              <svg v-if="selectedIds.includes(snap.id)" class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" />
-              </svg>
-            </div>
-          </div>
-          <div class="snapshot-info">
-            <div class="snapshot-path">{{ formatPath(snap.path) }}</div>
-            <div class="snapshot-meta">
-              <span class="snapshot-size">{{ snap.totalSizeFormatted }}</span>
-              <span class="snapshot-dot">·</span>
-              <span>{{ snap.fileCount }} 文件</span>
-              <span class="snapshot-dot">·</span>
-              <span>{{ snap.dirCount }} 目录</span>
-            </div>
-            <div class="snapshot-time">{{ formatTime(snap.scanTime * 1000) }}</div>
-          </div>
-          <div class="snapshot-action">
-            <button class="chip" @click.stop="handleDelete(snap.id)">删除</button>
-          </div>
+          <input type="checkbox" :checked="selected.includes(s.id)" @click.stop="pick(s.id)" />
+          <span class="t mono">{{ formatDateTime(s.scanTime) }}</span>
+          <span class="c mono">{{ s.itemCount.toLocaleString() }} 项</span>
+          <span class="s mono">{{ formatSizeCompact(s.totalSize) }}</span>
+          <span class="spacer" style="flex:1" />
+          <button class="chip" title="删除该快照" @click.stop="remove(s.id)">删除</button>
         </div>
       </div>
 
-      <div class="snapshot-empty" v-else>
-        <p>暂无双击快照</p>
-        <p class="snapshot-hint">扫描目录后点击"保存当前快照"</p>
-      </div>
-
-      <!-- 比较按钮 -->
-      <div class="snapshot-compare-bar" v-if="selectedIds.length === 2">
-        <button class="btn primary" :disabled="comparing" @click="handleCompare">
-          <span v-if="comparing" class="spinner" />对比所选快照 ({{ selectedIds.length }})
-        </button>
-      </div>
-
-      <!-- 差异结果 -->
-      <div class="diff-results" v-if="diffResult">
-        <!-- 概览 -->
-        <div class="diff-overview">
-          <div class="diff-stat" :class="diffResult.netChange >= 0 ? 'diff-grow' : 'diff-shrink'">
-            <div class="diff-stat-value">{{ formatDelta(diffResult.netChange) }}</div>
-            <div class="diff-stat-label">净变化</div>
-          </div>
-          <div class="diff-stat diff-grow">
-            <div class="diff-stat-value">+{{ diffResult.added.length }}</div>
-            <div class="diff-stat-label">新增</div>
-          </div>
-          <div class="diff-stat diff-shrink">
-            <div class="diff-stat-value">-{{ diffResult.removed.length }}</div>
-            <div class="diff-stat-label">删除</div>
-          </div>
-          <div class="diff-stat diff-modify">
-            <div class="diff-stat-value">{{ diffResult.modified.length }}</div>
-            <div class="diff-stat-label">修改</div>
-          </div>
+      <div v-if="diff" class="snap-diff">
+        <div class="diff-summary">
+          <span class="badge" :class="net > 0 ? 'warn' : 'ok'">
+            净变化 {{ net > 0 ? '+' : '' }}{{ formatSize(net) }}
+          </span>
+          <span class="section-note">
+            新增 {{ summary?.addedCount ?? added.length }} 项（+{{ formatSize(diff.addedTotalSize || 0) }}）·
+            删除 {{ summary?.removedCount ?? removed.length }} 项（-{{ formatSize(diff.removedTotalSize || 0) }}）·
+            修改 {{ summary?.modifiedCount ?? modified.length }} 项（{{ (diff.modifiedDelta || 0) >= 0 ? '+' : '' }}{{ formatSize(diff.modifiedDelta || 0) }}）
+          </span>
         </div>
-
-        <!-- 进度条 -->
-        <div class="diff-growth-bar" v-if="diffResult.summary">
-          <div class="diff-growth-label">
-            {{ diffResult.summary.oldTotalSizeFormatted }}
-            →
-            {{ diffResult.summary.newTotalSizeFormatted }}
-            ({{ diffResult.summary.growthPercent >= 0 ? '+' : '' }}{{ diffResult.summary.growthPercent.toFixed(1) }}%)
-          </div>
-          <div class="diff-bar-track">
-            <div
-              class="diff-bar-grow"
-              :style="{ width: Math.max(0, diffResult.summary.growthPercent) + '%' }"
-              v-if="diffResult.summary.growthPercent > 0"
-            ></div>
-          </div>
-        </div>
-
-        <!-- 新增文件 -->
-        <div class="diff-section" v-if="diffResult.added.length > 0">
-          <div class="diff-section-title diff-title-grow">
-            🟢 新增 ({{ diffResult.added.length }} 项, {{ formatSize(diffResult.addedTotalSize) }})
-          </div>
-          <div class="diff-items">
-            <div
-              v-for="item in diffResult.added.slice(0, 20)"
-              :key="'a-' + item.path"
-              class="diff-item"
-            >
-              <span class="diff-item-name" :title="item.path">
-                {{ item.isDir ? '[DIR]' : '[FILE]' }} {{ item.name.length > 40 ? item.name.substring(0, 40) + '...' : item.name }}
-              </span>
-              <span class="diff-item-size diff-grow-text">{{ item.sizeFormatted }}</span>
-            </div>
-            <div v-if="diffResult.added.length > 20" class="diff-more">
-              ...还有 {{ diffResult.added.length - 20 }} 项
+        <div class="diff-cols">
+          <div class="diff-col">
+            <h5>新增 / 增长（{{ added.length + modified.filter((m) => m.delta > 0).length }}）</h5>
+            <div class="list">
+              <div v-for="i in added" :key="'a' + i.path" class="diff-row add" :title="i.path" @click="openPath(i.path)">
+                <span class="d">+{{ formatSizeCompact(i.size) }}</span>
+                <span class="p">{{ i.path }}</span>
+              </div>
+              <div v-for="i in modified.filter((m) => m.delta > 0)" :key="'m' + i.path" class="diff-row add" :title="i.path" @click="openPath(i.path)">
+                <span class="d">+{{ formatSizeCompact(i.delta) }}</span>
+                <span class="p">{{ i.path }}</span>
+              </div>
             </div>
           </div>
-        </div>
-
-        <!-- 删除文件 -->
-        <div class="diff-section" v-if="diffResult.removed.length > 0">
-          <div class="diff-section-title diff-title-shrink">
-            🔴 删除 ({{ diffResult.removed.length }} 项, {{ formatSize(diffResult.removedTotalSize) }})
-          </div>
-          <div class="diff-items">
-            <div
-              v-for="item in diffResult.removed.slice(0, 20)"
-              :key="'r-' + item.path"
-              class="diff-item"
-            >
-              <span class="diff-item-name" :title="item.path">
-                {{ item.isDir ? '[DIR]' : '[FILE]' }} {{ item.name.length > 40 ? item.name.substring(0, 40) + '...' : item.name }}
-              </span>
-              <span class="diff-item-size diff-shrink-text">{{ item.sizeFormatted }}</span>
-            </div>
-            <div v-if="diffResult.removed.length > 20" class="diff-more">
-              ...还有 {{ diffResult.removed.length - 20 }} 项
-            </div>
-          </div>
-        </div>
-
-        <!-- 修改文件 -->
-        <div class="diff-section" v-if="diffResult.modified.length > 0">
-          <div class="diff-section-title diff-title-modify">
-            🟡 大小变化 ({{ diffResult.modified.length }} 项)
-          </div>
-          <div class="diff-items">
-            <div
-              v-for="item in diffResult.modified.slice(0, 20)"
-              :key="'m-' + item.path"
-              class="diff-item"
-            >
-              <span class="diff-item-name" :title="item.path">
-                {{ item.isDir ? '[DIR]' : '[FILE]' }} {{ item.name.length > 35 ? item.name.substring(0, 35) + '...' : item.name }}
-              </span>
-              <span class="diff-item-delta" :class="item.delta >= 0 ? 'diff-grow-text' : 'diff-shrink-text'">
-                {{ item.deltaFormatted }}
-              </span>
-            </div>
-            <div v-if="diffResult.modified.length > 20" class="diff-more">
-              ...还有 {{ diffResult.modified.length - 20 }} 项
+          <div class="diff-col">
+            <h5>删除 / 缩小（{{ removed.length + modified.filter((m) => m.delta < 0).length }}）</h5>
+            <div class="list">
+              <div v-for="i in removed" :key="'r' + i.path" class="diff-row del" :title="i.path">
+                <span class="d">-{{ formatSizeCompact(i.size) }}</span>
+                <span class="p">{{ i.path }}</span>
+              </div>
+              <div v-for="i in modified.filter((m) => m.delta < 0)" :key="'n' + i.path" class="diff-row del" :title="i.path" @click="openPath(i.path)">
+                <span class="d">-{{ formatSizeCompact(-i.delta) }}</span>
+                <span class="p">{{ i.path }}</span>
+              </div>
             </div>
           </div>
         </div>
@@ -177,437 +202,23 @@
   </div>
 </template>
 
-<script setup>
-import { ref, watch, onMounted } from 'vue'
-import { useToasts } from '../composables/useToasts.js'
-import { useTauri } from '../composables/useTauri'
-import { formatSize, formatTime, formatError } from '../utils/format.js'
-
-const { invoke } = useTauri()
-
-const toasts = useToasts()
-
-const props = defineProps({
-  items: { type: Array, default: () => [] },
-  totalSize: { type: Number, default: 0 },
-  currentPath: { type: String, default: '' }
-})
-
-const emit = defineEmits(['refresh'])
-
-const snapshots = ref([])
-const selectedIds = ref([])
-const diffResult = ref(null)
-const saving = ref(false)
-const comparing = ref(false)
-const comparingLatest = ref(false)
-
-const formatPath = (path) => {
-  if (!path) return ''
-  const parts = path.replace(/\\/g, '/').split('/')
-  return parts[parts.length - 1] || path
-}
-
-const formatDelta = (delta) => {
-  const abs = Math.abs(delta)
-  const formatted = formatSize(abs)
-  return delta >= 0 ? `+${formatted}` : `-${formatted}`
-}
-
-const loadSnapshots = async () => {
-  if (!props.currentPath || !invoke) return
-  try {
-    const list = await invoke('list_snapshots', { path: props.currentPath })
-    snapshots.value = list || []
-  } catch (error) {
-    console.error('加载快照失败:', error)
-  }
-}
-
-const toggleSelect = (id) => {
-  const idx = selectedIds.value.indexOf(id)
-  if (idx >= 0) {
-    selectedIds.value.splice(idx, 1)
-  } else {
-    if (selectedIds.value.length >= 2) {
-      selectedIds.value.shift()
-    }
-    selectedIds.value.push(id)
-  }
-}
-
-const handleSaveSnapshot = async () => {
-  if (!props.items || props.items.length === 0) {
-    toasts.warn('请先扫描目录')
-    return
-  }
-  saving.value = true
-  try {
-    // 只从后端内存缓存保存：
-    // 旧实现会在缓存缺失时把"当前分页的 100 条"当作全量快照回传，
-    // 生成残缺但看起来正常的快照。这里直接报错，要求重新扫描。
-    await invoke('save_snapshot_from_cache', { path: props.currentPath })
-    toasts.ok('快照已保存')
-    await loadSnapshots()
-  } catch (error) {
-    toasts.err('保存快照失败: ' + formatError(error))
-  } finally {
-    saving.value = false
-  }
-}
-
-const handleCompareLatest = async () => {
-  if (!props.currentPath) return
-  comparingLatest.value = true
-  try {
-    const result = await invoke('compare_with_latest_snapshot_from_cache', {
-      path: props.currentPath,
-    })
-    diffResult.value = result || null
-    if (!result) {
-      toasts.info('当前目录还没有历史快照')
-    }
-  } catch (error) {
-    toasts.err('对比当前失败: ' + error)
-  } finally {
-    comparingLatest.value = false
-  }
-}
-
-const handleQuickCompare = async () => {
-  if (snapshots.value.length < 2) {
-    toasts.warn('至少需要两个快照才能对比')
-    return
-  }
-  selectedIds.value = [snapshots.value[1].id, snapshots.value[0].id]
-  await doCompare(snapshots.value[1].id, snapshots.value[0].id)
-}
-
-const handleCompare = async () => {
-  if (selectedIds.value.length !== 2) return
-  const sorted = [...selectedIds.value].sort((a, b) => {
-    const sa = snapshots.value.find(s => s.id === a)
-    const sb = snapshots.value.find(s => s.id === b)
-    return (sa?.scanTime || 0) - (sb?.scanTime || 0)
-  })
-  await doCompare(sorted[0], sorted[1])
-}
-
-const doCompare = async (oldId, newId) => {
-  comparing.value = true
-  try {
-    const result = await invoke('compare_snapshots', { oldId, newId })
-    diffResult.value = result
-  } catch (error) {
-    toasts.err('对比失败: ' + error)
-  } finally {
-    comparing.value = false
-  }
-}
-
-const handleDelete = async (id) => {
-  try {
-    await invoke('delete_snapshot', { id })
-    selectedIds.value = selectedIds.value.filter(s => s !== id)
-    if (diffResult.value) {
-      // Check if current diff involves deleted snapshot
-      const snapIds = snapshots.value.map(s => s.id)
-      if (!snapIds.includes(id)) {
-        // This is the deleted snapshot - clear diff
-      }
-    }
-    await loadSnapshots()
-    toasts.ok('快照已删除')
-  } catch (error) {
-    toasts.err('删除失败: ' + error)
-  }
-}
-
-watch(() => props.currentPath, () => {
-  loadSnapshots()
-  diffResult.value = null
-  selectedIds.value = []
-})
-
-onMounted(() => {
-  loadSnapshots()
-})
-</script>
-
 <style scoped>
-.snapshot-panel {
-  width: 100%;
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
+.snap { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 9px 10px; }
+.snap-bar { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.snap-body { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
+.snap-list { max-height: 34%; overflow: auto; border: 1px solid var(--bd-0); border-radius: var(--r); }
+.snap-row {
+  display: flex; align-items: center; gap: 10px; height: 23px; padding: 0 8px;
+  border-bottom: 1px solid var(--bd-0); color: var(--tx-1); cursor: pointer; font-size: 11.5px;
 }
-
-.snapshot-panel-content {
-  flex: 1;
-  overflow-y: auto;
-  padding: 12px;
-}
-
-.snapshot-actions {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.snapshot-actions .ant-btn {
-  flex: 1;
-}
-
-/* 快照列表 */
-.snapshot-section-title {
-  font-size: 11px;
-  color: var(var(--tx-2));
-  margin-bottom: 8px;
-  text-transform: uppercase;
-}
-
-.snapshot-list {
-  margin-bottom: 12px;
-}
-
-.snapshot-item {
-  display: flex;
-  align-items: flex-start;
-  padding: 8px;
-  margin-bottom: 4px;
-  background: var(var(--bg-0));
-  border: 1px solid var(var(--bd-1));
-  border-radius: 6px;
-  cursor: pointer;
-  transition: all 0.15s;
-}
-
-.snapshot-item:hover {
-  border-color: var(var(--accent));
-  background: var(var(--bg-2));
-}
-
-.snapshot-selected {
-  border-color: var(var(--accent));
-  background: var(var(--sel));
-}
-
-.snapshot-latest {
-  border-left: 3px solid var(var(--accent));
-}
-
-.snapshot-select {
-  margin-right: 8px;
-  padding-top: 2px;
-}
-
-.snapshot-checkbox {
-  width: 16px;
-  height: 16px;
-  border: 2px solid var(var(--tx-2));
-  border-radius: 3px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 10px;
-  color: white;
-  transition: all 0.15s;
-}
-
-.snapshot-checkbox.checked {
-  background: var(var(--accent));
-  border-color: var(var(--accent));
-}
-
-.snapshot-info {
-  flex: 1;
-  min-width: 0;
-}
-
-.snapshot-path {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(var(--tx-0));
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.snapshot-meta {
-  font-size: 10px;
-  color: var(var(--tx-2));
-  margin-top: 2px;
-}
-
-.snapshot-size {
-  font-weight: 500;
-  color: var(var(--tx-1));
-}
-
-.snapshot-dot {
-  margin: 0 4px;
-}
-
-.snapshot-time {
-  font-size: 10px;
-  color: var(var(--tx-2));
-  margin-top: 2px;
-}
-
-.snapshot-action {
-  flex-shrink: 0;
-}
-
-/* 比较栏 */
-.snapshot-compare-bar {
-  padding: 8px 0;
-}
-
-.snapshot-compare-bar .ant-btn {
-  width: 100%;
-}
-
-/* 空状态 */
-.snapshot-empty {
-  text-align: center;
-  color: var(var(--tx-2));
-  font-size: 12px;
-  padding: 32px 0;
-}
-
-.snapshot-hint {
-  font-size: 11px;
-  margin-top: 4px;
-}
-
-/* 差异结果 */
-.diff-results {
-  margin-top: 16px;
-}
-
-.diff-overview {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.diff-stat {
-  flex: 1;
-  background: var(var(--bg-0));
-  border: 1px solid var(var(--bd-1));
-  border-radius: 6px;
-  padding: 8px;
-  text-align: center;
-}
-
-.diff-stat-value {
-  font-size: 16px;
-  font-weight: 700;
-}
-
-.diff-stat-label {
-  font-size: 10px;
-  color: var(var(--tx-2));
-  margin-top: 2px;
-}
-
-.diff-grow .diff-stat-value { color: var(var(--ok)); }
-.diff-shrink .diff-stat-value { color: var(var(--bad)); }
-.diff-modify .diff-stat-value { color: #faad14; }
-
-/* 增长条 */
-.diff-growth-bar {
-  margin-bottom: 12px;
-  padding: 8px;
-  background: var(var(--bg-0));
-  border-radius: 6px;
-  border: 1px solid var(var(--bd-1));
-}
-
-.diff-growth-label {
-  font-size: 11px;
-  color: var(var(--tx-2));
-  margin-bottom: 4px;
-  text-align: center;
-}
-
-.diff-bar-track {
-  height: 6px;
-  background: var(var(--bg-3));
-  border-radius: 3px;
-  overflow: hidden;
-}
-
-.diff-bar-grow {
-  height: 100%;
-  background: linear-gradient(90deg, var(var(--ok)), var(var(--bad)));
-  border-radius: 3px;
-  transition: width 0.3s;
-}
-
-/* 差异区域 */
-.diff-section {
-  margin-bottom: 12px;
-}
-
-.diff-section-title {
-  font-size: 12px;
-  font-weight: 600;
-  margin-bottom: 6px;
-  padding: 4px 8px;
-  border-radius: 4px;
-}
-
-.diff-title-grow { background: rgba(137,209,133,0.15); color: var(var(--ok)); }
-.diff-title-shrink { background: rgba(244,135,113,0.15); color: var(var(--bad)); }
-.diff-title-modify { background: rgba(250,173,20,0.15); color: #faad14; }
-
-.diff-items {
-  max-height: 300px;
-  overflow-y: auto;
-}
-
-.diff-item {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 3px 8px;
-  font-size: 11px;
-}
-
-.diff-item:hover {
-  background: var(var(--bg-2));
-}
-
-.diff-item-name {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(var(--tx-1));
-}
-
-.diff-item-size {
-  flex-shrink: 0;
-  margin-left: 8px;
-  font-weight: 500;
-}
-
-.diff-item-delta {
-  flex-shrink: 0;
-  margin-left: 8px;
-  font-weight: 500;
-}
-
-.diff-grow-text { color: var(var(--ok)); }
-.diff-shrink-text { color: var(var(--bad)); }
-
-.diff-more {
-  font-size: 11px;
-  color: var(var(--tx-2));
-  text-align: center;
-  padding: 4px;
-}
+.snap-row:last-child { border-bottom: 0; }
+.snap-row:hover { background: var(--hover); }
+.snap-row.o
+.snap-row.on { background: var(--sel); color: var(--tx-0); }
+.snap-row .t { width: 120px; }
+.snap-row .c { width: 84px; color: var(--tx-3); }
+.snap-row .s { width: 66px; color: var(--tx-0); }
+.snap-diff { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.diff-summary { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.diff-cols { flex: 1; min-height: 0; }
 </style>

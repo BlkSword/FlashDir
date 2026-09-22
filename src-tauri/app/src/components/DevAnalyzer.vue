@@ -1,331 +1,121 @@
+<script setup>
+import { ref, computed, watch } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
+import Icon from './Icon.vue'
+import { formatSize, formatSizeCompact, formatError } from '../utils/format.js'
+import { useToasts } from '../composables/useToasts.js'
+
+const props = defineProps({
+  items: { type: Array, default: () => [] },
+  totalSize: { type: Number, default: 0 },
+  currentPath: { type: String, default: '' },
+})
+const toasts = useToasts()
+
+const data = ref(null)
+const scanning = ref(false)
+const expanded = ref('')
+
+async function analyze() {
+  if (!props.currentPath) {
+    toasts.warn('请先选择目录')
+    return
+  }
+  scanning.value = true
+  try {
+    data.value = (await invoke('analyze_dev_disk', { path: props.currentPath })) || null
+    expanded.value = data.value?.categories?.[0]?.category || ''
+  } catch (e) {
+    toasts.err('开发缓存分析失败：' + formatError(e))
+    data.value = null
+  } finally {
+    scanning.value = false
+  }
+}
+watch(() => props.currentPath, () => { data.value = null; expanded.value = '' })
+
+const categories = computed(() => data.value?.categories || [])
+const maxCat = computed(() => categories.value.reduce((m, c) => Math.max(m, c.totalSize), 0) || 1)
+const toggle = (c) => { expanded.value = expanded.value === c.category ? '' : c.category }
+
+/** Top 项只有名字没有路径：按名字+大小在当前页条目里反查，找到则可打开 */
+const pathOf = (t) => {
+  const hit = props.items.find((i) => i.name === t.name && i.size === t.size)
+  return hit ? hit.path : null
+}
+async function openPath(p) {
+  try { await invoke('open_path', { path: p }) } catch (e) { toasts.err('打开失败：' + formatError(e)) }
+}
+</script>
+
 <template>
-  <div class="dev-panel" v-if="hasData">
-    <div class="dev-panel-content">
-      <!-- 概览卡片 -->
-      <div class="dev-summary" v-if="devData">
-        <div class="dev-summary-card">
-          <div class="dev-summary-label">开发工具占用</div>
-          <div class="dev-summary-value dev-summary-primary">
-            {{ devData.devTotalSize ? formatSize(devData.devTotalSize) : '计算中...' }}
-          </div>
-          <div class="dev-summary-sub" v-if="devData.devPercent > 0">
-            占总量 {{ devData.devPercent.toFixed(1) }}%
-          </div>
+  <div class="dev">
+    <div class="dev-bar">
+      <button class="btn primary" :disabled="scanning || !currentPath" @click="analyze">
+        <span v-if="scanning" class="spinner" />分析开发缓存
+      </button>
+      <span class="spacer" style="flex:1" />
+      <span v-if="data" class="section-note">
+        开发类占用 <b class="mono" style="color:var(--tx-0)">{{ formatSize(data.devTotalSize) }}</b>
+        · 占全部 {{ (data.devPercent || 0).toFixed(1) }}%
+        · 命中 {{ data.devItems.toLocaleString() }} / {{ data.totalItems.toLocaleString() }} 项
+      </span>
+    </div>
+
+    <div v-if="scanning" class="section-note">正在分析当前目录…</div>
+    <div v-else-if="!data" class="section-note" style="margin-top:8px">
+      分析 node_modules、target、包管理器缓存、构建产物等开发类目录的占用与可回收空间。
+    </div>
+
+    <div v-else class="dev-list">
+      <div v-for="c in categories" :key="c.category" class="dev-cat">
+        <div class="dev-row" :class="{ open: expanded === c.category }" @click="toggle(c)">
+          <Icon :name="expanded === c.category ? 'down' : 'right'" :size="11" />
+          <span class="lbl">{{ c.label }}</span>
+          <span class="cnt mono">{{ c.itemCount.toLocaleString() }} 项</span>
+          <span class="bar"><i :style="{ width: (c.totalSize / maxCat) * 100 + '%' }" /></span>
+          <span class="sz mono">{{ formatSize(c.totalSize) }}</span>
+          <span class="pct mono">{{ (c.percentOfDev || 0).toFixed(0) }}%</span>
         </div>
-        <div class="dev-summary-card" v-if="devData.categories && devData.categories.length > 0">
-          <div class="dev-summary-label">最大类别</div>
-          <div class="dev-summary-value">
-            {{ devData.categories[0].icon }} {{ devData.categories[0].label }}
-          </div>
-          <div class="dev-summary-sub">
-            {{ devData.categories[0].totalSizeFormatted }}
-          </div>
-        </div>
-      </div>
-
-      <!-- 类别列表 -->
-      <div class="dev-category-list" v-if="devData && devData.categories && devData.categories.length > 0">
-        <div
-          v-for="cat in devData.categories"
-          :key="cat.category"
-          class="dev-category-item"
-        >
-          <div class="dev-category-header">
-            <span class="dev-category-icon">{{ cat.icon }}</span>
-            <div class="dev-category-info">
-              <span class="dev-category-name">{{ cat.label }}</span>
-              <span class="dev-category-desc">{{ cat.description }}</span>
-            </div>
-            <div class="dev-category-size">
-              <span class="dev-size-value">{{ cat.totalSizeFormatted }}</span>
-              <span class="dev-size-percent">{{ cat.percentOfDev.toFixed(1) }}%</span>
-            </div>
-          </div>
-
-          <!-- 进度条 -->
-          <div class="dev-progress-wrapper">
+        <div v-if="expanded === c.category" class="dev-detail">
+          <div class="section-note" style="margin-bottom:4px">{{ c.description }}</div>
+          <div class="rows">
             <div
-              class="dev-progress-bar"
-              :style="{ width: cat.percentOfDev + '%', backgroundColor: getColor(cat.category) }"
-            ></div>
-          </div>
-
-          <!-- Top 5 子项 -->
-          <div class="dev-top-items" v-if="cat.topItems && cat.topItems.length > 0">
-            <div
-              v-for="(top, idx) in cat.topItems"
-              :key="idx"
-              class="dev-top-item"
+              v-for="t in c.topItems"
+              :key="t.name + t.size"
+              class="rowline"
+              :style="{ cursor: pathOf(t) ? 'pointer' : 'default' }"
+              :title="pathOf(t) || t.name"
+              @click="pathOf(t) && openPath(pathOf(t))"
             >
-              <span class="dev-top-name" :title="top.name">{{ top.name.length > 35 ? top.name.substring(0, 35) + '...' : top.name }}</span>
-              <span class="dev-top-size">{{ top.sizeFormatted }}</span>
+              <span class="k">{{ formatSizeCompact(t.size) }}</span>
+              <span class="p">{{ t.name }}</span>
+              <span v-if="pathOf(t)" class="tagline"><Icon name="folder-open" :size="12" />打开</span>
             </div>
+            <div v-if="!c.topItems.length" class="section-note">该类别下没有可列出的具体项。</div>
           </div>
         </div>
       </div>
-
-      <!-- 无数据 -->
-      <div class="dev-empty" v-else>
-        未检测到常见开发者工具目录
-      </div>
+      <div v-if="!categories.length" class="section-note">当前目录没有识别到开发类缓存。</div>
     </div>
   </div>
 </template>
 
-<script setup>
-import { ref, watch, computed } from 'vue'
-import { formatSize, debounce } from '../utils/format.js'
-import { useTauri } from '../composables/useTauri'
-
-const { invoke } = useTauri()
-
-const props = defineProps({
-  items: {
-    type: Array,
-    default: () => []
-  },
-  totalSize: {
-    type: Number,
-    default: 0
-  },
-  currentPath: {
-    type: String,
-    default: ''
-  }
-})
-
-const devData = ref(null)
-const lastDataFingerprint = ref('')
-
-const hasData = computed(() => {
-  return devData.value && devData.value.categories && devData.value.categories.length > 0
-})
-
-// 颜色映射
-const colorMap = {
-  node: '#339933',
-  rust: '#dea584',
-  rust_cache: '#b7410e',
-  python_venv: '#3776ab',
-  python_cache: '#ffd43b',
-  java_gradle: '#a074c4',
-  java_maven: '#c41d7f',
-  git: '#f05032',
-  dotnet: '#512bd4',
-  dotnet_cache: '#0078d4',
-  go: '#00add8',
-  docker: '#2496ed',
-  wsl: '#e95420',
-  android: '#3ddc84',
-  npm_cache: '#cb3837',
-  pip_cache: '#3776ab',
-  electron: '#47848f',
-  vscode: '#007acc'
-}
-
-const getColor = (category) => {
-  return colorMap[category] || '#8c8c8c'
-}
-
-const analyze = async () => {
-  const fingerprint = `${props.currentPath}|${props.items.length}`
-  if (fingerprint === lastDataFingerprint.value) return
-
-  if (!props.currentPath || !props.items || props.items.length === 0) {
-    devData.value = null
-    lastDataFingerprint.value = ''
-    return
-  }
-  lastDataFingerprint.value = fingerprint
-
-  try {
-    // 后端从内存缓存读取 items 并用 Rayon 分析（已按"匹配边界顶层"去重），
-    // 前端不再传百万级 items，也不在主线程做 O(n) 路径匹配
-    const result = await invoke('analyze_dev_disk', { path: props.currentPath })
-    devData.value = result || null
-  } catch (error) {
-    console.error('开发者分析失败:', error)
-    devData.value = null
-  }
-}
-
-const debouncedAnalyze = debounce(analyze, 300)
-
-watch(() => [props.items.length, props.currentPath], () => {
-  debouncedAnalyze()
-})
-
-// 初始分析
-analyze()
-</script>
-
 <style scoped>
-.dev-panel {
-  width: 100%;
-  background: transparent;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
+.dev { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 9px 10px; }
+.dev-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.dev-list { overflow: auto; flex: 1; min-height: 0; }
+.dev-cat { border-bottom: 1px solid var(--bd-0); }
+.dev-row {
+  display: flex; align-items: center; gap: 8px; height: 24px; cursor: pointer; color: var(--tx-1);
 }
-
-.dev-panel-content {
-  flex: 1;
-  overflow-y: auto;
-  padding: 12px;
-  background: var(var(--bg-1));
-}
-
-/* 概览卡片 */
-.dev-summary {
-  display: flex;
-  gap: 8px;
-  margin-bottom: 16px;
-}
-
-.dev-summary-card {
-  flex: 1;
-  background: var(var(--bg-0));
-  border: 1px solid var(var(--bd-1));
-  border-radius: 6px;
-  padding: 10px 12px;
-  text-align: center;
-}
-
-.dev-summary-label {
-  font-size: 11px;
-  color: var(var(--tx-2));
-  margin-bottom: 4px;
-}
-
-.dev-summary-value {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(var(--tx-0));
-}
-
-.dev-summary-primary {
-  color: var(var(--bad));
-}
-
-.dev-summary-sub {
-  font-size: 11px;
-  color: var(var(--tx-2));
-  margin-top: 2px;
-}
-
-/* 类别列表 */
-.dev-category-list {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.dev-category-item {
-  background: var(var(--bg-0));
-  border: 1px solid var(var(--bd-1));
-  border-radius: 6px;
-  padding: 10px 12px;
-}
-
-.dev-category-header {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.dev-category-icon {
-  font-size: 20px;
-  flex-shrink: 0;
-}
-
-.dev-category-info {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-
-.dev-category-name {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(var(--tx-0));
-}
-
-.dev-category-desc {
-  font-size: 11px;
-  color: var(var(--tx-2));
-}
-
-.dev-category-size {
-  text-align: right;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-}
-
-.dev-size-value {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(var(--tx-0));
-}
-
-.dev-size-percent {
-  font-size: 11px;
-  color: var(var(--tx-2));
-}
-
-/* 进度条 */
-.dev-progress-wrapper {
-  height: 4px;
-  background: var(var(--bg-3));
-  border-radius: 2px;
-  margin-top: 8px;
-  overflow: hidden;
-}
-
-.dev-progress-bar {
-  height: 100%;
-  border-radius: 2px;
-  transition: width 0.3s ease;
-}
-
-/* Top 项 */
-.dev-top-items {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px dashed var(var(--bd-1));
-}
-
-.dev-top-item {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 2px 0;
-}
-
-.dev-top-name {
-  font-size: 11px;
-  color: var(var(--tx-2));
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1;
-  min-width: 0;
-}
-
-.dev-top-size {
-  font-size: 11px;
-  color: var(var(--tx-2));
-  font-weight: 500;
-  flex-shrink: 0;
-  margin-left: 8px;
-}
-
-/* 空状态 */
-.dev-empty {
-  text-align: center;
-  color: var(var(--tx-2));
-  font-size: 12px;
-  padding: 32px 16px;
-}
+.dev-row:hover { background: var(--hover); }
+.dev-row.open { color: var(--tx-0); }
+.dev-row .lbl { width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dev-row .cnt { width: 78px; text-align: right; color: var(--tx-3); font-size: 10.5px; }
+.dev-row .bar { flex: 1; height: 6px; background: var(--bg-3); border-radius: 2px; overflow: hidden; }
+.dev-row .bar i { display: block; height: 100%; background: var(--heat-4); }
+.dev-row .sz { width: 74px; text-align: right; color: var(--tx-0); }
+.dev-row .pct { width: 40px; text-align: right; color: var(--tx-3); font-size: 10.5px; }
+.dev-detail { padding: 4px 0 8px 20px; }
 </style>

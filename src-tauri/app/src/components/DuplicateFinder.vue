@@ -1,290 +1,102 @@
-<template>
-  <div class="duplicate-panel">
-    <div class="duplicate-toolbar">
-      <button class="btn primary" :disabled="scanning || !props.currentPath || props.items.length === 0" @click="handleScan">
-        <span v-if="scanning" class="spinner" />扫描重复文件
-      </button>
-      <label class="filter-box" style="flex:0 0 150px">
-        <span class="section-note">最小</span>
-        <input type="number" min="0" max="102400" v-model.number="minSizeMB" style="width:56px" />
-        <span class="section-note">MB</span>
-      </label>
-    </div>
-
-    <div v-if="scanning" class="duplicate-empty">
-      <div class="duplicate-empty-icon">⏳</div>
-      <div>正在计算文件哈希，大目录可能需要一些时间…</div>
-    </div>
-
-    <div v-else-if="!result" class="duplicate-empty">
-      <div class="duplicate-empty-icon">🔁</div>
-      <div>按文件大小与内容哈希识别重复文件</div>
-      <div class="duplicate-empty-hint">建议先扫描目录，再点“扫描重复文件”</div>
-    </div>
-
-    <template v-else>
-      <div v-if="result.groups.length === 0" class="duplicate-empty">
-        <div class="duplicate-empty-icon">✅</div>
-        <div>未发现重复文件</div>
-      </div>
-
-      <template v-else>
-        <div class="duplicate-summary">
-          <div class="duplicate-stat">
-            <div class="duplicate-stat-value">{{ result.totalGroups }}</div>
-            <div class="duplicate-stat-label">重复组</div>
-          </div>
-          <div class="duplicate-stat">
-            <div class="duplicate-stat-value">{{ result.totalFiles }}</div>
-            <div class="duplicate-stat-label">重复文件</div>
-          </div>
-          <div class="duplicate-stat duplicate-stat--danger">
-            <div class="duplicate-stat-value">{{ result.totalWastedFormatted }}</div>
-            <div class="duplicate-stat-label">可回收空间</div>
-          </div>
-        </div>
-
-        <div
-          v-for="(group, gi) in result.groups"
-          :key="gi"
-          class="duplicate-group"
-        >
-          <div class="duplicate-group-header">
-            <div class="duplicate-group-main">
-              <span class="duplicate-group-size">{{ group.sizeFormatted }}</span>
-              <span class="duplicate-group-count">{{ group.fileCount }} 个文件</span>
-            </div>
-            <span class="duplicate-group-wasted">可回收 {{ group.wastedFormatted }}</span>
-          </div>
-
-          <div class="duplicate-group-files">
-            <div
-              v-for="(file, fi) in group.files"
-              :key="file.path"
-              class="duplicate-file"
-              :title="`点击打开：${file.path}`"
-              @click="openPath(file.path)"
-            >
-              <span class="duplicate-file-index">{{ fi + 1 }}</span>
-              <div class="duplicate-file-body">
-                <span class="duplicate-file-name">{{ file.name }}</span>
-                <span class="duplicate-file-path">{{ file.path }}</span>
-              </div>
-              <span class="duplicate-file-open">打开</span>
-            </div>
-          </div>
-        </div>
-      </template>
-    </template>
-  </div>
-</template>
-
 <script setup>
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
+import Icon from './Icon.vue'
+import { formatSize, formatDateTime, formatError } from '../utils/format.js'
 import { useToasts } from '../composables/useToasts.js'
-import { useTauri } from '../composables/useTauri'
-
-const toasts = useToasts()
 
 const props = defineProps({
   items: { type: Array, default: () => [] },
   currentPath: { type: String, default: '' },
 })
+const toasts = useToasts()
 
-const { invoke } = useTauri()
-
-const scanning = ref(false)
 const result = ref(null)
+const scanning = ref(false)
 const minSizeMB = ref(1)
+const expanded = ref(null)
 
-const handleScan = async () => {
-  if (!props.currentPath) return
+async function run() {
+  if (!props.currentPath || !props.items.length) {
+    toasts.warn('请先扫描目录')
+    return
+  }
   scanning.value = true
-  result.value = null
   try {
     const minSize = Math.max(0, Math.round((minSizeMB.value || 0) * 1024 * 1024))
-    result.value = await invoke('find_duplicates', {
-      path: props.currentPath,
-      minSize,
-    })
-  } catch (error) {
-    console.error('重复文件检测失败:', error)
-    toasts.err('重复文件检测失败: ' + error)
+    result.value = await invoke('find_duplicates', { path: props.currentPath, minSize })
+    expanded.value = result.value?.groups?.[0]?.files?.[0]?.path || null
+  } catch (e) {
+    toasts.err('重复文件检测失败：' + formatError(e))
+    result.value = null
   } finally {
     scanning.value = false
   }
 }
 
-const openPath = async (path) => {
-  try {
-    await invoke('open_path', { path })
-  } catch (error) {
-    toasts.err('打开文件失败: ' + error)
-  }
+const groups = computed(() => result.value?.groups || [])
+const toggle = (g) => { expanded.value = expanded.value === g.files[0]?.path ? null : g.files[0]?.path }
+
+async function openPath(p) {
+  try { await invoke('open_path', { path: p }) } catch (e) { toasts.err('打开失败：' + formatError(e)) }
 }
 </script>
 
+<template>
+  <div class="dup">
+    <div class="dup-bar">
+      <button class="btn primary" :disabled="scanning || !currentPath || !items.length" @click="run">
+        <span v-if="scanning" class="spinner" />扫描重复文件
+      </button>
+      <label class="filter-box" style="flex: 0 0 168px">
+        <span class="section-note">最小</span>
+        <input type="number" min="0" max="102400" v-model.number="minSizeMB" style="width: 58px" />
+        <span class="section-note">MB</span>
+      </label>
+      <span class="spacer" style="flex:1" />
+      <span v-if="result" class="section-note">
+        {{ result.totalGroups.toLocaleString() }} 组 / {{ result.totalFiles.toLocaleString() }} 个文件 ·
+        可回收 <b class="mono" style="color:var(--warn)">{{ result.totalWastedFormatted }}</b>
+      </span>
+    </div>
+
+    <div v-if="scanning" class="section-note">正在按内容哈希比对（大目录可能需要几秒）…</div>
+    <div v-else-if="!result" class="section-note" style="margin-top:8px">
+      按大小分组后对同大小文件做内容哈希，找出真正重复的文件。检测结果只做展示，不会删除任何文件。
+    </div>
+    <div v-else-if="!groups.length" class="section-note" style="margin-top:8px">没有发现重复文件。</div>
+
+    <div v-else class="dup-list">
+      <div v-for="g in groups" :key="g.files[0]?.path" class="dup-group">
+        <div class="dup-head" @click="toggle(g)">
+          <Icon :name="expanded === g.files[0]?.path ? 'down' : 'right'" :size="11" />
+          <span class="sz mono">{{ g.sizeFormatted }}</span>
+          <span class="cnt mono">× {{ g.fileCount }}</span>
+          <span class="lbl">可回收 {{ g.wastedFormatted }}</span>
+          <span class="spacer" style="flex:1" />
+          <span class="tagline">{{ g.files[0]?.name }}</span>
+        </div>
+        <div v-if="expanded === g.files[0]?.path" class="dup-files">
+          <div v-for="f in g.files" :key="f.path" class="rowline" style="cursor:pointer" :title="f.path" @click="openPath(f.path)">
+            <span class="k">{{ formatDateTime(f.mtime) }}</span>
+            <span class="p">{{ f.path }}</span>
+            <span class="tagline"><Icon name="folder-open" :size="12" />打开</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
 <style scoped>
-.duplicate-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.duplicate-toolbar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.duplicate-empty {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 36px 12px;
-  color: var(var(--tx-2));
-  font-size: 12px;
-  text-align: center;
-  background: var(var(--bg-2));
-  border: 1px dashed var(var(--bd-1));
-  border-radius: 10px;
-}
-.duplicate-empty-icon {
-  font-size: 26px;
-  line-height: 1;
-}
-.duplicate-empty-hint {
-  color: var(var(--tx-3));
-  font-size: 11px;
-}
-.duplicate-summary {
-  display: flex;
-  gap: 8px;
-}
-.duplicate-stat {
-  flex: 1;
-  background: var(var(--bg-2));
-  border: 1px solid var(var(--bd-1));
-  border-radius: 8px;
-  padding: 10px 8px;
-  text-align: center;
-}
-.duplicate-stat-value {
-  font-size: 15px;
-  font-weight: 700;
-  color: var(var(--tx-0));
-  font-family: Consolas, 'JetBrains Mono', monospace;
-}
-.duplicate-stat-label {
-  font-size: 10px;
-  color: var(var(--tx-2));
-  margin-top: 2px;
-  text-transform: uppercase;
-  letter-spacing: .4px;
-}
-.duplicate-stat--danger .duplicate-stat-value {
-  color: var(var(--bad));
-}
-.duplicate-group {
-  background: var(var(--bg-2));
-  border: 1px solid var(var(--bd-1));
-  border-radius: 10px;
-  overflow: hidden;
-}
-.duplicate-group-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(var(--bd-1));
-  background: var(var(--bg-1));
-}
-.duplicate-group-main {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  min-width: 0;
-}
-.duplicate-group-size {
-  font-weight: 700;
-  font-size: 13px;
-  color: var(var(--tx-0));
-  font-family: Consolas, 'JetBrains Mono', monospace;
-}
-.duplicate-group-count {
-  color: var(var(--tx-2));
-  font-size: 11px;
-}
-.duplicate-group-wasted {
-  flex-shrink: 0;
-  color: var(var(--bad));
-  font-size: 11px;
-  background: rgba(244,135,113,.1);
-  border: 1px solid rgba(244,135,113,.2);
-  border-radius: 6px;
-  padding: 2px 8px;
-}
-.duplicate-group-files {
-  display: flex;
-  flex-direction: column;
-}
-.duplicate-file {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
-  border-bottom: 1px solid rgba(255,255,255,0.04);
-  cursor: pointer;
-  transition: background .12s ease;
-}
-.duplicate-file:last-child {
-  border-bottom: none;
-}
-.duplicate-file:hover {
-  background: var(var(--bg-3));
-}
-.duplicate-file-index {
-  width: 18px;
-  height: 18px;
-  border-radius: 5px;
-  background: var(var(--bg-3));
-  color: var(var(--tx-2));
-  display: grid;
-  place-items: center;
-  font-size: 10px;
-  font-family: Consolas, 'JetBrains Mono', monospace;
-  flex-shrink: 0;
-}
-.duplicate-file-body {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-}
-.duplicate-file-name {
-  font-size: 12px;
-  color: var(var(--tx-0));
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.duplicate-file-path {
-  font-size: 10px;
-  color: var(var(--tx-3));
-  font-family: Consolas, 'JetBrains Mono', monospace;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.duplicate-file-open {
-  flex-shrink: 0;
-  font-size: 11px;
-  color: var(var(--accent));
-  opacity: 0;
-  transition: opacity .12s ease;
-}
-.duplicate-file:hover .duplicate-file-open {
-  opacity: 1;
-}
+.dup { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 9px 10px; }
+.dup-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.dup-list { overflow: auto; flex: 1; min-height: 0; }
+.dup-group { border-bottom: 1px solid var(--bd-0); }
+.dup-head { display: flex; align-items: center; gap: 8px; height: 24px; cursor: pointer; color: var(--tx-1); }
+.dup-head:hover { background: var(--hover); }
+.dup-head .sz { width: 70px; color: var(--tx-0); }
+.dup-head .cnt { width: 52px; color: var(--tx-2); font-size: 10.5px; }
+.dup-head .lbl { color: var(--warn); font-size: 11.5px; }
+.dup-files { padding: 2px 0 6px 20px; }
 </style>

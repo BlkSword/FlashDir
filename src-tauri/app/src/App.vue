@@ -50,6 +50,40 @@ const diagnosticsOpen = ref(false)
 const diagnosticsText = ref('')
 const aboutOpen = ref(false)
 const snapshotCount = ref(0)
+
+/* 洞察坞高度：可拖拽调整，有最小/最大限制并记忆 */
+const DOCK_MIN = 120
+const DOCK_DEFAULT = 230
+const dockHeight = ref(Number(localStorage.getItem('flashdir.dockHeight')) || DOCK_DEFAULT)
+const dockMax = ref(720)
+function computeDockBounds() {
+  // 顶部固定行 + 状态栏 + 文件表最小高度之后剩下的空间
+  const reserve = 32 + 38 + 24 + 170
+  dockMax.value = Math.max(DOCK_MIN + 40, window.innerHeight - reserve)
+  dockHeight.value = Math.min(dockMax.value, Math.max(DOCK_MIN, dockHeight.value))
+}
+function onDockResizeStart(e) {
+  e.preventDefault()
+  const startY = e.clientY
+  const startH = dockHeight.value
+  const onMove = (ev) => {
+    const next = Math.min(dockMax.value, Math.max(DOCK_MIN, startH - (ev.clientY - startY)))
+    dockHeight.value = Math.round(next)
+  }
+  const onUp = () => {
+    localStorage.setItem('flashdir.dockHeight', String(dockHeight.value))
+    window.removeEventListener('mousemove', onMove)
+    window.removeEventListener('mouseup', onUp)
+    document.body.style.cursor = ''
+  }
+  window.addEventListener('mousemove', onMove)
+  window.addEventListener('mouseup', onUp)
+  document.body.style.cursor = 'row-resize'
+}
+function resetDockHeight() {
+  dockHeight.value = Math.min(DOCK_DEFAULT, dockMax.value)
+  localStorage.setItem('flashdir.dockHeight', String(dockHeight.value))
+}
 const scanPhase = ref({ phase: '', message: '' })
 const history = ref([])
 const navStack = ref([])
@@ -363,7 +397,7 @@ function runCommand(id) {
 }
 
 /* ── 键盘 ───────────────────────────────────────────────── */
-const dockTabs = ['map', 'big', 'dupes', 'snapshot', 'dev']
+const dockTabs = ['map', 'big', 'growth', 'dupes', 'snapshot', 'dev']
 function onKeydown(e) {
   const mod = e.ctrlKey || e.metaKey
   const inInput = ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)
@@ -389,7 +423,7 @@ function onKeydown(e) {
   if (mod && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); treeVisible.value = !treeVisible.value; return }
   if (mod && (e.key === 'j' || e.key === 'J')) { e.preventDefault(); dockVisible.value = !dockVisible.value; return }
   if (mod && (e.key === 'i' || e.key === 'I')) { e.preventDefault(); inspVisible.value = !inspVisible.value; return }
-  if (mod && /^[1-5]$/.test(e.key)) {
+  if (mod && /^[1-6]$/.test(e.key)) {
     e.preventDefault()
     dockVisible.value = true
     dockTab.value = dockTabs[Number(e.key) - 1]
@@ -404,6 +438,8 @@ async function loadHistory() {
 
 onMounted(async () => {
   document.addEventListener('keydown', onKeydown)
+  window.addEventListener('resize', computeDockBounds)
+  computeDockBounds()
   unlistenPhase = await listen('scan-phase', (ev) => { scanPhase.value = ev.payload || { phase: '', message: '' } })
   refreshVolumes()
   loadHistory()
@@ -412,6 +448,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   document.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('resize', computeDockBounds)
   if (unlistenPhase) unlistenPhase()
 })
 
@@ -456,6 +493,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
     <symbol id="i-auto" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 2v12"/><path d="M8 2a6 6 0 0 1 0 12z" fill="currentColor" stroke="none"/></symbol>
     <symbol id="i-min" viewBox="0 0 16 16"><path d="M3 8h10"/></symbol>
     <symbol id="i-max" viewBox="0 0 16 16"><rect x="3.5" y="3.5" width="9" height="9"/></symbol>
+    <symbol id="i-grip" viewBox="0 0 16 16"><path d="M3 6h10M3 10h10"/></symbol>
   </svg>
 
   <div class="fd-app" :class="{ 'no-dock': !dockVisible }">
@@ -564,6 +602,10 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
     <InsightDock
       v-if="dockVisible"
       :tab="dockTab"
+      :height="dockHeight"
+      :min-height="DOCK_MIN"
+      @resize-start="onDockResizeStart"
+      @reset-height="resetDockHeight"
       :items="items"
       :top-files="topFiles"
       :total-size="totalSize"
@@ -627,7 +669,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
             <kbd>F5</kbd> 增量刷新 ·
             <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> 强制全量 ·
             <kbd>Ctrl</kbd>+<kbd>B</kbd>/<kbd>J</kbd>/<kbd>I</kbd> 面板开关 ·
-            <kbd>Ctrl</kbd>+<kbd>1..5</kbd> 洞察标签
+            <kbd>Ctrl</kbd>+<kbd>1..6</kbd> 洞察标签
           </div>
         </div>
       </div>
