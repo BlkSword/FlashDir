@@ -1,239 +1,136 @@
-<template>
-  <header class="fd-toolbar">
-    <div class="fd-brand" title="FlashDir">
-      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4h6l2 2h8a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V6a2 2 0 012-2z"/><path d="M2 10h20"/></svg>
-      <span class="fd-brand-text"><b>FlashDir</b><small>磁盘观测站</small></span>
-    </div>
-    <div class="fd-toolbar-group">
-      <button
-        class="fd-icon-btn"
-        title="后退"
-        :disabled="!canGoBack"
-        @click="$emit('navigate', 'back')"
-      >
-        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" /></svg>
-      </button>
-      <button
-        class="fd-icon-btn"
-        title="前进"
-        :disabled="!canGoForward"
-        @click="$emit('navigate', 'forward')"
-      >
-        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" /></svg>
-      </button>
-      <button
-        class="fd-icon-btn"
-        title="上级"
-        :disabled="!canGoUp"
-        @click="$emit('navigate', 'up')"
-      >
-        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 10l7-7m0 0l7 7m-7-7v18" /></svg>
-      </button>
-    </div>
-
-    <button
-      class="fd-btn fd-btn-primary"
-      :disabled="loading"
-      @click="$emit('scan', localPath)"
-    >
-      <svg v-if="loading" class="animate-spin" width="13" height="13" fill="none" viewBox="0 0 24 24">
-        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-      </svg>
-      <svg v-else width="13" height="13" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
-      {{ loading ? '扫描中' : '扫描' }}
-    </button>
-
-    <button v-if="loading" class="fd-btn" @click="$emit('cancel-scan')">取消</button>
-
-    <button
-      v-else
-      class="fd-btn"
-      :disabled="!path"
-      title="忽略所有缓存（内存/磁盘/USN），强制重新扫描当前目录"
-      @click="$emit('force-scan')"
-    >
-      刷新
-    </button>
-
-    <button class="fd-btn" @click="$emit('browse')">浏览…</button>
-
-    <div class="fd-path-bar">
-      <input
-        v-model="localPath"
-        type="text"
-        placeholder="输入目录路径，回车或点扫描"
-        spellcheck="false"
-        @keyup.enter="$emit('scan', localPath)"
-      />
-    </div>
-
-    <GlobalSearchDropdown
-      ref="globalSearchRef"
-      @open-dir="$emit('open-dir', $event)"
-    />
-
-    <button class="fd-icon-btn" title="关于" @click="$emit('show-about')">
-      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z"/><path d="M12 16v-4m0-4h.01"/></svg>
-    </button>
-
-    <button class="fd-icon-btn" title="诊断" @click="$emit('show-diagnostics')">
-      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-    </button>
-
-    <button class="fd-icon-btn" title="历史记录" @click="$emit('show-history')">
-      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-    </button>
-
-    <button class="fd-icon-btn" title="收起/展开侧边栏" @click="$emit('toggle-sidebar')">
-      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" /></svg>
-    </button>
-  </header>
-</template>
-
 <script setup>
-import { ref, watch } from 'vue'
-import GlobalSearchDropdown from './GlobalSearchDropdown.vue'
+import { computed, ref, nextTick } from 'vue'
+import Icon from './Icon.vue'
+import { formatSizeCompact } from '../utils/format.js'
 
 const props = defineProps({
   path: { type: String, default: '' },
-  canGoBack: { type: Boolean, default: false },
-  canGoForward: { type: Boolean, default: false },
-  canGoUp: { type: Boolean, default: false },
   loading: { type: Boolean, default: false },
+  filter: { type: String, default: '' },
+  hits: { type: Number, default: 0 },
+  totalItems: { type: Number, default: 0 },
+  totalSize: { type: Number, default: 0 },
+  view: { type: String, default: 'list' },
+  canBack: { type: Boolean, default: false },
+  canForward: { type: Boolean, default: false },
+  canUp: { type: Boolean, default: false },
+  forceBusy: { type: Boolean, default: false },
 })
-
-// 路径输入框本地值：用户可自由编辑，父级路径变化（导航/历史/浏览）时同步
-const localPath = ref(props.path)
-watch(() => props.path, (v) => { localPath.value = v })
-
-const globalSearchRef = ref(null)
-
-const focusGlobalSearch = () => {
-  globalSearchRef.value?.focusSearch?.()
-}
-
-defineEmits([
-  'scan',
-  'force-scan',
-  'cancel-scan',
-  'browse',
-  'navigate',
-  'show-history',
-  'show-about',
-  'show-diagnostics',
-  'open-dir',
-  'toggle-sidebar',
+const emit = defineEmits([
+  'scan', 'force-scan', 'cancel-scan', 'refresh', 'navigate',
+  'update:filter', 'update:view', 'export', 'up', 'back', 'forward',
 ])
 
-defineExpose({ focusGlobalSearch })
+const editing = ref(false)
+const draft = ref('')
+const pathInput = ref(null)
+
+const segments = computed(() => {
+  const p = (props.path || '').replace(/\\/g, '/')
+  if (!p) return []
+  const parts = p.split('/').filter(Boolean)
+  const out = []
+  let acc = ''
+  parts.forEach((seg, i) => {
+    acc = i === 0 ? seg : `${acc}/${seg}`
+    out.push({ label: seg, path: acc, last: i === parts.length - 1 })
+  })
+  return out
+})
+
+const startEdit = async () => {
+  draft.value = props.path || ''
+  editing.value = true
+  await nextTick()
+  pathInput.value?.focus()
+  pathInput.value?.select()
+}
+const commitEdit = () => {
+  editing.value = false
+  const v = draft.value.trim()
+  if (v && v !== props.path) emit('scan', v)
+}
+const onFilterInput = (e) => emit('update:filter', e.target.value)
+
+/** 目录选择器：使用 Tauri 的 dialog 插件（withGlobalTauri 注入） */
+const browse = async () => {
+  const dialog = window.__TAURI__?.dialog
+  if (!dialog?.open) return
+  try {
+    const picked = await dialog.open({ directory: true, multiple: false, title: '选择要扫描的目录' })
+    if (picked) emit('scan', typeof picked === 'string' ? picked : picked.path)
+  } catch (e) {
+    /* 用户取消或权限不足：静默 */
+  }
+}
 </script>
 
-<style scoped>
-.fd-toolbar {
-  grid-column: 1 / -1;
-  position: relative;
-  z-index: 100;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 10px;
-  background: var(--fd-bg-1);
-  border-bottom: 1px solid var(--fd-border);
-}
-.fd-brand {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  min-width: 132px;
-  color: var(--fd-accent);
-}
-.fd-brand > svg {
-  width: 22px;
-  height: 22px;
-}
-.fd-brand-text {
-  display: flex;
-  flex-direction: column;
-  line-height: 1.1;
-}
-.fd-brand-text b {
-  font-size: 13px;
-  color: var(--fd-text-0);
-  letter-spacing: .3px;
-}
-.fd-brand-text small {
-  font-size: 9px;
-  color: var(--fd-text-2);
-  letter-spacing: 1px;
-}
-.fd-toolbar-group {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-.fd-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 10px;
-  border: 1px solid var(--fd-border);
-  background: var(--fd-bg-2);
-  color: var(--fd-text-1);
-  border-radius: 3px;
-  font-size: 12px;
-  cursor: pointer;
-}
-.fd-btn:hover:not(:disabled) { background: var(--fd-bg-3); }
-.fd-btn:disabled { opacity: 0.5; cursor: default; }
-.fd-btn-primary {
-  background: var(--fd-accent);
-  border-color: var(--fd-accent);
-  color: #fff;
-}
-.fd-btn-primary:hover:not(:disabled) { background: var(--fd-accent-hover); border-color: var(--fd-accent-hover); }
-.fd-icon-btn {
-  width: 26px;
-  height: 26px;
-  padding: 0;
-  display: inline-grid;
-  place-items: center;
-  border: 1px solid var(--fd-border);
-  background: var(--fd-bg-2);
-  color: var(--fd-text-1);
-  border-radius: 3px;
-  cursor: pointer;
-}
-.fd-icon-btn:hover:not(:disabled) { background: var(--fd-bg-3); }
-.fd-icon-btn.fd-icon-active {
-  color: #fff;
-  background: var(--fd-accent);
-  border-color: var(--fd-accent);
-}
-.fd-icon-btn:disabled { opacity: 0.5; cursor: default; }
-.fd-icon-btn svg { width: 14px; height: 14px; }
-.fd-path-bar {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 8px;
-  background: var(--fd-bg-0);
-  border: 1px solid var(--fd-border);
-  border-radius: 3px;
-  color: var(--fd-text-1);
-  font-size: 12px;
-  min-width: 0;
-}
-.fd-path-bar input {
-  flex: 1;
-  background: transparent;
-  border: none;
-  outline: none;
-  color: var(--fd-text-1);
-  font-family: Consolas, 'JetBrains Mono', monospace;
-  font-size: 12px;
-  min-width: 0;
-}
-.fd-path-bar input::placeholder { color: var(--fd-text-3); }
-</style>
+<template>
+  <div class="toolbar">
+    <button class="btn ghost" :disabled="!canBack" title="后退" @click="emit('back')"><Icon name="left" /></button>
+    <button class="btn ghost" :disabled="!canForward" title="前进" @click="emit('forward')"><Icon name="right" /></button>
+    <button class="btn ghost" :disabled="!canUp" title="上一级（Backspace）" @click="emit('up')"><Icon name="up" /></button>
+    <span class="sep" />
+
+    <button class="btn primary" :disabled="loading" title="扫描当前路径（Enter）" @click="emit('scan', path)">
+      <Icon name="scan" />扫描
+    </button>
+    <button v-if="loading" class="btn" title="取消扫描（Esc）" @click="emit('cancel-scan')">
+      <Icon name="xc" />取消
+    </button>
+    <button v-else class="btn" :disabled="!path" title="走 USN 快路径刷新（F5）" @click="emit('refresh')">
+      <Icon name="refresh" />刷新
+    </button>
+    <button class="btn ghost" :disabled="loading || !path" title="忽略缓存强制全量重扫（Ctrl+Shift+R）" @click="emit('force-scan')">
+      <Icon name="zap" />强制
+    </button>
+    <button class="btn ghost" title="选择要扫描的目录…" @click="browse">
+      <Icon name="folder-open" />浏览
+    </button>
+    <span class="sep" />
+
+    <div class="pathbar" title="双击可直接编辑路径">
+      <template v-if="!editing">
+        <template v-for="(s, i) in segments" :key="s.path">
+          <span class="caret" v-if="i">›</span>
+          <span class="crumb" :class="{ cur: s.last }" @click="emit('navigate', s.path)">{{ s.label }}</span>
+        </template>
+        <span v-if="!segments.length" class="crumb">未选择目录</span>
+        <span class="meta" @dblclick.stop="startEdit">
+          {{ totalItems.toLocaleString() }} 项 · {{ formatSizeCompact(totalSize) }}
+        </span>
+      </template>
+      <input
+        v-else
+        ref="pathInput"
+        v-model="draft"
+        class="mono"
+        style="flex:1;background:none;border:0;outline:none;color:var(--tx-0);font:12px var(--font-mono)"
+        @keydown.enter="commitEdit"
+        @keydown.esc="editing = false"
+        @blur="commitEdit"
+      />
+      <span v-if="!editing" class="crumb" title="编辑路径" style="padding:1px 3px" @click="startEdit">
+        <Icon name="pencil" :size="12" />
+      </span>
+    </div>
+
+    <label class="filter-box" title="过滤语法：ext:zip size:>100MB dir:node_modules !tmp type:file mtime:>7d">
+      <Icon name="filter" :size="13" />
+      <input
+        :value="filter"
+        placeholder="过滤：ext:zip size:>100MB !tmp"
+        spellcheck="false"
+        @input="onFilterInput"
+      />
+      <span class="hits">{{ filter ? `${hits} 命中` : '' }}</span>
+    </label>
+
+    <div class="seg">
+      <button :class="{ on: view === 'list' }" title="列表视图" @click="emit('update:view', 'list')">列表</button>
+      <button :class="{ on: view === 'map' }" title="热图视图" @click="emit('update:view', 'map')">热图</button>
+    </div>
+
+    <button class="btn ghost" title="导出当前页为 CSV" @click="emit('export')"><Icon name="tray" />导出</button>
+  </div>
+</template>

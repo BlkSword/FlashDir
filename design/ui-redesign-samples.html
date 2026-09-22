@@ -1,0 +1,914 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FlashDir · UI 重构设计样例（3 个方向）</title>
+<style>
+/* ============================================================
+   FlashDir UI 设计样例
+   设计基调：专业桌面工具（Everything / WizTree / Directory Opus / VS Code 一类）
+   - 信息密度优先：12px UI 文本、22-24px 行高、1px 分隔线
+   - 单一强调色 + 功能性热力色；不用渐变/玻璃拟态/大圆角/emoji
+   - 数字、路径、时间统一等宽字体；键盘可达（快捷键直接标在界面上）
+   ============================================================ */
+:root{
+  --font-ui:"Segoe UI Variable Text","Segoe UI","Microsoft YaHei UI",system-ui,sans-serif;
+  --font-mono:"Cascadia Mono",Consolas,"JetBrains Mono",ui-monospace,monospace;
+  --r:3px;            /* 圆角统一 3px */
+  --h-row:23px;       /* 表格行高 */
+}
+html[data-theme="dark"]{
+  --bg-0:#17181a; --bg-1:#1e1f22; --bg-2:#26282c; --bg-3:#2f3237; --bg-4:#3a3e44;
+  --bd-0:#303338; --bd-1:#3d4147;
+  --tx-0:#e8eaed; --tx-1:#b9bdc4; --tx-2:#8b9098; --tx-3:#63686f;
+  --accent:#4c9aff; --accent-dim:#2b4a70; --accent-tx:#cfe3ff;
+  --sel:#2c4a6e; --hover:#262a30;
+  --ok:#4cc38a; --warn:#e0a33a; --bad:#e5534b;
+  --heat-1:#2d4f6b; --heat-2:#3c6e57; --heat-3:#7a6a34; --heat-4:#8a5230; --heat-5:#7d3733;
+  --shadow:0 6px 20px rgba(0,0,0,.45);
+}
+html[data-theme="light"]{
+  --bg-0:#f3f3f3; --bg-1:#fafafa; --bg-2:#ffffff; --bg-3:#eceff2; --bg-4:#e1e5ea;
+  --bd-0:#dcdfe3; --bd-1:#c9cdd3;
+  --tx-0:#1b1d21; --tx-1:#42464d; --tx-2:#6b7076; --tx-3:#9aa0a6;
+  --accent:#0a6ed1; --accent-dim:#cfe4f7; --accent-tx:#0a4f96;
+  --sel:#d6e7f8; --hover:#eef1f4;
+  --ok:#1e7f4f; --warn:#a5680a; --bad:#b3261e;
+  --heat-1:#cfe0ef; --heat-2:#cfe6d6; --heat-3:#efe4c4; --heat-4:#f2d6c0; --heat-5:#eec9c5;
+  --shadow:0 6px 18px rgba(20,30,40,.16);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-0);color:var(--tx-0);font:12px/1.45 var(--font-ui);-webkit-font-smoothing:antialiased}
+.mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+svg{display:block;width:14px;height:14px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+kbd{font:10px/1 var(--font-mono);border:1px solid var(--bd-1);border-bottom-width:2px;border-radius:3px;padding:2px 4px;color:var(--tx-2);background:var(--bg-2)}
+
+/* ── 样例页外壳（不属于产品 UI） ───────────────────────────── */
+.shell{max-width:1580px;margin:0 auto;padding:18px 20px 40px}
+.shell-head{display:flex;align-items:flex-end;gap:14px;flex-wrap:wrap;margin-bottom:14px}
+.shell-head h1{font-size:15px;font-weight:600;letter-spacing:.2px}
+.shell-head p{color:var(--tx-2);font-size:12px;max-width:760px}
+.switch{display:flex;gap:0;border:1px solid var(--bd-1);border-radius:var(--r);overflow:hidden}
+.switch button{background:var(--bg-1);color:var(--tx-1);border:0;padding:6px 12px;font:12px var(--font-ui);cursor:pointer;border-right:1px solid var(--bd-1)}
+.switch button:last-child{border-right:0}
+.switch button.on{background:var(--accent);color:#fff}
+.note{color:var(--tx-2);font-size:11.5px;margin:10px 2px 0}
+.note b{color:var(--tx-1)}
+.variant{display:none}
+.variant.on{display:block}
+
+/* ── 窗口骨架（三个方向共用） ─────────────────────────────── */
+.win{border:1px solid var(--bd-1);border-radius:var(--r);background:var(--bg-1);overflow:hidden;box-shadow:var(--shadow)}
+.titlebar{display:flex;align-items:center;gap:10px;height:32px;padding:0 0 0 10px;background:var(--bg-2);border-bottom:1px solid var(--bd-0)}
+.titlebar .brand{display:flex;align-items:center;gap:6px;font-weight:600;font-size:12px;letter-spacing:.2px}
+.titlebar .brand svg{width:15px;height:15px;color:var(--accent)}
+.volumes{display:flex;gap:6px;margin-left:8px}
+.vol{display:flex;align-items:center;gap:6px;background:var(--bg-1);border:1px solid var(--bd-0);border-radius:var(--r);color:var(--tx-1);padding:2px 7px;font:11px var(--font-ui);cursor:pointer}
+.vol:hover{border-color:var(--bd-1);color:var(--tx-0)}
+.vol.on{border-color:var(--accent);background:var(--accent-dim);color:var(--accent-tx)}
+.volbar{display:block;width:44px;height:5px;border-radius:2px;background:var(--bg-4);overflow:hidden}
+.volbar i{display:block;height:100%;background:var(--ok)}
+.volbar i.warn{background:var(--warn)}
+.volbar i.bad{background:var(--bad)}
+.titlebar .sp{flex:1}
+.cmd-search{display:flex;align-items:center;gap:8px;height:22px;padding:0 8px;background:var(--bg-1);border:1px solid var(--bd-0);border-radius:var(--r);color:var(--tx-2);font:12px var(--font-ui);cursor:pointer;min-width:230px}
+.cmd-search:hover{border-color:var(--bd-1);color:var(--tx-1)}
+.cmd-search .sp2{flex:1}
+.winbtns{display:flex;align-self:stretch}
+.winbtns span{width:44px;display:flex;align-items:center;justify-content:center;color:var(--tx-2);cursor:pointer}
+.winbtns span:hover{background:var(--bg-3);color:var(--tx-0)}
+.winbtns span.close:hover{background:#c0392b;color:#fff}
+.winbtns svg{width:11px;height:11px}
+
+.toolbar{display:flex;align-items:center;gap:6px;height:36px;padding:0 8px;background:var(--bg-1);border-bottom:1px solid var(--bd-0)}
+.btn{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 9px;background:var(--bg-3);border:1px solid var(--bd-1);border-radius:var(--r);color:var(--tx-1);font:12px var(--font-ui);cursor:pointer;white-space:nowrap}
+.btn:hover{background:var(--bg-4);color:var(--tx-0)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{filter:brightness(1.08)}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--tx-2)}
+.btn.ghost:hover{background:var(--bg-3);color:var(--tx-0)}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.sep{width:1px;height:18px;background:var(--bd-0);margin:0 3px}
+.pathbar{display:flex;align-items:center;gap:2px;height:24px;padding:0 8px;background:var(--bg-0);border:1px solid var(--bd-0);border-radius:var(--r);font:12px var(--font-mono);min-width:300px;flex:1;max-width:560px}
+.pathbar .crumb{color:var(--tx-2);padding:1px 4px;border-radius:2px;cursor:pointer}
+.pathbar .crumb:hover{background:var(--bg-3);color:var(--tx-0)}
+.pathbar .crumb.cur{color:var(--tx-0)}
+.pathbar .caret{color:var(--tx-3)}
+.filter{display:flex;align-items:center;gap:6px;height:24px;padding:0 8px;background:var(--bg-0);border:1px solid var(--bd-0);border-radius:var(--r);flex:0 0 320px}
+.filter svg{color:var(--tx-3)}
+.filter input{background:none;border:0;outline:none;color:var(--tx-0);font:12px var(--font-mono);width:100%}
+.filter input::placeholder{color:var(--tx-3);font-family:var(--font-ui)}
+.seg{display:flex;border:1px solid var(--bd-1);border-radius:var(--r);overflow:hidden}
+.seg button{background:var(--bg-2);border:0;border-right:1px solid var(--bd-0);color:var(--tx-2);font:11.5px var(--font-ui);padding:4px 10px;cursor:pointer}
+.seg button:last-child{border-right:0}
+.seg button.on{background:var(--bg-4);color:var(--tx-0)}
+
+/* ── 目录树 / 表格 / 检查器 ───────────────────────────────── */
+.body{display:flex;min-height:430px}
+.tree{width:236px;flex:0 0 236px;border-right:1px solid var(--bd-0);background:var(--bg-1);padding:4px 0;overflow:hidden}
+.tree .head{padding:3px 10px 5px;color:var(--tx-3);font-size:10.5px;letter-spacing:.6px;text-transform:uppercase}
+.tnode{display:flex;align-items:center;gap:6px;height:22px;padding:0 8px;color:var(--tx-1);cursor:pointer;white-space:nowrap}
+.tnode:hover{background:var(--hover);color:var(--tx-0)}
+.tnode.on{background:var(--sel);color:var(--tx-0)}
+.tnode svg{width:13px;height:13px;color:var(--tx-3)}
+.tnode .sz{margin-left:auto;color:var(--tx-3);font:10.5px var(--font-mono)}
+.tnode.d1{padding-left:22px}.tnode.d2{padding-left:36px}.tnode.d3{padding-left:50px}.tnode.d4{padding-left:64px}
+.tree .bar{height:3px;background:var(--bg-3);margin:6px 8px;border-radius:2px;overflow:hidden}
+.tree .bar i{display:block;height:100%;background:var(--accent);width:62%}
+
+.tablewrap{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg-2)}
+.thead,.trow{display:grid;grid-template-columns:26px minmax(220px,1fr) 92px 104px 86px 104px;align-items:center;gap:0}
+.thead{height:26px;background:var(--bg-1);border-bottom:1px solid var(--bd-0);color:var(--tx-2);font-size:11px;position:sticky;top:0}
+.thead>div,.trow>div{padding:0 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.thead .num,.trow .num{text-align:right;font-family:var(--font-mono)}
+.trow{height:var(--h-row);border-bottom:1px solid color-mix(in srgb,var(--bd-0) 45%,transparent);color:var(--tx-1);cursor:default}
+.trow:nth-child(odd){background:color-mix(in srgb,var(--bg-3) 22%,transparent)}
+.trow:hover{background:var(--hover)}
+.trow.sel{background:var(--sel);color:var(--tx-0)}
+.trow .nm{display:flex;align-items:center;gap:7px;color:var(--tx-0)}
+.trow .nm svg{color:var(--tx-3);flex:0 0 auto}
+.trow .nm .ext{color:var(--tx-3);font-size:10.5px;font-family:var(--font-mono)}
+.trow .nm .tag{border:1px solid var(--bd-1);border-radius:2px;color:var(--tx-2);font-size:9.5px;padding:0 3px;font-family:var(--font-mono)}
+.trow .size{font-family:var(--font-mono);color:var(--tx-0)}
+.pct{display:flex;align-items:center;gap:6px}
+.pct .track{flex:1;height:6px;background:var(--bg-4);border-radius:2px;overflow:hidden}
+.pct .track i{display:block;height:100%}
+.pct .v{font:10.5px var(--font-mono);color:var(--tx-2);width:38px;text-align:right}
+.tfoot{height:24px;display:flex;align-items:center;gap:14px;padding:0 10px;border-top:1px solid var(--bd-0);background:var(--bg-1);color:var(--tx-2);font-size:11px}
+
+.inspector{width:268px;flex:0 0 268px;border-left:1px solid var(--bd-0);background:var(--bg-1);padding:10px;overflow:hidden}
+.inspector h4{font-size:11px;color:var(--tx-3);text-transform:uppercase;letter-spacing:.6px;margin:2px 0 8px;font-weight:600}
+.kv{display:grid;grid-template-columns:74px 1fr;gap:3px 8px;font-size:11.5px;margin-bottom:12px}
+.kv dt{color:var(--tx-3)}
+.kv dd{color:var(--tx-1);font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis}
+.insp-actions{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:14px}
+.chip{display:inline-flex;align-items:center;gap:5px;height:22px;padding:0 8px;border:1px solid var(--bd-1);border-radius:var(--r);color:var(--tx-1);font-size:11.5px;background:var(--bg-2);cursor:pointer}
+.chip:hover{background:var(--bg-3);color:var(--tx-0)}
+.spark{display:flex;align-items:flex-end;gap:2px;height:42px;margin-bottom:6px}
+.spark i{flex:1;background:var(--heat-1);border-radius:1px 1px 0 0}
+.spark i.h{background:var(--warn)}
+.spark i.hh{background:var(--bad)}
+
+/* ── 洞察坞 / 状态栏 ─────────────────────────────────────── */
+.dock{border-top:1px solid var(--bd-0);background:var(--bg-1)}
+.dock .tabs{display:flex;align-items:center;gap:2px;height:28px;padding:0 8px;border-bottom:1px solid var(--bd-0)}
+.dock .tabs button{background:none;border:0;color:var(--tx-2);font:11.5px var(--font-ui);padding:4px 9px;border-radius:var(--r);cursor:pointer}
+.dock .tabs button:hover{background:var(--bg-3);color:var(--tx-0)}
+.dock .tabs button.on{background:var(--bg-4);color:var(--tx-0)}
+.dock .tabs .sp{flex:1}
+.dock .pane{height:118px;padding:9px 10px;display:flex;gap:14px;overflow:hidden}
+.statusbar{display:flex;align-items:center;gap:0;height:24px;background:var(--bg-2);border-top:1px solid var(--bd-0);color:var(--tx-2);font-size:11px}
+.statusbar .st{display:flex;align-items:center;gap:6px;padding:0 10px;height:100%;border-right:1px solid var(--bd-0);white-space:nowrap}
+.statusbar .st b{color:var(--tx-1);font-weight:600}
+.statusbar .sp{flex:1}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--ok)}
+.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}.dot.idle{background:var(--tx-3)}
+
+/* ── 方向 B：左侧模式栏 + 容量条 + 洞察坞 ─────────────────── */
+.b-top{display:flex;align-items:center;gap:10px;height:44px;padding:0 12px;background:var(--bg-2);border-bottom:1px solid var(--bd-0)}
+.b-top .brand{display:flex;align-items:center;gap:7px;font-weight:600}
+.b-top .brand svg{color:var(--accent);width:16px;height:16px}
+.b-top .omni{display:flex;align-items:center;gap:8px;height:28px;padding:0 10px;background:var(--bg-0);border:1px solid var(--bd-1);border-radius:var(--r);flex:1;max-width:720px}
+.b-top .omni svg{color:var(--tx-3)}
+.b-top .omni input{flex:1;background:none;border:0;outline:none;color:var(--tx-0);font:12.5px var(--font-mono)}
+.b-top .omni input::placeholder{color:var(--tx-3);font-family:var(--font-ui)}
+.b-top .omni .hint{color:var(--tx-3);font-size:11px;border-left:1px solid var(--bd-0);padding-left:8px}
+.b-body{display:flex;min-height:470px}
+.rail{width:60px;flex:0 0 60px;background:var(--bg-2);border-right:1px solid var(--bd-0);padding-top:6px;display:flex;flex-direction:column;align-items:center;gap:2px}
+.rail button{width:52px;height:48px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;background:none;border:0;border-left:2px solid transparent;color:var(--tx-3);cursor:pointer;font:10px var(--font-ui)}
+.rail button:hover{background:var(--hover);color:var(--tx-1)}
+.rail button.on{color:var(--accent);border-left-color:var(--accent);background:var(--bg-3)}
+.rail svg{width:17px;height:17px}
+.rail .gap{flex:1}
+.b-main{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg-2)}
+.b-head{padding:9px 12px 8px;border-bottom:1px solid var(--bd-0);background:var(--bg-1)}
+.b-crumb{display:flex;align-items:center;gap:8px;font:12px var(--font-mono);color:var(--tx-1);margin-bottom:8px}
+.b-crumb .path{color:var(--tx-0)}
+.b-crumb .m{color:var(--tx-3);font-family:var(--font-ui);font-size:11px}
+.cap{display:flex;align-items:center;gap:10px}
+.cap .bar{flex:1;height:8px;border-radius:2px;background:var(--bg-4);overflow:hidden;display:flex}
+.cap .bar i{display:block;height:100%}
+.cap .lg{display:flex;gap:10px;color:var(--tx-2);font-size:11px;white-space:nowrap}
+.cap .lg span{display:flex;align-items:center;gap:5px}
+.sw{width:8px;height:8px;border-radius:1px;display:block}
+
+/* ── 方向 C：浅色 IDE 式（活动栏 + 侧栏 + 编辑器 + 检查器）── */
+.c-top{display:flex;align-items:center;gap:12px;height:30px;padding:0 10px;background:var(--bg-3);border-bottom:1px solid var(--bd-0);font-size:11.5px;color:var(--tx-1)}
+.c-top .menu{display:flex;gap:2px}
+.c-top .menu span{padding:2px 7px;border-radius:2px;cursor:pointer}
+.c-top .menu span:hover{background:var(--bg-4)}
+.c-top .title{margin-left:auto;color:var(--tx-2);font-family:var(--font-mono);font-size:11px}
+.c-body{display:flex;min-height:470px}
+.c-rail{width:46px;flex:0 0 46px;background:var(--bg-2);border-right:1px solid var(--bd-0);display:flex;flex-direction:column;align-items:center;padding-top:6px;gap:2px}
+.c-rail button{width:38px;height:38px;display:flex;align-items:center;justify-content:center;background:none;border:0;border-left:2px solid transparent;color:var(--tx-3);cursor:pointer}
+.c-rail button.on{color:var(--accent);border-left-color:var(--accent);background:var(--bg-3)}
+.c-rail button:hover{color:var(--tx-1);background:var(--hover)}
+.c-side{width:228px;flex:0 0 228px;background:var(--bg-1);border-right:1px solid var(--bd-0);display:flex;flex-direction:column}
+.c-side .cap{padding:7px 10px;border-bottom:1px solid var(--bd-0);display:flex;align-items:center;justify-content:space-between;color:var(--tx-2);font-size:10.5px;letter-spacing:.6px;text-transform:uppercase}
+.c-side .sec{padding:6px 10px 8px;border-bottom:1px solid var(--bd-0)}
+.c-side .sec h5{font-size:10.5px;color:var(--tx-3);text-transform:uppercase;letter-spacing:.6px;margin-bottom:6px;font-weight:600}
+.c-side .li{display:flex;align-items:center;gap:7px;height:21px;color:var(--tx-1);cursor:pointer;font-size:11.5px;padding:0 4px;border-radius:2px}
+.c-side .li:hover{background:var(--hover)}
+.c-side .li.on{background:var(--sel);color:var(--tx-0)}
+.c-side .li .n{margin-left:auto;font-family:var(--font-mono);font-size:10.5px;color:var(--tx-3)}
+.c-editor{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg-2)}
+.c-insp{width:250px;flex:0 0 250px;border-left:1px solid var(--bd-0);background:var(--bg-1);padding:9px 10px;overflow:hidden}
+
+/* ── 热图（CSS 网格模拟 treemap） ─────────────────────────── */
+.tm{display:grid;grid-template-columns:repeat(12,1fr);grid-template-rows:repeat(4,1fr);gap:2px;height:104px;flex:1}
+.tm div{border-radius:2px;padding:3px 5px;font-size:10.5px;overflow:hidden;color:var(--tx-0);position:relative}
+.tm div b{font-family:var(--font-mono);font-size:10px;opacity:.85;display:block;font-weight:400}
+
+/* ── 快照 diff ───────────────────────────────────────────── */
+.diff{display:flex;gap:10px;flex:1}
+.diff .col{flex:1;border:1px solid var(--bd-0);border-radius:var(--r);overflow:hidden}
+.diff .col h5{font-size:10.5px;color:var(--tx-2);padding:5px 8px;background:var(--bg-3);border-bottom:1px solid var(--bd-0);text-transform:uppercase;letter-spacing:.5px}
+.diff .r{display:flex;align-items:center;gap:8px;height:21px;padding:0 8px;font-size:11.5px;color:var(--tx-1)}
+.diff .r .p{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:11px}
+.diff .r .d{font-family:var(--font-mono);font-size:11px}
+.diff .r.add .d{color:var(--bad)}
+.diff .r.del .d{color:var(--ok)}
+
+/* ── 注释标记 ─────────────────────────────────────────────── */
+.ann{position:relative;display:inline-flex}
+.ann::after{content:attr(data-n);position:absolute;top:-7px;right:-7px;min-width:14px;height:14px;border-radius:7px;background:var(--warn);color:#241a05;font:9.5px/14px var(--font-mono);text-align:center;padding:0 3px;z-index:5}
+.legend{margin-top:14px;border:1px solid var(--bd-1);border-radius:var(--r);background:var(--bg-1);padding:12px 14px}
+.legend h3{font-size:12px;margin-bottom:8px;color:var(--tx-0)}
+.legend ol{margin:0;padding-left:18px;color:var(--tx-1);font-size:11.5px;line-height:1.8}
+.legend ol b{color:var(--tx-0)}
+.spec{margin-top:14px;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px}
+.card{border:1px solid var(--bd-1);border-radius:var(--r);background:var(--bg-1);padding:12px 14px}
+.card h3{font-size:12px;margin-bottom:8px}
+.card table{width:100%;border-collapse:collapse;font-size:11.5px}
+.card th,.card td{text-align:left;padding:3px 6px;border-bottom:1px solid var(--bd-0);color:var(--tx-1)}
+.card th{color:var(--tx-3);font-weight:600;font-size:10.5px;text-transform:uppercase;letter-spacing:.5px}
+.card code{font-family:var(--font-mono);font-size:11px;color:var(--tx-0)}
+.swatch{display:inline-block;width:14px;height:14px;border-radius:2px;border:1px solid var(--bd-1);vertical-align:-3px;margin-right:6px}
+</style>
+</head>
+<body>
+<svg style="display:none" aria-hidden="true">
+  <symbol id="i-folder" viewBox="0 0 16 16"><path d="M1.5 3.5h4l1.2 1.5h7.8v7.5h-13z"/></symbol>
+  <symbol id="i-file" viewBox="0 0 16 16"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3"/></symbol>
+  <symbol id="i-drive" viewBox="0 0 16 16"><rect x="1.5" y="3.5" width="13" height="9" rx="1"/><path d="M1.5 9.5h13"/><circle cx="12" cy="11.5" r=".7"/></symbol>
+  <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></symbol>
+  <symbol id="i-scan" viewBox="0 0 16 16"><path d="M2 8a6 6 0 0 1 12 0"/><path d="M8 8l3.5-3.5"/><circle cx="8" cy="8" r="1"/></symbol>
+  <symbol id="i-x" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+  <symbol id="i-xc" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 16 16"><path d="M13.5 8a5.5 5.5 0 1 1-1.8-4.1"/><path d="M13.5 2v3.5H10"/></symbol>
+  <symbol id="i-filter" viewBox="0 0 16 16"><path d="M2 4h12M4.5 8h7M6.5 12h3"/></symbol>
+  <symbol id="i-right" viewBox="0 0 16 16"><path d="M6 3.5L10.5 8 6 12.5"/></symbol>
+  <symbol id="i-down" viewBox="0 0 16 16"><path d="M3.5 6L8 10.5 12.5 6"/></symbol>
+  <symbol id="i-list" viewBox="0 0 16 16"><path d="M2 4h12M2 8h12M2 12h12"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 16 16"><rect x="2" y="2" width="5" height="5"/><rect x="9" y="2" width="5" height="3"/><rect x="2" y="9" width="5" height="5"/><rect x="9" y="7" width="5" height="7"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 16 16"><path d="M2 13.5V9M6 13.5V4M10 13.5V7M14 13.5V2.5"/></symbol>
+  <symbol id="i-diff" viewBox="0 0 16 16"><path d="M4 2.5v11M12 2.5v11M4 6h3M9 10h3"/></symbol>
+  <symbol id="i-dupes" viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="8" height="8"/><path d="M5.5 13.5h8v-8"/></symbol>
+  <symbol id="i-dev" viewBox="0 0 16 16"><path d="M6 3.5L2.5 8 6 12.5M10 3.5L13.5 8 10 12.5"/></symbol>
+  <symbol id="i-cog" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M12.4 3.6l-1.1 1.1M4.7 11.3l-1.1 1.1"/></symbol>
+  <symbol id="i-down-tray" viewBox="0 0 16 16"><path d="M8 2v7.5M5 6.5L8 9.5l3-3M2.5 13.5h11"/></symbol>
+  <symbol id="i-info" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 7v4M8 5.2v.6"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 16 16"><path d="M8 1.8l5 2v4c0 3-2.2 5.4-5 6.4-2.8-1-5-3.4-5-6.4v-4z"/></symbol>
+  <symbol id="i-pin" viewBox="0 0 16 16"><path d="M6 2.5h4l-.5 4 2 2v1.5H4.5V8.5l2-2z"/><path d="M8 10v3.5"/></symbol>
+  <symbol id="i-min" viewBox="0 0 16 16"><path d="M3 8h10"/></symbol>
+  <symbol id="i-max" viewBox="0 0 16 16"><rect x="3.5" y="3.5" width="9" height="9"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8"/><path d="M2.5 10.5v-8h8"/></symbol>
+</svg>
+
+<div class="shell">
+  <div class="shell-head">
+    <div>
+      <h1>FlashDir · UI 重构设计样例</h1>
+      <p>三个方向都是"专业工具"路线：信息密度优先、键盘可达、状态可观测。下方标注数字对应每个方向的交互说明；页面底部是设计规范（色板/字阶/间距/图标/状态）。点按钮切换方向与明暗主题。</p>
+    </div>
+    <div style="flex:1"></div>
+    <div class="switch" id="vswitch">
+      <button data-v="a" class="on">A · 指挥台（双栏）</button>
+      <button data-v="b">B · 仪器台（单表+洞察坞）</button>
+      <button data-v="c">C · 工作台（浅色 IDE 式）</button>
+    </div>
+    <div class="switch" id="tswitch">
+      <button data-t="dark" class="on">深色</button>
+      <button data-t="light">浅色</button>
+    </div>
+  </div>
+
+  <!-- ═══════════════ 方向 A：指挥台（双栏 + 检查器） ═══════════════ -->
+  <section class="variant on" id="v-a">
+  <div class="win">
+    <div class="titlebar">
+      <div class="brand"><svg><use href="#i-drive"/></svg>FlashDir</div>
+      <div class="volumes">
+        <button class="vol on"><span class="mono">C:</span><span class="volbar"><i class="bad" style="width:87%"></i></span><span class="mono">412/476G</span></button>
+        <button class="vol"><span class="mono">D:</span><span class="volbar"><i style="width:19%"></i></span><span class="mono">180/931G</span></button>
+      </div>
+      <div class="sp"></div>
+      <button class="cmd-search"><svg><use href="#i-search"/></svg>搜索文件 / 命令<span class="sp2"></span><kbd>Ctrl</kbd><kbd>K</kbd></button>
+      <div class="winbtns"><span><svg><use href="#i-min"/></svg></span><span><svg><use href="#i-max"/></svg></span><span class="close"><svg><use href="#i-x"/></svg></span></div>
+    </div>
+
+    <div class="toolbar">
+      <button class="btn primary"><svg><use href="#i-scan"/></svg>扫描</button>
+      <button class="btn"><svg><use href="#i-xc"/></svg>取消</button>
+      <span class="sep"></span>
+      <div class="pathbar">
+        <span class="crumb">C:</span><span class="caret">›</span>
+        <span class="crumb">Users</span><span class="caret">›</span>
+        <span class="crumb cur">wfshenm</span>
+        <span style="flex:1"></span><span class="mono" style="color:var(--tx-3)">305,326 项 · 15.4 GB</span>
+      </div>
+      <button class="btn ghost"><svg><use href="#i-refresh"/></svg>刷新</button>
+      <button class="btn ghost"><svg><use href="#i-down-tray"/></svg>导出</button>
+      <span class="sep"></span>
+      <label class="filter"><svg><use href="#i-filter"/></svg><input value="" placeholder="过滤语法：ext:zip size:>100MB dir:node_modules !tmp"></label>
+      <div class="seg"><button class="on">列表</button><button>热图</button><button>统计</button></div>
+    </div>
+
+    <div class="body">
+      <aside class="tree">
+        <div class="head">目录 · 按占用排序</div>
+        <div class="tnode on"><svg><use href="#i-folder"/></svg>wfshenm<span class="sz">15.4G</span></div>
+        <div class="tnode d1"><svg><use href="#i-folder"/></svg>AppData<span class="sz">9.1G</span></div>
+        <div class="tnode d2"><svg><use href="#i-folder"/></svg>Local<span class="sz">6.7G</span></div>
+        <div class="tnode d3"><svg><use href="#i-folder"/></svg>Temp<span class="sz">2.3G</span></div>
+        <div class="tnode d3"><svg><use href="#i-folder"/></svg>Packages<span class="sz">1.9G</span></div>
+        <div class="tnode d1"><svg><use href="#i-folder"/></svg>Downloads<span class="sz">3.2G</span></div>
+        <div class="tnode d1"><svg><use href="#i-folder"/></svg>Documents<span class="sz">1.1G</span></div>
+        <div class="tnode d1"><svg><use href="#i-folder"/></svg>.cargo<span class="sz">840M</span></div>
+        <div class="tnode d1"><svg><use href="#i-folder"/></svg>.flashdir<span class="sz">446M</span></div>
+        <div class="bar"><i style="width:62%"></i></div>
+        <div class="head">固定视图</div>
+        <div class="tnode"><svg><use href="#i-clock"/></svg>最近 7 天新增<span class="sz">1.8G</span></div>
+        <div class="tnode"><svg><use href="#i-dupes"/></svg>重复文件候选<span class="sz">312</span></div>
+        <div class="tnode"><svg><use href="#i-dev"/></svg>开发者缓存<span class="sz">4.6G</span></div>
+      </aside>
+      <main class="tablewrap">
+        <div class="thead">
+          <div></div><div>名称</div><div class="num">大小</div><div>占父目录</div><div>修改时间</div><div>属性</div>
+        </div>
+        <div class="trow sel">
+          <div style="color:var(--tx-3)"><svg><use href="#i-folder"/></svg></div>
+          <div class="nm"><svg><use href="#i-folder"/></svg>AppData <span class="tag">DIR</span></div>
+          <div class="num size">9.1 GB</div>
+          <div class="pct"><span class="track"><i style="width:59%;background:var(--heat-5)"></i></span><span class="v">59.1%</span></div>
+          <div class="mono">08-14 09:21</div>
+          <div style="color:var(--tx-3)">已缓存 · USN</div>
+        </div>
+        <div class="trow">
+          <div style="color:var(--tx-3)"><svg><use href="#i-folder"/></svg></div>
+          <div class="nm"><svg><use href="#i-folder"/></svg>Downloads <span class="tag">DIR</span></div>
+          <div class="num size">3.2 GB</div>
+          <div class="pct"><span class="track"><i style="width:21%;background:var(--heat-4)"></i></span><span class="v">20.8%</span></div>
+          <div class="mono">09-02 22:04</div>
+          <div style="color:var(--tx-3)">已缓存</div>
+        </div>
+        <div class="trow">
+          <div style="color:var(--tx-3)"><svg><use href="#i-file"/></svg></div>
+          <div class="nm"><svg><use href="#i-file"/></svg>devtools-cache.tar.zst <span class="ext">.zst</span></div>
+          <div class="num size">2.41 GB</div>
+          <div class="pct"><span class="track"><i style="width:15.6%;background:var(--heat-4)"></i></span><span class="v">15.6%</span></div>
+          <div class="mono">07-28 11:47</div>
+          <div style="color:var(--tx-3)">冷数据</div>
+        </div>
+        <div class="trow">
+          <div style="color:var(--tx-3)"><svg><use href="#i-folder"/></svg></div>
+          <div class="nm"><svg><use href="#i-folder"/></svg>Documents <span class="tag">DIR</span></div>
+          <div class="num size">1.1 GB</div>
+          <div class="pct"><span class="track"><i style="width:7.1%;background:var(--heat-3)"></i></span><span class="v">7.1%</span></div>
+          <div class="mono">09-18 16:02</div>
+          <div style="color:var(--tx-3)">已缓存</div>
+        </div>
+        <div class="trow">
+          <div style="color:var(--tx-3)"><svg><use href="#i-folder"/></svg></div>
+          <div class="nm"><svg><use href="#i-folder"/></svg>.cargo <span class="tag">DIR</span></div>
+          <div class="num size">840 MB</div>
+          <div class="pct"><span class="track"><i style="width:5.3%;background:var(--heat-3)"></i></span><span class="v">5.3%</span></div>
+          <div class="mono">09-19 19:24</div>
+          <div style="color:var(--tx-3)">已缓存 · 可清理</div>
+        </div>
+        <div class="trow">
+          <div style="color:var(--tx-3)"><svg><use href="#i-file"/></svg></div>
+          <div class="nm"><svg><use href="#i-file"/></svg>HWiNFO64_Log.csv <span class="ext">.csv</span></div>
+          <div class="num size">612 MB</div>
+          <div class="pct"><span class="track"><i style="width:3.9%;background:var(--heat-2)"></i></span><span class="v">3.9%</span></div>
+          <div class="mono">09-15 08:12</div>
+          <div style="color:var(--tx-3)">—</div>
+        </div>
+        <div class="trow">
+          <div style="color:var(--tx-3)"><svg><use href="#i-folder"/></svg></div>
+          <div class="nm"><svg><use href="#i-folder"/></svg>node_modules <span class="tag">DIR</span></div>
+          <div class="num size">486 MB</div>
+          <div class="pct"><span class="track"><i style="width:3.1%;background:var(--heat-2)"></i></span><span class="v">3.1%</span></div>
+          <div class="mono">08-30 13:55</div>
+          <div style="color:var(--tx-3)">重复 1,204 项</div>
+        </div>
+        <div class="trow">
+          <div style="color:var(--tx-3)"><svg><use href="#i-file"/></svg></div>
+          <div class="nm"><svg><use href="#i-file"/></svg>Windows-11.iso <span class="ext">.iso</span></div>
+          <div class="num size">5.21 GB</div>
+          <div class="pct"><span class="track"><i style="width:33.8%;background:var(--heat-5)"></i></span><span class="v">33.8%</span></div>
+          <div class="mono">06-11 20:30</div>
+          <div style="color:var(--tx-3)">不在当前目录</div>
+        </div>
+        <div class="tfoot">
+          <span>显示 <b class="mono" style="color:var(--tx-0)">8</b> / 305,326 项</span>
+          <span>已选 <b class="mono" style="color:var(--tx-0)">1</b> · 9.1 GB</span>
+          <span style="margin-left:auto">排序：大小 ↓</span>
+          <span>过滤：无</span>
+        </div>
+      </main>
+
+      <aside class="inspector">
+        <h4>选中项</h4>
+        <div class="nm" style="display:flex;gap:7px;align-items:center;color:var(--tx-0);margin-bottom:8px">
+          <svg style="color:var(--accent)"><use href="#i-folder"/></svg><b style="font-weight:600">AppData</b>
+        </div>
+        <dl class="kv">
+          <dt>完整路径</dt><dd title="C:\Users\wfshenm\AppData">C:\Users\wfshenm\AppData</dd>
+          <dt>大小</dt><dd>9.1 GB · 12.4% of C:</dd>
+          <dt>文件 / 目录</dt><dd>184,209 / 21,338</dd>
+          <dt>修改时间</dt><dd>2024-08-14 09:21</dd>
+          <dt>新鲜度</dt><dd style="color:var(--ok)">USN 已校验 · 3 分钟前</dd>
+          <dt>来源</dt><dd>MFT 直接读取（1.3s）</dd>
+        </dl>
+        <div class="insp-actions">
+          <span class="chip"><svg><use href="#i-search"/></svg>在此搜索</span>
+          <span class="chip"><svg><use href="#i-dupes"/></svg>查重复</span>
+          <span class="chip"><svg><use href="#i-diff"/></svg>对比快照</span>
+          <span class="chip"><svg><use href="#i-copy"/></svg>复制路径</span>
+        </div>
+        <h4>近 30 天增长</h4>
+        <div class="spark">
+          <i style="height:18%"></i><i style="height:24%"></i><i style="height:20%"></i><i style="height:31%"></i>
+          <i style="height:28%"></i><i style="height:44%"></i><i class="h" style="height:62%"></i><i style="height:38%"></i>
+          <i style="height:35%"></i><i class="hh" style="height:88%"></i><i style="height:41%"></i><i style="height:33%"></i>
+        </div>
+        <div style="color:var(--tx-2);font-size:11px">+1.42 GB · 主要来自 Local\Temp（+780 MB）</div>
+      </aside>
+    </div>
+
+    <div class="dock">
+      <div class="tabs">
+        <button class="on">体积构成</button><button>Top 增长</button><button>重复文件</button><button>快照对比</button><button>开发者清理</button>
+        <span class="sp"></span>
+        <span style="color:var(--tx-3);font-size:11px">洞察随选中目录变化 · <kbd>Ctrl</kbd>+<kbd>1..5</kbd></span>
+      </div>
+      <div class="pane">
+        <div class="tm" style="flex:1.2">
+          <div style="grid-column:span 5;grid-row:span 3;background:var(--heat-5)">AppData <b>9.1 GB · 59%</b></div>
+          <div style="grid-column:span 3;grid-row:span 2;background:var(--heat-4)">Downloads <b>3.2 GB</b></div>
+          <div style="grid-column:span 2;grid-row:span 2;background:var(--heat-3)">Documents <b>1.1 GB</b></div>
+          <div style="grid-column:span 2;grid-row:span 1;background:var(--heat-2)">.cargo <b>840M</b></div>
+          <div style="grid-column:span 2;grid-row:span 1;background:var(--heat-2)">Temp <b>2.3 GB</b></div>
+          <div style="grid-column:span 4;grid-row:span 1;background:var(--heat-1)">其他 42 项 <b>1.9 GB</b></div>
+        </div>
+        <div style="flex:.8;display:flex;flex-direction:column;gap:5px;font-size:11.5px;color:var(--tx-1)">
+          <div style="color:var(--tx-3);font-size:10.5px;letter-spacing:.6px;text-transform:uppercase">可直接清理（估算 3.4 GB）</div>
+          <div style="display:flex;gap:8px"><span class="mono" style="color:var(--tx-0);width:64px">1.9 GB</span>Local\Temp · 90 天未访问</div>
+          <div style="display:flex;gap:8px"><span class="mono" style="color:var(--tx-0);width:64px">840 MB</span>.cargo\registry\cache</div>
+          <div style="display:flex;gap:8px"><span class="mono" style="color:var(--tx-0);width:64px">486 MB</span>node_modules ×3（重复）</div>
+          <div style="display:flex;gap:8px"><span class="mono" style="color:var(--tx-0);width:64px">172 MB</span>CrashDumps</div>
+          <div style="margin-top:auto;display:flex;gap:6px">
+            <span class="chip">加入清理清单</span><span class="chip">导出 CSV</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="statusbar">
+      <span class="st"><span class="dot"></span>USN 已校验 <b class="mono">11527443664</b></span>
+      <span class="st">缓存 <b>内存命中</b> · 40ms</span>
+      <span class="st">全局索引 <b class="mono">1,145,896</b> 项 · 就绪</span>
+      <span class="st">MFT <b>管理员</b></span>
+      <span class="sp"></span>
+      <span class="st">扫描 305,326 项 · 15.4 GB</span>
+      <span class="st">最近扫描 <b class="mono">1.3s</b></span>
+      <span class="st"><svg><use href="#i-shield"/></svg>只读访问</span>
+    </div>
+  </div>
+  </section>
+
+  <!-- ═══════════ 方向 B：仪器台（单一大表 + 底部洞察坞） ═══════════ -->
+  <section class="variant" id="v-b">
+  <div class="win">
+    <div class="b-top">
+      <div class="brand"><svg><use href="#i-drive"/></svg>FlashDir</div>
+      <span class="sep"></span>
+      <label class="omni">
+        <svg><use href="#i-search"/></svg>
+        <input value="dir:AppData size:>100MB !.log" spellcheck="false">
+        <span class="hint">范围：C: · 索引 1,145,896 项 · 18ms</span>
+      </label>
+      <button class="btn primary"><svg><use href="#i-scan"/></svg>扫描 C:</button>
+      <button class="btn"><svg><use href="#i-xc"/></svg>取消</button>
+      <div class="sp" style="flex:1"></div>
+      <div class="winbtns"><span><svg><use href="#i-min"/></svg></span><span><svg><use href="#i-max"/></svg></span><span class="close"><svg><use href="#i-x"/></svg></span></div>
+    </div>
+
+    <div class="b-body">
+      <nav class="rail">
+        <button class="on"><svg><use href="#i-list"/></svg>浏览</button>
+        <button><svg><use href="#i-search"/></svg>搜索</button>
+        <button><svg><use href="#i-diff"/></svg>快照</button>
+        <button><svg><use href="#i-dupes"/></svg>重复</button>
+        <button><svg><use href="#i-dev"/></svg>清理</button>
+        <span class="gap"></span>
+        <button><svg><use href="#i-cog"/></svg>设置</button>
+      </nav>
+
+      <div class="b-main">
+        <div class="b-head">
+          <div class="b-crumb">
+            <span class="path">C:\Users\wfshenm</span>
+            <span class="m">扫描于 3 分钟前 · 305,326 项 · 15.4 GB · MFT 1.3s</span>
+            <span style="flex:1"></span>
+            <span class="chip"><svg><use href="#i-refresh"/></svg>刷新</span>
+            <span class="chip"><svg><use href="#i-down-tray"/></svg>导出</span>
+          </div>
+          <div class="cap">
+            <div class="bar">
+              <i style="width:26%;background:var(--heat-5)"></i>
+              <i style="width:21%;background:var(--heat-4)"></i>
+              <i style="width:14%;background:var(--heat-3)"></i>
+              <i style="width:12%;background:var(--heat-2)"></i>
+              <i style="width:14%;background:var(--bg-4)"></i>
+            </div>
+            <div class="lg">
+              <span><i class="sw" style="background:var(--heat-5)"></i>系统 108G</span>
+              <span><i class="sw" style="background:var(--heat-4)"></i>用户 86G</span>
+              <span><i class="sw" style="background:var(--heat-3)"></i>程序 58G</span>
+              <span><i class="sw" style="background:var(--heat-2)"></i>其他 49G</span>
+              <span><i class="sw" style="background:var(--bg-4)"></i>可用 63G</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="thead" style="grid-template-columns:26px minmax(260px,1fr) 96px 116px 108px 96px">
+          <div></div><div>名称</div><div class="num">大小</div><div>占父目录</div><div>修改时间</div><div>访问热度</div>
+        </div>
+        <div class="trow" style="grid-template-columns:26px minmax(260px,1fr) 96px 116px 108px 96px">
+          <div style="color:var(--tx-3)"><svg><use href="#i-folder"/></svg></div>
+          <div class="nm"><svg><use href="#i-folder"/></svg>AppData <span class="tag">DIR</span></div>
+          <div class="num size">9.1 GB</div>
+          <div class="pct"><span class="track"><i style="width:59%;background:var(--heat-5)"></i></span><span class="v">59.1%</span></div>
+          <div class="mono">08-14 09:21</div>
+          <div style="color:var(--warn)">高频</div>
+        </div>
+        <div class="trow sel" style="grid-template-columns:26px minmax(260px,1fr) 96px 116px 108px 96px">
+          <div style="color:var(--tx-3)"><svg><use href="#i-folder"/></svg></div>
+          <div class="nm"><svg><use href="#i-folder"/></svg>AppData\Local\Temp <span class="tag">DIR</span></div>
+          <div class="num size">2.3 GB</div>
+          <div class="pct"><span class="track"><i style="width:25.3%;background:var(--heat-4)"></i></span><span class="v">25.3%</span></div>
+          <div class="mono">09-19 19:41</div>
+          <div style="color:var(--bad)">90 天未访问</div>
+        </div>
+        <div class="trow" style="grid-template-columns:26px minmax(260px,1fr) 96px 116px 108px 96px">
+          <div style="color:var(--tx-3)"><svg><use href="#i-file"/></svg></div>
+          <div class="nm"><svg><use href="#i-file"/></svg>devtools-cache.tar.zst <span class="ext">.zst</span></div>
+          <div class="num size">2.41 GB</div>
+          <div class="pct"><span class="track"><i style="width:15.6%;background:var(--heat-4)"></i></span><span class="v">15.6%</span></div>
+          <div class="mono">07-28 11:47</div>
+          <div style="color:var(--tx-2)">冷</div>
+        </div>
+        <div class="trow" style="grid-template-columns:26px minmax(260px,1fr) 96px 116px 108px 96px">
+          <div style="color:var(--tx-3)"><svg><use href="#i-file"/></svg></div>
+          <div class="nm"><svg><use href="#i-file"/></svg>node_modules\.cache\webpack\index.pack <span class="ext">.pack</span></div>
+          <div class="num size">1.02 GB</div>
+          <div class="pct"><span class="track"><i style="width:11.2%;background:var(--heat-3)"></i></span><span class="v">11.2%</span></div>
+          <div class="mono">08-30 13:55</div>
+          <div style="color:var(--tx-2)">冷</div>
+        </div>
+        <div class="trow" style="grid-template-columns:26px minmax(260px,1fr) 96px 116px 108px 96px">
+          <div style="color:var(--tx-3)"><svg><use href="#i-folder"/></svg></div>
+          <div class="nm"><svg><use href="#i-folder"/></svg>AppData\Local\Packages <span class="tag">DIR</span></div>
+          <div class="num size">1.9 GB</div>
+          <div class="pct"><span class="track"><i style="width:20.9%;background:var(--heat-3)"></i></span><span class="v">20.9%</span></div>
+          <div class="mono">09-12 07:30</div>
+          <div style="color:var(--tx-1)">中</div>
+        </div>
+        <div class="trow" style="grid-template-columns:26px minmax(260px,1fr) 96px 116px 108px 96px">
+          <div style="color:var(--tx-3)"><svg><use href="#i-file"/></svg></div>
+          <div class="nm"><svg><use href="#i-file"/></svg>AppData\Local\CrashDumps\flashdir.exe.4120.dmp <span class="ext">.dmp</span></div>
+          <div class="num size">172 MB</div>
+          <div class="pct"><span class="track"><i style="width:1.8%;background:var(--heat-2)"></i></span><span class="v">1.8%</span></div>
+          <div class="mono">09-18 22:11</div>
+          <div style="color:var(--bad)">可清理</div>
+        </div>
+        <div class="tfoot">
+          <span>命中 <b class="mono" style="color:var(--tx-0)">7</b> · 过滤 <span class="mono">dir:AppData size:>100MB !.log</span></span>
+          <span style="margin-left:auto">按大小 ↓ · 聚合开启</span>
+        </div>
+        <div class="dock" style="margin-top:auto">
+          <div class="tabs">
+            <button class="on">体积构成</button><button>热图</button><button>Top 增长</button><button>重复文件</button><button>快照对比</button>
+            <span class="sp"></span>
+            <span style="color:var(--tx-3);font-size:11px">拖拽上边缘调整高度</span>
+          </div>
+          <div class="pane">
+            <div style="flex:1.1;display:flex;flex-direction:column;gap:4px">
+              <div style="color:var(--tx-3);font-size:10.5px;letter-spacing:.6px;text-transform:uppercase">Top 占用（当前过滤结果）</div>
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:11px">AppData</span><span style="flex:1;height:8px;background:var(--bg-3);border-radius:2px"><i style="display:block;height:8px;width:100%;background:var(--heat-5);border-radius:2px"></i></span><span class="mono" style="width:56px;text-align:right">9.1G</span></div>
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:11px">AppData\Local\Temp</span><span style="flex:1;height:8px;background:var(--bg-3);border-radius:2px"><i style="display:block;height:8px;width:25%;background:var(--heat-4);border-radius:2px"></i></span><span class="mono" style="width:56px;text-align:right">2.3G</span></div>
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:11px">devtools-cache.tar.zst</span><span style="flex:1;height:8px;background:var(--bg-3);border-radius:2px"><i style="display:block;height:8px;width:26%;background:var(--heat-4);border-radius:2px"></i></span><span class="mono" style="width:56px;text-align:right">2.41G</span></div>
+              <div style="display:flex;align-items:center;gap:8px"><span style="width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono);font-size:11px">webpack\index.pack</span><span style="flex:1;height:8px;background:var(--bg-3);border-radius:2px"><i style="display:block;height:8px;width:11%;background:var(--heat-3);border-radius:2px"></i></span><span class="mono" style="width:56px;text-align:right">1.02G</span></div>
+            </div>
+            <div style="flex:1;border-left:1px solid var(--bd-0);padding-left:12px;display:flex;flex-direction:column;gap:6px">
+              <div style="color:var(--tx-3);font-size:10.5px;letter-spacing:.6px;text-transform:uppercase">操作</div>
+              <div style="display:flex;gap:6px;flex-wrap:wrap">
+                <span class="chip">在资源管理器中打开</span><span class="chip">复制路径</span><span class="chip">排除此目录</span><span class="chip">标记清理</span>
+              </div>
+              <div style="margin-top:auto;color:var(--tx-2);font-size:11px;line-height:1.7">
+                <b style="color:var(--tx-1)">USN 增量</b>：3 分钟前校验，窗口内 12 项变更已应用<br>
+                <b style="color:var(--tx-1)">缓存</b>：内存命中（40ms）· 磁盘 blob 72MB
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="statusbar">
+          <span class="st"><span class="dot"></span>索引就绪 · <b class="mono">1,145,896</b></span>
+          <span class="st">USN 已校验</span>
+          <span class="st">MFT <b>管理员</b></span>
+          <span class="sp"></span>
+          <span class="st">选中 1 项 · 2.3 GB</span>
+          <span class="st">18ms 搜索</span>
+          <span class="st">C: 412/476 GB</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  </section>
+
+  <!-- ═══════════ 方向 C：工作台（浅色 IDE 式，菜单栏 + 侧栏 + 检查器） ═══════════ -->
+  <section class="variant" id="v-c">
+  <div class="win">
+    <div class="c-top">
+      <div class="brand" style="display:flex;align-items:center;gap:6px;font-weight:600;color:var(--tx-0)"><svg style="color:var(--accent)"><use href="#i-drive"/></svg>FlashDir</div>
+      <div class="menu"><span>文件</span><span>扫描</span><span>视图</span><span>工具</span><span>帮助</span></div>
+      <span class="title">C:\Users\wfshenm — 305,326 项 · 15.4 GB</span>
+      <div class="winbtns"><span><svg><use href="#i-min"/></svg></span><span><svg><use href="#i-max"/></svg></span><span class="close"><svg><use href="#i-x"/></svg></span></div>
+    </div>
+    <div class="c-body">
+      <nav class="c-rail">
+        <button class="on" title="浏览"><svg><use href="#i-list"/></svg></button>
+        <button title="搜索"><svg><use href="#i-search"/></svg></button>
+        <button title="快照"><svg><use href="#i-diff"/></svg></button>
+        <button title="重复"><svg><use href="#i-dupes"/></svg></button>
+        <button title="清理建议"><svg><use href="#i-dev"/></svg></button>
+        <button title="设置" style="margin-top:auto"><svg><use href="#i-cog"/></svg></button>
+      </nav>
+      <aside class="c-side">
+        <div class="cap">范围<span style="font-family:var(--font-mono)">C: · 1.14M</span></div>
+        <div class="sec">
+          <h5>驱动器</h5>
+          <div class="li on"><svg><use href="#i-drive"/></svg>C: 系统<span class="n">412/476G</span></div>
+          <div class="li"><svg><use href="#i-drive"/></svg>D: 数据<span class="n">180/931G</span></div>
+        </div>
+        <div class="sec" style="flex:1;overflow:hidden">
+          <h5>目录</h5>
+          <div class="li on"><svg><use href="#i-folder"/></svg>wfshenm<span class="n">15.4G</span></div>
+          <div class="li" style="padding-left:16px"><svg><use href="#i-folder"/></svg>AppData<span class="n">9.1G</span></div>
+          <div class="li" style="padding-left:28px"><svg><use href="#i-folder"/></svg>Local<span class="n">6.7G</span></div>
+          <div class="li" style="padding-left:40px"><svg><use href="#i-folder"/></svg>Temp<span class="n">2.3G</span></div>
+          <div class="li" style="padding-left:40px"><svg><use href="#i-folder"/></svg>Packages<span class="n">1.9G</span></div>
+          <div class="li" style="padding-left:16px"><svg><use href="#i-folder"/></svg>Downloads<span class="n">3.2G</span></div>
+          <div class="li" style="padding-left:16px"><svg><use href="#i-folder"/></svg>Documents<span class="n">1.1G</span></div>
+          <div class="li" style="padding-left:16px"><svg><use href="#i-folder"/></svg>.cargo<span class="n">840M</span></div>
+        </div>
+        <div class="sec">
+          <h5>保存的搜索</h5>
+          <div class="li"><svg><use href="#i-search"/></svg>大文件 &gt;1GB<span class="n">88</span></div>
+          <div class="li"><svg><use href="#i-search"/></svg>可清理缓存<span class="n">3.4G</span></div>
+          <div class="li"><svg><use href="#i-search"/></svg>近 7 天变更<span class="n">1.8G</span></div>
+        </div>
+      </aside>
+      <main class="c-editor">
+        <div class="toolbar">
+          <button class="btn primary"><svg><use href="#i-scan"/></svg>扫描</button>
+          <button class="btn"><svg><use href="#i-xc"/></svg>取消</button>
+          <button class="btn ghost"><svg><use href="#i-refresh"/></svg>刷新</button>
+          <span class="sep"></span>
+          <div class="pathbar" style="max-width:420px"><span class="crumb">C:</span><span class="caret">›</span><span class="crumb">Users</span><span class="caret">›</span><span class="crumb cur">wfshenm</span></div>
+          <div class="sp" style="flex:1"></div>
+          <label class="filter" style="flex:0 0 260px"><svg><use href="#i-filter"/></svg><input placeholder="过滤：ext: iso size:>1GB"></label>
+          <div class="seg"><button class="on">列表</button><button>热图</button><button>统计</button></div>
+        </div>
+        <div class="thead" style="grid-template-columns:26px minmax(240px,1fr) 92px 108px 100px 84px">
+          <div></div><div>名称</div><div class="num">大小</div><div>占父目录</div><div>修改时间</div><div>状态</div>
+        </div>
+        <div class="trow" style="grid-template-columns:26px minmax(240px,1fr) 92px 108px 100px 84px">
+          <div style="color:var(--tx-3)"><svg><use href="#i-folder"/></svg></div>
+          <div class="nm"><svg><use href="#i-folder"/></svg>AppData <span class="tag">DIR</span></div>
+          <div class="num size">9.1 GB</div>
+          <div class="pct"><span class="track"><i style="width:59%;background:var(--heat-5)"></i></span><span class="v">59.1%</span></div>
+          <div class="mono">08-14 09:21</div>
+          <div style="color:var(--ok)">已校验</div>
+        </div>
+        <div class="trow" style="grid-template-columns:26px minmax(240px,1fr) 92px 108px 100px 84px">
+          <div style="color:var(--tx-3)"><svg><use href="#i-folder"/></svg></div>
+          <div class="nm"><svg><use href="#i-folder"/></svg>Downloads <span class="tag">DIR</span></div>
+          <div class="num size">3.2 GB</div>
+          <div class="pct"><span class="track"><i style="width:21%;background:var(--heat-4)"></i></span><span class="v">20.8%</span></div>
+          <div class="mono">09-02 22:04</div>
+          <div style="color:var(--ok)">已校验</div>
+        </div>
+        <div class="trow sel" style="grid-template-columns:26px minmax(240px,1fr) 92px 108px 100px 84px">
+          <div style="color:var(--tx-3)"><svg><use href="#i-file"/></svg></div>
+          <div class="nm"><svg><use href="#i-file"/></svg>Windows-11.iso <span class="ext">.iso</span></div>
+          <div class="num size">5.21 GB</div>
+          <div class="pct"><span class="track"><i style="width:33.8%;background:var(--heat-5)"></i></span><span class="v">33.8%</span></div>
+          <div class="mono">06-11 20:30</div>
+          <div style="color:var(--warn)">冷数据</div>
+        </div>
+        <div class="trow" style="grid-template-columns:26px minmax(240px,1fr) 92px 108px 100px 84px">
+          <div style="color:var(--tx-3)"><svg><use href="#i-folder"/></svg></div>
+          <div class="nm"><svg><use href="#i-folder"/></svg>node_modules <span class="tag">DIR</span></div>
+          <div class="num size">486 MB</div>
+          <div class="pct"><span class="track"><i style="width:3.1%;background:var(--heat-2)"></i></span><span class="v">3.1%</span></div>
+          <div class="mono">08-30 13:55</div>
+          <div style="color:var(--tx-2)">重复候选</div>
+        </div>
+        <div class="tfoot"><span>305,326 项 · 15.4 GB</span><span style="margin-left:auto">排序：大小 ↓</span><span>渲染 60 行（虚拟滚动）</span></div>
+      </main>
+      <aside class="c-insp">
+        <h4>属性</h4>
+        <dl class="kv">
+          <dt>名称</dt><dd>Windows-11.iso</dd>
+          <dt>路径</dt><dd>C:\Users\wfshenm\Downloads</dd>
+          <dt>大小</dt><dd>5.21 GB</dd>
+          <dt>类型</dt><dd>ISO 磁盘映像</dd>
+          <dt>修改时间</dt><dd>2024-06-11 20:30</dd>
+          <dt>最后访问</dt><dd>2024-06-12 08:02</dd>
+        </dl>
+        <h4>操作</h4>
+        <div class="insp-actions">
+          <span class="chip"><svg><use href="#i-folder"/></svg>定位</span>
+          <span class="chip"><svg><use href="#i-copy"/></svg>复制路径</span>
+          <span class="chip"><svg><use href="#i-dupes"/></svg>查重复</span>
+        </div>
+        <h4>同目录大文件</h4>
+        <div style="font-size:11.5px;color:var(--tx-1);line-height:1.9" class="mono">
+          5.21G Windows-11.iso<br>1.02G webpack-index.pack<br>612M HWiNFO64_Log.csv
+        </div>
+      </aside>
+    </div>
+    <div class="statusbar">
+      <span class="st"><span class="dot"></span>USN 已校验</span>
+      <span class="st">缓存 <b>内存命中</b></span>
+      <span class="st">索引 <b class="mono">1,145,896</b></span>
+      <span class="sp"></span>
+      <span class="st">选中 1 项 · 5.21 GB</span>
+      <span class="st">MFT 管理员 · 只读</span>
+    </div>
+  </div>
+  </section>
+
+  <!-- ═══════════ 功能状态样例（扫描/增量/降级/空结果/索引/快照） ═══════════ -->
+  <div class="legend" style="margin-top:18px">
+    <h3>功能状态样例 — 每个状态都要"看得见、能操作"</h3>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:10px">
+      <div class="card">
+        <h3>扫描中（可取消 · 显示阶段与吞吐）</h3>
+        <div style="display:flex;align-items:center;gap:8px;margin:6px 0">
+          <span class="dot warn"></span><b style="font-size:11.5px">正在读取 MFT</b>
+          <span style="flex:1;height:6px;background:var(--bg-4);border-radius:2px;overflow:hidden"><i style="display:block;height:6px;width:42%;background:var(--accent)"></i></span>
+          <span class="mono" style="font-size:11px;color:var(--tx-1)">42%</span>
+        </div>
+        <div class="mono" style="font-size:11px;color:var(--tx-2)">已解析 512,304 / 763,124 条 · 880 MB · 剩余 ~1.2s</div>
+        <div style="margin-top:8px"><span class="chip"><svg><use href="#i-xc"/></svg>取消扫描</span></div>
+      </div>
+      <div class="card">
+        <h3>USN 增量（快路径，标明窗口与条数）</h3>
+        <div style="display:flex;align-items:center;gap:8px;margin:6px 0"><span class="dot"></span><b style="font-size:11.5px">增量已应用</b><span class="mono" style="font-size:11px;color:var(--tx-2)">12 项变更 · 0.31s</span></div>
+        <div class="mono" style="font-size:11px;color:var(--tx-2)">校验点 11527443664 → 11527449812 · 窗口内无失效</div>
+        <div style="margin-top:8px"><span class="chip">查看变更明细</span><span class="chip">强制全量重扫</span></div>
+      </div>
+      <div class="card">
+        <h3>降级/受限（说明原因 + 一步恢复）</h3>
+        <div style="display:flex;align-items:center;gap:8px;margin:6px 0"><span class="dot warn"></span><b style="font-size:11.5px">未以管理员运行</b><span style="font-size:11px;color:var(--tx-2)">已回退目录遍历，预计 ~60s（MFT 直读约 3s）</span></div>
+        <div style="margin-top:8px"><span class="chip"><svg><use href="#i-shield"/></svg>以管理员重启</span><span class="chip">本次继续</span></div>
+      </div>
+      <div class="card">
+        <h3>索引构建（全局搜索可用性）</h3>
+        <div style="display:flex;align-items:center;gap:8px;margin:6px 0">
+          <span class="dot warn"></span><b style="font-size:11.5px">正在构建索引</b>
+          <span style="flex:1;height:6px;background:var(--bg-4);border-radius:2px;overflow:hidden"><i style="display:block;height:6px;width:78%;background:var(--accent)"></i></span>
+          <span class="mono" style="font-size:11px">78%</span>
+        </div>
+        <div class="mono" style="font-size:11px;color:var(--tx-2)">1,145,896 项 · C: 完成，D: 待建 · 期间可搜索已建部分</div>
+      </div>
+      <div class="card" style="grid-column:span 2">
+        <h3>快照对比（同一目录两个时间点，按增量排序）</h3>
+        <div class="diff" style="height:104px;margin-top:4px">
+          <div class="col">
+            <h5>新增 / 增长 · +2.41 GB</h5>
+            <div class="r add"><span class="p">Downloads\Windows-11.iso</span><span class="d">+5.21G</span></div>
+            <div class="r add"><span class="p">AppData\Local\Temp\build-cache</span><span class="d">+812M</span></div>
+            <div class="r add"><span class="p">Documents\report-final.pdf</span><span class="d">+18M</span></div>
+          </div>
+          <div class="col">
+            <h5>删除 / 缩小 · -486 MB</h5>
+            <div class="r del"><span class="p">node_modules\.cache</span><span class="d">-486M</span></div>
+            <div class="r del"><span class="p">Downloads\old-backup.7z</span><span class="d">-1.2G</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="card" style="grid-column:span 2">
+        <h3>空结果（给出语法与下一步，不卖萌）</h3>
+        <div style="display:flex;gap:14px;align-items:flex-start;margin-top:6px">
+          <div style="flex:1">
+            <div class="mono" style="font-size:11.5px;color:var(--tx-1)">查询：<b>ext:psd size:&gt;500MB</b> — 0 项命中（索引 1,145,896 项）</div>
+            <div style="font-size:11.5px;color:var(--tx-2);margin-top:6px;line-height:1.8">
+              可能的修正：<span class="mono">ext:psd</span> 是否拼写正确 · 去掉 <span class="mono">size</span> 限制 · 切换范围到全部驱动器
+            </div>
+          </div>
+          <div style="flex:0 0 330px;border-left:1px solid var(--bd-0);padding-left:12px">
+            <div style="color:var(--tx-3);font-size:10.5px;letter-spacing:.6px;text-transform:uppercase;margin-bottom:5px">过滤语法</div>
+            <div class="mono" style="font-size:11px;color:var(--tx-1);line-height:1.9">
+              ext:zip · size:&gt;1GB · dir:node_modules<br>type:file|dir · mtime:&gt;7d · !tmp · "精确短语"
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════ 交互说明 + 设计规范 ═══════════ -->
+  <div class="legend">
+    <h3>交互模型（三个方向共用）</h3>
+    <ol>
+      <li><b>键盘优先</b>：<code>Ctrl+K</code> 统一入口（文件搜索 + 命令，同一输入框，前缀 <code>&gt;</code> 切命令）；<code>Ctrl+F</code> 当前目录过滤；<code>Ctrl+Shift+F</code> 全局搜索；<code>F5</code> 刷新（走 USN 快路径）；<code>Ctrl+Shift+R</code> 强制全量；<code>Esc</code> 取消扫描/关闭面板。</li>
+      <li><b>方向键即可完成主流程</b>：<code>↑/↓</code> 选行、<code>→/←</code> 展开/折叠或进出目录、<code>Enter</code> 打开（资源管理器定位）、<code>Space</code> 预览信息、<code>Backspace</code> 上一级；表格列头 <code>Alt+1..6</code> 直接排序。</li>
+      <li><b>过滤语法常驻可见</b>：过滤框右侧常显语法提示与命中数；输入 <code>?</code> 展开完整语法；非法 token 标红并保留原文，不静默丢弃。</li>
+      <li><b>状态永远可解释</b>：状态栏固定显示 USN 校验点、缓存层级（内存/磁盘/推导）、索引规模、是否管理员；降级时给出原因与"以管理员重启"一步操作。</li>
+      <li><b>洞察随上下文</b>：底部/侧边洞察区跟随选中目录（体积构成、Top 增长、可清理项、重复候选、快照 diff），并用 <code>Ctrl+1..5</code> 切换。</li>
+      <li><b>危险操作有边界</b>：删除/清理只在"清理清单"里批量执行，先给估算与影响面；程序本身始终只读扫描。</li>
+    </ol>
+  </div>
+
+  <div class="spec">
+    <div class="card">
+      <h3>色板（深色 / 浅色同构）</h3>
+      <table>
+        <tr><th>用途</th><th>深色</th><th>浅色</th></tr>
+        <tr><td>窗口底 / 面板 / 浮层</td><td><span class="swatch" style="background:#17181a"></span><code>#17181a</code> <span class="swatch" style="background:#1e1f22"></span><code>#1e1f22</code></td><td><span class="swatch" style="background:#f3f3f3"></span><code>#f3f3f3</code></td></tr>
+        <tr><td>强调色（唯一）</td><td><span class="swatch" style="background:#4c9aff"></span><code>#4c9aff</code></td><td><span class="swatch" style="background:#0a6ed1"></span><code>#0a6ed1</code></td></tr>
+        <tr><td>占用热力（5 档）</td><td><span class="swatch" style="background:#2d4f6b"></span><span class="swatch" style="background:#3c6e57"></span><span class="swatch" style="background:#7a6a34"></span><span class="swatch" style="background:#8a5230"></span><span class="swatch" style="background:#7d3733"></span></td><td colspan="2">低 → 高（蓝绿 → 黄 → 橙 → 红），只表达数据不表达情绪</td></tr>
+        <tr><td>语义色</td><td><span class="swatch" style="background:#4cc38a"></span>正常 <span class="swatch" style="background:#e0a33a"></span>注意 <span class="swatch" style="background:#e5534b"></span>危险</td><td colspan="2">仅用于状态与告警</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3>字阶与间距</h3>
+      <table>
+        <tr><th>元素</th><th>规格</th></tr>
+        <tr><td>UI 文本 / 表格</td><td><code>12px / 1.45</code>，行高 23px，密度优先</td></tr>
+        <tr><td>次级说明 / 状态栏</td><td><code>11px</code></td></tr>
+        <tr><td>数字 / 路径 / 时间</td><td><code>Cascadia Mono 11-12px</code>，等宽对齐（tabular-nums）</td></tr>
+        <tr><td>标题 / 分组</td><td><code>10.5-12px</code>，全大写 + 0.6px 字距，不用大字号</td></tr>
+        <tr><td>圆角 / 边框</td><td>统一 <code>3px</code>，分隔线 <code>1px</code>；阴影仅用于浮层</td></tr>
+        <tr><td>间距节奏</td><td>4 / 6 / 8 / 10 / 14 px；工具栏 36px、状态栏 24px、标题栏 32px</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3>图标与控件</h3>
+      <table>
+        <tr><th>项</th><th>规则</th></tr>
+        <tr><td>图标</td><td>内联 SVG，14-16px，1.6px 描边，单色跟随文本；不用 emoji、不用彩色图标</td></tr>
+        <tr><td>按钮</td><td>高 24px，图标 + 文本；仅主操作使用强调色填充</td></tr>
+        <tr><td>表格</td><td>斑马纹极淡 + 悬停高亮 + 选中用强调色 18% 底；数字右对齐</td></tr>
+        <tr><td>占用条</td><td>6px 高轨道 + 热力填充 + 右侧百分比（等宽）</td></tr>
+        <tr><td>动效</td><td>仅 120ms 背景/边框过渡；扫描进度用宽度过渡；不做位移/缩放动画</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3>三个方向的取舍</h3>
+      <table>
+        <tr><th>方向</th><th>适合</th><th>代价</th></tr>
+        <tr><td>A 指挥台</td><td>长期驻留、双栏对照（树 + 表 + 检查器），最接近 Everything/Opus 习惯</td><td>横向空间占用最大</td></tr>
+        <tr><td>B 仪器台</td><td>单表信息量最大、洞察坞可拖拽；适合"看数据"为主</td><td>树/检查器需要弹层或切换</td></tr>
+        <tr><td>C 工作台</td><td>浅色、多模式（浏览/搜索/快照/重复）切换清晰，最"软件"</td><td>模式切换有学习成本</td></tr>
+      </table>
+    </div>
+  </div>
+
+  <p class="note">样例文件：<b>design/ui-redesign-samples.html</b> · 自包含（无外部字体/图片/脚本依赖），直接用浏览器打开即可。确定方向后我再按该方向落到 Vue 组件与设计令牌上。</p>
+</div>
+
+<script>
+(function(){
+  var vs=document.querySelectorAll('#vswitch button');
+  vs.forEach(function(b){ b.onclick=function(){
+    vs.forEach(function(x){x.classList.remove('on')}); b.classList.add('on');
+    document.querySelectorAll('.variant').forEach(function(v){v.classList.remove('on')});
+    document.getElementById('v-'+b.dataset.v).classList.add('on');
+  }});
+  var ts=document.querySelectorAll('#tswitch button');
+  ts.forEach(function(b){ b.onclick=function(){
+    ts.forEach(function(x){x.classList.remove('on')}); b.classList.add('on');
+    document.documentElement.dataset.theme=b.dataset.t;
+  }});
+})();
+</script>
+</body>
+</html>

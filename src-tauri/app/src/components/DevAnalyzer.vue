@@ -172,7 +172,7 @@ analyze()
   flex: 1;
   overflow-y: auto;
   padding: 12px;
-  background: var(--fd-bg-1);
+  background: var(var(--bg-1));
 }
 
 /* 概览卡片 */
@@ -184,8 +184,8 @@ analyze()
 
 .dev-summary-card {
   flex: 1;
-  background: var(--fd-bg-0);
-  border: 1px solid var(--fd-border);
+  background: var(var(--bg-0));
+  border: 1px solid var(var(--bd-1));
   border-radius: 6px;
   padding: 10px 12px;
   text-align: center;
@@ -193,23 +193,23 @@ analyze()
 
 .dev-summary-label {
   font-size: 11px;
-  color: var(--fd-text-2);
+  color: var(var(--tx-2));
   margin-bottom: 4px;
 }
 
 .dev-summary-value {
   font-size: 14px;
   font-weight: 600;
-  color: var(--fd-text-0);
+  color: var(var(--tx-0));
 }
 
 .dev-summary-primary {
-  color: var(--fd-danger);
+  color: var(var(--bad));
 }
 
 .dev-summary-sub {
   font-size: 11px;
-  color: var(--fd-text-2);
+  color: var(var(--tx-2));
   margin-top: 2px;
 }
 
@@ -221,8 +221,8 @@ analyze()
 }
 
 .dev-category-item {
-  background: var(--fd-bg-0);
-  border: 1px solid var(--fd-border);
+  background: var(var(--bg-0));
+  border: 1px solid var(var(--bd-1));
   border-radius: 6px;
   padding: 10px 12px;
 }
@@ -248,12 +248,12 @@ analyze()
 .dev-category-name {
   font-size: 13px;
   font-weight: 600;
-  color: var(--fd-text-0);
+  color: var(var(--tx-0));
 }
 
 .dev-category-desc {
   font-size: 11px;
-  color: var(--fd-text-2);
+  color: var(var(--tx-2));
 }
 
 .dev-category-size {
@@ -266,18 +266,18 @@ analyze()
 .dev-size-value {
   font-size: 13px;
   font-weight: 600;
-  color: var(--fd-text-0);
+  color: var(var(--tx-0));
 }
 
 .dev-size-percent {
   font-size: 11px;
-  color: var(--fd-text-2);
+  color: var(var(--tx-2));
 }
 
 /* 进度条 */
 .dev-progress-wrapper {
   height: 4px;
-  background: var(--fd-bg-3);
+  background: var(var(--bg-3));
   border-radius: 2px;
   margin-top: 8px;
   overflow: hidden;
@@ -293,7 +293,7 @@ analyze()
 .dev-top-items {
   margin-top: 8px;
   padding-top: 8px;
-  border-top: 1px dashed var(--fd-border);
+  border-top: 1px dashed var(var(--bd-1));
 }
 
 .dev-top-item {
@@ -305,7 +305,7 @@ analyze()
 
 .dev-top-name {
   font-size: 11px;
-  color: var(--fd-text-2);
+  color: var(var(--tx-2));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -315,7 +315,7 @@ analyze()
 
 .dev-top-size {
   font-size: 11px;
-  color: var(--fd-text-2);
+  color: var(var(--tx-2));
   font-weight: 500;
   flex-shrink: 0;
   margin-left: 8px;
@@ -324,7 +324,7 @@ analyze()
 /* 空状态 */
 .dev-empty {
   text-align: center;
-  color: var(--fd-text-2);
+  color: var(var(--tx-2));
   font-size: 12px;
   padding: 32px 16px;
 }

@@ -20,6 +20,8 @@ pub struct FastDirEntry {
     pub is_symlink: bool,
     /// 修改时间（Unix 秒级时间戳，0 = 未知），与 Windows 遍历器保持一致
     pub mtime: i64,
+    /// 访问时间（Unix 秒级时间戳）
+    pub atime: i64,
 }
 
 /// 使用标准库遍历目录（非 Windows 平台）
@@ -52,8 +54,8 @@ pub fn read_dir_entries(dir_path: &Path) -> io::Result<Vec<FastDirEntry>> {
             .unwrap_or("?")
             .to_string();
 
-        let (size, mtime) = if is_dir {
-            (0, 0)
+        let (size, mtime, atime) = if is_dir {
+            (0, 0, 0)
         } else {
             match entry.metadata() {
                 Ok(m) => (
@@ -63,8 +65,13 @@ pub fn read_dir_entries(dir_path: &Path) -> io::Result<Vec<FastDirEntry>> {
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0),
+                    m.accessed()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0),
                 ),
-                Err(_) => (0, 0),
+                Err(_) => (0, 0, 0),
             }
         };
 
@@ -75,6 +82,7 @@ pub fn read_dir_entries(dir_path: &Path) -> io::Result<Vec<FastDirEntry>> {
             is_dir,
             is_symlink,
             mtime,
+            atime,
         });
     }
 

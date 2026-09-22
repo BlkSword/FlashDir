@@ -532,6 +532,7 @@ mod tests {
             size_formatted: CompactString::new(),
             is_dir,
             mtime: 0,
+            atime: 0,
         }
     }
 

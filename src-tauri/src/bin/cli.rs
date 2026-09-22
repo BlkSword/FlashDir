@@ -213,6 +213,8 @@ fn print_json(items: &[scan::Item], total_size: i64, scan_time: f64, file_count:
         size: i64,
         size_formatted: String,
         is_dir: bool,
+        mtime: i64,
+        atime: i64,
     }
 
     let output = Output {
@@ -228,6 +230,8 @@ fn print_json(items: &[scan::Item], total_size: i64, scan_time: f64, file_count:
                 size: i.size,
                 size_formatted: format_size(i.size),
                 is_dir: i.is_dir,
+                mtime: i.mtime,
+                atime: i.atime,
             })
             .collect(),
     };

@@ -1,566 +1,638 @@
+<script setup>
+import { ref, reactive, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
+import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
+
+import TitleBar from './components/TitleBar.vue'
+import Toolbar from './components/Toolbar.vue'
+import DirTree from './components/DirTree.vue'
+import FileTable from './components/FileTable.vue'
+import Inspector from './components/Inspector.vue'
+import InsightDock from './components/InsightDock.vue'
+import StatusBar from './components/StatusBar.vue'
+import Treemap from './components/Treemap.vue'
+import CommandPalette from './components/CommandPalette.vue'
+import ContextMenu from './components/ContextMenu.vue'
+import UiModal from './components/UiModal.vue'
+import Toasts from './components/Toasts.vue'
+import Icon from './components/Icon.vue'
+
+import { useTheme } from './composables/useTheme.js'
+import { useToasts } from './composables/useToasts.js'
+import { useGlobalSearch } from './composables/useGlobalSearch.js'
+import { formatSize, formatDateTime, formatError, getParentPath, normalizePath } from './utils/format.js'
+
+/* ── 状态 ───────────────────────────────────────────────── */
+const currentPath = ref('')
+const items = ref([])
+const totalItems = ref(0)
+const totalSize = ref(0)
+const fileCount = ref(0)
+const dirCount = ref(0)
+const topFiles = ref([])
+const scanTime = ref(0)
+const cacheSource = ref('')
+const mftAvailable = ref(false)
+const isAdmin = ref(false)
+const loading = ref(false)
+const filter = ref('')
+const sortConfig = ref({ column: 'size', direction: 'desc' })
+const page = ref(1)
+const pageSize = ref(200)
+const view = ref('list')
+const dockTab = ref('map')
+const selectedItem = ref(null)
+const treeVisible = ref(true)
+const inspVisible = ref(true)
+const dockVisible = ref(true)
+const paletteOpen = ref(false)
+const diagnosticsOpen = ref(false)
+const diagnosticsText = ref('')
+const aboutOpen = ref(false)
+const snapshotCount = ref(0)
+const scanPhase = ref({ phase: '', message: '' })
+const history = ref([])
+const navStack = ref([])
+const navIndex = ref(-1)
+
+const ctx = reactive({ open: false, x: 0, y: 0, items: [], target: null })
+
+const { mode: themeMode, cycle: cycleTheme } = useTheme()
+const toasts = useToasts()
+const gs = useGlobalSearch()
+
+const volumes = ref([])
+const currentDrive = computed(() => {
+  const m = (currentPath.value || '').match(/^([A-Za-z]):/)
+  return m ? m[1].toUpperCase() : ''
+})
+const usnVerified = computed(() =>
+  mftAvailable.value && ['usn', 'usn-disk', 'scan'].includes(cacheSource.value)
+)
+const parentTotal = computed(() => totalSize.value)
+const scopeLabel = computed(() => (currentDrive.value ? currentDrive.value + ': ' : ''))
+
+/* ── 卷信息 ─────────────────────────────────────────────── */
+async function refreshVolumes() {
+  try {
+    volumes.value = (await invoke('get_volumes')) || []
+  } catch (e) {
+    volumes.value = []
+  }
+}
+
+/* ── 扫描 / 分页 ─────────────────────────────────────────── */
+async function loadPage({ record = false, force = false } = {}) {
+  if (!currentPath.value) return
+  loading.value = true
+  const t0 = performance.now()
+  try {
+    const res = await invoke('scan_directory_paged', {
+      path: currentPath.value,
+      forceRefresh: force,
+      page: page.value,
+      pageSize: pageSize.value,
+      sortColumn: sortConfig.value.column,
+      sortDirection: sortConfig.value.direction,
+      filter: filter.value.trim(),
+      recordHistory: record,
+    })
+    items.value = res.items || []
+    totalItems.value = res.totalItems || 0
+    totalSize.value = res.totalSize || 0
+    fileCount.value = res.fileCount || 0
+    dirCount.value = res.dirCount || 0
+    topFiles.value = res.topFiles || []
+    cacheSource.value = res.cacheSource || 'scan'
+    mftAvailable.value = !!res.mftAvailable
+    scanTime.value = parseFloat(((performance.now() - t0) / 1000).toFixed(2))
+    if (!items.value.some((i) => i.path === selectedItem.value?.path)) selectedItem.value = null
+  } catch (e) {
+    toasts.err('扫描失败：' + formatError(e))
+    items.value = []
+    totalItems.value = 0
+  } finally {
+    loading.value = false
+  }
+}
+
+async function scanPath(path, { force = false, record = true } = {}) {
+  const p = normalizePath((path || '').trim())
+  if (!p) {
+    toasts.warn('请输入有效路径')
+    return
+  }
+  if (record) {
+    navStack.value = navStack.value.slice(0, navIndex.value + 1)
+    navStack.value.push(p)
+    navIndex.value = navStack.value.length - 1
+  }
+  currentPath.value = p
+  page.value = 1
+  selectedItem.value = null
+  scanPhase.value = { phase: '', message: '' }
+  await loadPage({ record, force })
+  refreshVolumes()
+  loadSnapshotCount()
+  // 全局索引增量追加放后台
+  invoke('global_search_add_scan_from_cache', { path: p }).catch(() => {})
+}
+
+function navigate(path) {
+  if (!path) return
+  if (normalizePath(path) === currentPath.value && !loading.value) return
+  scanPath(path)
+}
+function goUp() {
+  const parent = getParentPath(currentPath.value)
+  if (parent && parent !== currentPath.value) navigate(parent)
+}
+function goBack() {
+  if (navIndex.value > 0) {
+    navIndex.value -= 1
+    scanPath(navStack.value[navIndex.value], { record: false })
+  }
+}
+function goForward() {
+  if (navIndex.value < navStack.value.length - 1) {
+    navIndex.value += 1
+    scanPath(navStack.value[navIndex.value], { record: false })
+  }
+}
+function refresh() {
+  loadPage({ force: false })
+}
+function forceRescan() {
+  loadPage({ force: true })
+}
+async function cancelScan() {
+  try {
+    await invoke('cancel_scan')
+    toasts.info('正在取消扫描…')
+  } catch (e) {
+    toasts.err('取消失败：' + formatError(e))
+  }
+}
+
+/* ── 排序 / 过滤 ─────────────────────────────────────────── */
+function onSort(column) {
+  if (sortConfig.value.column === column) {
+    sortConfig.value.direction = sortConfig.value.direction === 'desc' ? 'asc' : 'desc'
+  } else {
+    sortConfig.value.column = column
+    sortConfig.value.direction = column === 'name' ? 'asc' : 'desc'
+  }
+  page.value = 1
+  loadPage()
+}
+let filterTimer = null
+function onFilterInput(v) {
+  filter.value = v
+  clearTimeout(filterTimer)
+  filterTimer = setTimeout(() => {
+    page.value = 1
+    loadPage()
+  }, 220)
+}
+function changePage(p) {
+  page.value = p
+  loadPage()
+}
+function changePageSize(n) {
+  pageSize.value = n
+  page.value = 1
+  loadPage()
+}
+function searchHere(path) {
+  const name = normalizePath(path || '').split('/').filter(Boolean).pop()
+  if (!name) return
+  filter.value = `dir:${name}`
+  page.value = 1
+  loadPage()
+}
+
+/* ── 条目操作（只读：跳转 / 复制 / 打开） ─────────────────── */
+async function openItem(item) {
+  try {
+    await invoke('open_path', { path: item.path })
+  } catch (e) {
+    toasts.err('打开失败：' + formatError(e))
+  }
+}
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text)
+    toasts.ok('已复制：' + (text.length > 60 ? text.slice(0, 60) + '…' : text))
+  } catch (e) {
+    toasts.err('复制失败：' + formatError(e))
+  }
+}
+function exportCsv() {
+  if (!items.value.length) {
+    toasts.warn('当前页没有可导出的数据')
+    return
+  }
+  const esc = (s) => `"${String(s ?? '').replace(/"/g, '""')}"`
+  const lines = ['名称,大小(字节),类型,修改时间,访问时间,完整路径']
+  for (const it of items.value) {
+    lines.push([
+      esc(it.name), it.size, it.isDir ? '目录' : '文件',
+      esc(formatDateTime(it.mtime)), esc(formatDateTime(it.atime)), esc(it.path),
+    ].join(','))
+  }
+  const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = `flashdir-${(currentPath.value.split('/').pop() || 'export')}-p${page.value}.csv`
+  a.click()
+  URL.revokeObjectURL(a.href)
+  toasts.ok(`已导出当前页 ${items.value.length} 行`)
+}
+
+/* ── 右键菜单 ───────────────────────────────────────────── */
+function openContext({ item, event }) {
+  ctx.target = item
+  ctx.items = [
+    { id: 'open', label: '打开所在位置', icon: 'folder-open' },
+    { id: 'copy', label: '复制完整路径', icon: 'copy' },
+    { id: 'copyName', label: '复制文件名', icon: 'copy' },
+    { sep: true },
+    { id: 'searchHere', label: '在此目录内过滤', icon: 'filter', disabled: !item.isDir },
+    { id: 'globalSearch', label: '全局搜索同名文件', icon: 'search' },
+    { id: 'dupes', label: '检测重复文件', icon: 'dupes', disabled: item.isDir },
+    { sep: true },
+    { id: 'snapshot', label: '保存目录快照', icon: 'clock', disabled: !item.isDir },
+  ]
+  ctx.x = event.clientX
+  ctx.y = event.clientY
+  ctx.open = true
+}
+function onContextPick(id) {
+  const item = ctx.target
+  if (!item) return
+  if (id === 'open') openItem(item)
+  else if (id === 'copy') copyText(item.path)
+  else if (id === 'copyName') copyText(item.name)
+  else if (id === 'searchHere') searchHere(item.path)
+  else if (id === 'globalSearch') paletteOpen.value = true
+  else if (id === 'dupes') { dockTab.value = 'dupes'; dockVisible.value = true }
+  else if (id === 'snapshot') saveSnapshot(currentPath.value)
+}
+
+/* ── 快照 / 诊断 / 管理员 ───────────────────────────────── */
+async function loadSnapshotCount() {
+  try {
+    const list = await invoke('list_snapshots', { path: currentPath.value })
+    snapshotCount.value = (list || []).length
+  } catch (e) {
+    snapshotCount.value = 0
+  }
+}
+async function saveSnapshot(path) {
+  try {
+    await invoke('save_snapshot_from_cache', { path })
+    toasts.ok('已保存快照')
+    loadSnapshotCount()
+  } catch (e) {
+    toasts.err('保存快照失败：' + formatError(e))
+  }
+}
+async function showDiagnostics() {
+  diagnosticsOpen.value = true
+  diagnosticsText.value = '正在获取诊断信息…'
+  try {
+    diagnosticsText.value = JSON.stringify(await invoke('get_diagnostics'), null, 2)
+  } catch (e) {
+    diagnosticsText.value = '获取失败：' + formatError(e)
+  }
+}
+async function restartAsAdmin() {
+  try {
+    await invoke('restart_as_admin')
+  } catch (e) {
+    toasts.err('重启失败：' + formatError(e))
+  }
+}
+async function indexAction() {
+  try {
+    if (gs.ready.value) await gs.refreshIndex()
+    else await gs.ensureIndex()
+    toasts.ok('已触发索引构建/刷新')
+  } catch (e) {
+    toasts.err('索引操作失败：' + formatError(e))
+  }
+}
+
+/* ── 命令面板 ───────────────────────────────────────────── */
+const commands = computed(() => [
+  { id: 'scan', label: '扫描当前目录（强制刷新）', icon: 'scan', keywords: 'scan rescan', shortcut: 'Enter' },
+  { id: 'refresh', label: '刷新（USN 快路径）', icon: 'refresh', keywords: 'refresh usn', shortcut: 'F5' },
+  { id: 'force', label: '强制全量重扫（忽略缓存）', icon: 'zap', keywords: 'force full', shortcut: 'Ctrl+Shift+R' },
+  { id: 'cancel', label: '取消当前扫描', icon: 'xc', keywords: 'cancel stop', shortcut: 'Esc' },
+  { id: 'up', label: '上一级目录', icon: 'up', keywords: 'up parent', shortcut: 'Backspace' },
+  { id: 'index', label: gs.ready.value ? '刷新全局索引' : '建立全局索引', icon: 'search', keywords: 'index global' },
+  { id: 'snapshot', label: '保存当前目录快照', icon: 'clock', keywords: 'snapshot save' },
+  { id: 'dupes', label: '重复文件检测', icon: 'dupes', keywords: 'duplicate same' },
+  { id: 'dev', label: '开发缓存分析', icon: 'dev', keywords: 'node_modules target cache' },
+  { id: 'map', label: '体积构成（热图）', icon: 'grid', keywords: 'treemap map' },
+  { id: 'export', label: '导出当前页 CSV', icon: 'tray', keywords: 'export csv' },
+  { id: 'theme', label: '切换主题（跟随系统 / 深色 / 浅色）', icon: 'sun', keywords: 'theme dark light' },
+  { id: 'diagnostics', label: '运行诊断', icon: 'info', keywords: 'diagnostics debug' },
+  { id: 'admin', label: '以管理员重启（启用 MFT / USN）', icon: 'shield', keywords: 'admin elevate mft' },
+  { id: 'about', label: '关于 FlashDir', icon: 'info', keywords: 'about version' },
+])
+function runCommand(id) {
+  const map = {
+    scan: () => loadPage({ record: true, force: true }),
+    refresh: () => refresh(),
+    force: () => forceRescan(),
+    cancel: () => cancelScan(),
+    up: () => goUp(),
+    index: () => indexAction(),
+    snapshot: () => saveSnapshot(currentPath.value),
+    dupes: () => { dockTab.value = 'dupes'; dockVisible.value = true },
+    dev: () => { dockTab.value = 'dev'; dockVisible.value = true },
+    map: () => { dockTab.value = 'map'; dockVisible.value = true },
+    export: () => exportCsv(),
+    theme: () => cycleTheme(),
+    diagnostics: () => showDiagnostics(),
+    admin: () => restartAsAdmin(),
+    about: () => { aboutOpen.value = true },
+  }
+  map[id]?.()
+}
+
+/* ── 键盘 ───────────────────────────────────────────────── */
+const dockTabs = ['map', 'big', 'dupes', 'snapshot', 'dev']
+function onKeydown(e) {
+  const mod = e.ctrlKey || e.metaKey
+  const inInput = ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)
+
+  if (mod && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); paletteOpen.value = true; return }
+  if (e.key === 'Escape') {
+    if (paletteOpen.value) { paletteOpen.value = false; return }
+    if (diagnosticsOpen.value) { diagnosticsOpen.value = false; return }
+    if (aboutOpen.value) { aboutOpen.value = false; return }
+    if (ctx.open) { ctx.open = false; return }
+    if (loading.value) { cancelScan(); return }
+    return
+  }
+  if (inInput) return
+
+  if (mod && e.shiftKey && (e.key === 'R' || e.key === 'r')) { e.preventDefault(); forceRescan(); return }
+  if (e.key === 'F5') { e.preventDefault(); refresh(); return }
+  if (mod && (e.key === 'f' || e.key === 'F')) {
+    e.preventDefault()
+    document.querySelector('.filter-box input')?.focus()
+    return
+  }
+  if (mod && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); treeVisible.value = !treeVisible.value; return }
+  if (mod && (e.key === 'j' || e.key === 'J')) { e.preventDefault(); dockVisible.value = !dockVisible.value; return }
+  if (mod && (e.key === 'i' || e.key === 'I')) { e.preventDefault(); inspVisible.value = !inspVisible.value; return }
+  if (mod && /^[1-5]$/.test(e.key)) {
+    e.preventDefault()
+    dockVisible.value = true
+    dockTab.value = dockTabs[Number(e.key) - 1]
+  }
+}
+
+/* ── 生命周期 ───────────────────────────────────────────── */
+let unlistenPhase = null
+async function loadHistory() {
+  try { history.value = (await invoke('get_history_summary')) || [] } catch (e) { history.value = [] }
+}
+
+onMounted(async () => {
+  document.addEventListener('keydown', onKeydown)
+  unlistenPhase = await listen('scan-phase', (ev) => { scanPhase.value = ev.payload || { phase: '', message: '' } })
+  refreshVolumes()
+  loadHistory()
+  try { isAdmin.value = await invoke('is_admin') } catch (e) { isAdmin.value = false }
+})
+
+onUnmounted(() => {
+  document.removeEventListener('keydown', onKeydown)
+  if (unlistenPhase) unlistenPhase()
+})
+
+watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
+</script>
+
 <template>
-  <div class="fd-app" :class="{ 'fd-sidebar-collapsed': sidebarCollapsed }">
+  <svg style="display:none" aria-hidden="true">
+    <symbol id="i-drive" viewBox="0 0 16 16"><rect x="1.5" y="3.5" width="13" height="9" rx="1"/><path d="M1.5 9.5h13"/><circle cx="12" cy="11.5" r=".7"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 16 16"><path d="M1.5 3.5h4l1.2 1.5h7.8v7.5h-13z"/></symbol>
+    <symbol id="i-folder-open" viewBox="0 0 16 16"><path d="M1.5 3.5h4l1.2 1.5h6.8v2"/><path d="M1.5 5.5h13l-1.6 7h-11.4z"/></symbol>
+    <symbol id="i-file" viewBox="0 0 16 16"><path d="M3.5 1.5h6l3 3v10h-9z"/><path d="M9.5 1.5v3h3"/></symbol>
+    <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5L14 14"/></symbol>
+    <symbol id="i-scan" viewBox="0 0 16 16"><path d="M2 8a6 6 0 0 1 12 0"/><path d="M8 8l3.5-3.5"/><circle cx="8" cy="8" r="1"/></symbol>
+    <symbol id="i-zap" viewBox="0 0 16 16"><path d="M9 1.5L3.5 9h4L7 14.5 12.5 7h-4z"/></symbol>
+    <symbol id="i-x" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+    <symbol id="i-xc" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M5.8 5.8l4.4 4.4M10.2 5.8l-4.4 4.4"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 16 16"><path d="M13.5 8a5.5 5.5 0 1 1-1.8-4.1"/><path d="M13.5 2v3.5H10"/></symbol>
+    <symbol id="i-filter" viewBox="0 0 16 16"><path d="M2 4h12M4.5 8h7M6.5 12h3"/></symbol>
+    <symbol id="i-right" viewBox="0 0 16 16"><path d="M6 3.5L10.5 8 6 12.5"/></symbol>
+    <symbol id="i-left" viewBox="0 0 16 16"><path d="M10 3.5L5.5 8 10 12.5"/></symbol>
+    <symbol id="i-down" viewBox="0 0 16 16"><path d="M3.5 6L8 10.5 12.5 6"/></symbol>
+    <symbol id="i-up" viewBox="0 0 16 16"><path d="M3.5 10L8 5.5 12.5 10"/></symbol>
+    <symbol id="i-grid" viewBox="0 0 16 16"><rect x="2" y="2" width="5" height="5"/><rect x="9" y="2" width="5" height="3"/><rect x="2" y="9" width="5" height="5"/><rect x="9" y="7" width="5" height="7"/></symbol>
+    <symbol id="i-diff" viewBox="0 0 16 16"><path d="M4 2.5v11M12 2.5v11M4 6h3M9 10h3"/></symbol>
+    <symbol id="i-dupes" viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="8" height="8"/><path d="M5.5 13.5h8v-8"/></symbol>
+    <symbol id="i-dev" viewBox="0 0 16 16"><path d="M6 3.5L2.5 8 6 12.5M10 3.5L13.5 8 10 12.5"/></symbol>
+    <symbol id="i-cog" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M12.4 3.6l-1.1 1.1M4.7 11.3l-1.1 1.1"/></symbol>
+    <symbol id="i-tray" viewBox="0 0 16 16"><path d="M8 2v7.5M5 6.5L8 9.5l3-3M2.5 13.5h11"/></symbol>
+    <symbol id="i-info" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 7v4M8 5.2v.6"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 16 16"><path d="M8 1.8l5 2v4c0 3-2.2 5.4-5 6.4-2.8-1-5-3.4-5-6.4v-4z"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8"/><path d="M2.5 10.5v-8h8"/></symbol>
+    <symbol id="i-pencil" viewBox="0 0 16 16"><path d="M11 2.5l2.5 2.5L6 12.5 2.5 13.5 3.5 10z"/></symbol>
+    <symbol id="i-check" viewBox="0 0 16 16"><path d="M3 8.5l3.5 3.5L13 5"/></symbol>
+    <symbol id="i-warn" viewBox="0 0 16 16"><path d="M8 2.5l6 11H2z"/><path d="M8 6.5v3.5M8 11.6v.4"/></symbol>
+    <symbol id="i-tree" viewBox="0 0 16 16"><path d="M3 3h5M3 3v9h5M6 7.5h4M6 12h4"/></symbol>
+    <symbol id="i-panel" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10"/><path d="M10 3v10"/></symbol>
+    <symbol id="i-dock" viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10"/><path d="M2 9.5h12"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.5 3.5l1.1 1.1M11.4 11.4l1.1 1.1M12.5 3.5l-1.1 1.1M4.6 11.4l-1.1 1.1"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 16 16"><path d="M13 10.5A5.5 5.5 0 0 1 5.5 3a5.5 5.5 0 1 0 7.5 7.5z"/></symbol>
+    <symbol id="i-auto" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 2v12"/><path d="M8 2a6 6 0 0 1 0 12z" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-min" viewBox="0 0 16 16"><path d="M3 8h10"/></symbol>
+    <symbol id="i-max" viewBox="0 0 16 16"><rect x="3.5" y="3.5" width="9" height="9"/></symbol>
+  </svg>
+
+  <div class="fd-app" :class="{ 'no-dock': !dockVisible }">
+    <TitleBar
+      :volumes="volumes"
+      :current-drive="currentDrive"
+      :theme="themeMode"
+      :tree-visible="treeVisible"
+      :insp-visible="inspVisible"
+      :dock-visible="dockVisible"
+      @pick-volume="navigate($event.letter + ':/')"
+      @command="paletteOpen = true"
+      @cycle-theme="cycleTheme"
+      @toggle-tree="treeVisible = !treeVisible"
+      @toggle-insp="inspVisible = !inspVisible"
+      @toggle-dock="dockVisible = !dockVisible"
+    />
+
     <Toolbar
-      ref="toolbarRef"
       :path="currentPath"
-      :can-go-back="canGoBack"
-      :can-go-forward="canGoForward"
-      :can-go-up="canGoUp"
       :loading="loading"
-      @scan="handleScan"
-      @force-scan="handleForceRescan"
-      @cancel-scan="handleCancelScan"
-      @browse="handleBrowse"
-      @navigate="handleNavigate"
-      @show-history="historyVisible = true"
-      @show-about="aboutVisible = true"
-      @show-diagnostics="openDiagnostics"
-      @open-dir="handleOpenDirFromSearch"
-      @toggle-sidebar="sidebarCollapsed = !sidebarCollapsed"
+      :filter="filter"
+      :hits="totalItems"
+      :total-items="totalItems"
+      :total-size="totalSize"
+      :view="view"
+      :can-back="navIndex > 0"
+      :can-forward="navIndex < navStack.length - 1"
+      :can-up="!!currentPath && getParentPath(currentPath) !== currentPath"
+      @scan="scanPath($event)"
+      @force-scan="forceRescan"
+      @cancel-scan="cancelScan"
+      @refresh="refresh"
+      @navigate="navigate"
+      @update:filter="onFilterInput"
+      @update:view="view = $event"
+      @export="exportCsv"
+      @up="goUp"
+      @back="goBack"
+      @forward="goForward"
     />
 
-    <Sidebar
-      :tree-data="treeData"
-      :selected-path="currentPath"
-      :history="history"
-      :collapsed="sidebarCollapsed"
-      :tree-key="treeKey"
-      @select="handleSelectPath"
-      @quick-access="handleQuickAccess"
-      @load-children="handleLoadTreeChildren"
-      @collapse-tree="handleCollapseTree"
-    />
+    <div v-if="loading && (scanPhase.message || scanPhase.phase)" class="scan-strip">
+      <span class="dot warn" />
+      <span>{{ scanPhase.message || scanPhase.phase }}</span>
+      <span class="track">
+        <i :class="{ indet: typeof scanPhase.progress !== 'number' }" :style="typeof scanPhase.progress === 'number' ? { width: Math.min(100, Math.max(2, scanPhase.progress * 100)) + '%' } : {}" />
+      </span>
+      <button class="btn ghost" style="height:18px" @click="cancelScan">取消</button>
+    </div>
 
-    <main class="fd-main">
-      <FileList
-        :items="pageItems"
-        :loading="loading"
-        :total-size="totalSize"
-        :current-path="currentPath"
-        :sort-config="sortConfig"
-        :current-page="currentPage"
-        :page-size="pageSize"
-        :total-items="totalItems"
-        @sort="handleSort"
-        @select="handleSelectItem"
-        @page-change="handlePageChange"
-        @size-change="handleSizeChange"
-        @filter="handleSearchInput"
+    <div class="fd-body" :class="{ 'tree-collapsed': !treeVisible, 'insp-collapsed': !inspVisible }">
+      <DirTree
+        v-if="treeVisible"
+        :root-path="currentPath"
+        :selected-path="currentPath"
+        :volumes="volumes"
+        :history="history"
+        @navigate="navigate"
+        @error="toasts.err($event)"
       />
-    </main>
 
-    <RightPanel
-      :items="pageItems"
+      <FileTable
+        v-if="view === 'list'"
+        :items="items"
+        :total-size="totalSize"
+        :parent-total="parentTotal"
+        :total-items="totalItems"
+        :loading="loading"
+        :sort-config="sortConfig"
+        :page="page"
+        :page-size="pageSize"
+        :filter="filter"
+        :selected-path="selectedItem?.path || ''"
+        @sort="onSort"
+        @select="selectedItem = $event"
+        @open="openItem"
+        @context="openContext"
+        @page-change="changePage"
+        @page-size-change="changePageSize"
+        @up="goUp"
+      />
+
+      <div v-else class="table-wrap" style="padding:10px;overflow:auto">
+        <Treemap :items="items" :total="totalSize" @navigate="navigate" />
+      </div>
+
+      <Inspector
+        v-if="inspVisible"
+        :item="selectedItem"
+        :parent-path="currentPath"
+        :parent-total="parentTotal"
+        :top-files="topFiles"
+        :access-reliable="true"
+        :cache-source="cacheSource"
+        :mft-available="mftAvailable"
+        :snapshot-count="snapshotCount"
+        @open="openItem"
+        @copy="copyText"
+        @search-here="searchHere"
+        @duplicates="dockTab = 'dupes'; dockVisible = true"
+        @snapshot="saveSnapshot"
+      />
+    </div>
+
+    <InsightDock
+      v-if="dockVisible"
+      :tab="dockTab"
+      :items="items"
+      :top-files="topFiles"
       :total-size="totalSize"
       :current-path="currentPath"
-      :active-tab="rightPanelTab"
-      :scan-time="scanTime"
-      :file-count="fileCount"
-      :dir-count="dirCount"
-      :top-files="topFiles"
-      @update:active-tab="rightPanelTab = $event"
+      @update:tab="dockTab = $event"
+      @navigate="navigate"
+      @open="openItem"
+      @refresh="loadPage"
     />
 
     <StatusBar
       :path="currentPath"
       :total-items="totalItems"
       :total-size="totalSize"
+      :file-count="fileCount"
+      :dir-count="dirCount"
       :scan-time="scanTime"
-      :backend-time="backendTime"
-      :loading="loading"
+      :cache-source="cacheSource"
       :mft-available="mftAvailable"
       :is-admin="isAdmin"
-      :global-search-loading="globalSearchLoading"
-      :global-search-failed="globalSearchFailed"
-      :global-search-status="globalSearchStatusText"
-      :scan-phase="scanPhase"
+      :index-count="gs.indexMeta.value ? (gs.indexMeta.value.fileCount || 0) + (gs.indexMeta.value.dirCount || 0) : 0"
+      :index-partial="!!gs.indexMeta.value?.partial"
+      :usn-verified="usnVerified"
+      :filter="filter"
+      :selected="selectedItem"
+      @restart-admin="restartAsAdmin"
+      @index-action="indexAction"
+      @diagnostics="showDiagnostics"
     />
 
-    <a-modal
-      :open="historyVisible"
-      title="历史记录"
-      width="800px"
-      :footer="null"
-      @cancel="historyVisible = false"
-    >
-      <HistoryList
-        :history="history"
-        @select="handleSelectHistory"
-        @clear="handleClearHistory"
-      />
-    </a-modal>
+    <CommandPalette
+      :open="paletteOpen"
+      :commands="commands"
+      :index-count="gs.indexMeta.value ? (gs.indexMeta.value.fileCount || 0) + (gs.indexMeta.value.dirCount || 0) : 0"
+      :index-partial="!!gs.indexMeta.value?.partial"
+      :scope="scopeLabel"
+      @close="paletteOpen = false"
+      @run="runCommand"
+      @open-path="(p) => invoke('open_path', { path: p }).catch((e) => toasts.err('打开失败：' + formatError(e)))"
+      @navigate="navigate"
+    />
 
-    <a-modal
-      :open="diagnosticsVisible"
-      title="运行诊断"
-      width="760px"
-      :footer="null"
-      @cancel="diagnosticsVisible = false"
-    >
-      <pre class="diagnostics-pre">{{ diagnosticsText || '正在获取诊断信息…' }}</pre>
-    </a-modal>
+    <ContextMenu :open="ctx.open" :x="ctx.x" :y="ctx.y" :items="ctx.items" @close="ctx.open = false" @pick="onContextPick" />
 
-    <a-modal
-      :open="aboutVisible"
-      title="关于 FlashDir"
-      width="520px"
-      :footer="null"
-      @cancel="aboutVisible = false"
-    >
-      <div class="about-card">
-        <div class="about-logo">
-          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" width="48" height="48"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.6" d="M4 4h6l2 2h8a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2V6a2 2 0 012-2z"/><path d="M2 10h20"/></svg>
-        </div>
-        <div class="about-title">FlashDir</div>
-        <div class="about-subtitle">磁盘可观测性平台 · v3.4.2</div>
-        <p class="about-desc">
-          FlashDir 是一款面向 Windows 的磁盘空间分析与可观测性工具：MFT 直读扫描、
-          USN 增量刷新、开发者目录分析、快照对比、重复文件检测与跨盘全局文件搜索。
-        </p>
-        <div class="about-meta">
-          <span>本地优先 · 无遥测 · Apache-2.0</span>
-          <a href="https://github.com/BlkSword/FlashDir" target="_blank">GitHub</a>
+    <UiModal :open="diagnosticsOpen" title="运行诊断" width="820px" @close="diagnosticsOpen = false">
+      <pre class="mono-block">{{ diagnosticsText }}</pre>
+    </UiModal>
+
+    <UiModal :open="aboutOpen" title="关于 FlashDir" width="560px" @close="aboutOpen = false">
+      <div style="display:flex;gap:12px;align-items:flex-start">
+        <Icon name="drive" :size="28" style="color:var(--accent)" />
+        <div>
+          <div style="font-weight:600;margin-bottom:4px">FlashDir · 磁盘可观测性</div>
+          <p class="section-note" style="margin:0 0 8px">
+            MFT 直读扫描、USN 增量刷新、快照对比、重复文件检测、开发缓存分析与跨盘全局搜索。
+            扫描全程只读，不修改、不删除任何文件。
+          </p>
+          <div class="section-note">
+            快捷键：<kbd>Ctrl</kbd>+<kbd>K</kbd> 命令与文件搜索 ·
+            <kbd>Ctrl</kbd>+<kbd>F</kbd> 过滤 ·
+            <kbd>F5</kbd> 增量刷新 ·
+            <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> 强制全量 ·
+            <kbd>Ctrl</kbd>+<kbd>B</kbd>/<kbd>J</kbd>/<kbd>I</kbd> 面板开关 ·
+            <kbd>Ctrl</kbd>+<kbd>1..5</kbd> 洞察标签
+          </div>
         </div>
       </div>
-    </a-modal>
+    </UiModal>
+
+    <Toasts />
   </div>
 </template>
-
-<script setup>
-import { ref, computed, watch, onMounted, onUnmounted, shallowRef } from 'vue'
-import { message } from 'ant-design-vue'
-import { listen } from '@tauri-apps/api/event'
-import Toolbar from './components/Toolbar.vue'
-import Sidebar from './components/Sidebar.vue'
-import FileList from './components/FileList.vue'
-import RightPanel from './components/RightPanel.vue'
-import StatusBar from './components/StatusBar.vue'
-import HistoryList from './components/HistoryList.vue'
-import { useTauri } from './composables/useTauri'
-import { useGlobalSearch } from './composables/useGlobalSearch'
-import { debounce, getParentPath, formatError } from './utils/format.js'
-import { homeDir, join } from '@tauri-apps/api/path'
-
-const { invoke, openDialog } = useTauri()
-
-const scanPhase = ref({ phase: '', message: '' })
-let unlistenScanPhase = null
-
-const currentPath = ref('')
-const pageItems = shallowRef([])
-const totalItems = ref(0)
-const totalSize = ref(0)
-const fileCount = ref(0)
-const dirCount = ref(0)
-const topFiles = ref([])
-const loading = ref(false)
-const scanTime = ref(0)
-const backendTime = ref(0)
-const treeData = shallowRef([])
-const treeKey = ref(0)
-const history = shallowRef([])
-const mftAvailable = ref(false)
-const isAdmin = ref(false)
-
-const navigationHistory = ref([])
-const navigationIndex = ref(-1)
-
-const currentPage = ref(1)
-const pageSize = ref(100)
-const sortConfig = ref({ column: 'size', direction: 'desc' })
-const searchKeyword = ref('')
-
-const historyVisible = ref(false)
-const aboutVisible = ref(false)
-const diagnosticsVisible = ref(false)
-const diagnosticsText = ref('')
-const toolbarRef = ref(null)
-const rightPanelTab = ref('stats')
-const sidebarCollapsed = ref(false)
-
-const { loading: globalSearchLoading, failed: globalSearchFailed, statusText: globalSearchStatusText } = useGlobalSearch()
-
-const canGoBack = computed(() => navigationIndex.value > 0)
-const canGoForward = computed(() => navigationIndex.value < navigationHistory.value.length - 1)
-const canGoUp = computed(() => {
-  if (!currentPath.value) return false
-  const parts = currentPath.value.split(/[/\\]/)
-  return parts.length > 1
-})
-
-const loadPage = async () => {
-  if (!currentPath.value) return
-  loading.value = true
-  try {
-    const result = await invoke('scan_directory_paged', {
-      path: currentPath.value,
-      forceRefresh: false,
-      page: currentPage.value,
-      pageSize: pageSize.value,
-      sortColumn: sortConfig.value.column,
-      sortDirection: sortConfig.value.direction,
-      filter: searchKeyword.value.trim(),
-      // 分页/排序/过滤请求不写入历史记录
-      recordHistory: false,
-    })
-
-    pageItems.value = result.items || []
-    totalItems.value = result.totalItems || 0
-    totalSize.value = result.totalSize || 0
-    fileCount.value = result.fileCount || 0
-    dirCount.value = result.dirCount || 0
-    topFiles.value = result.topFiles || []
-    backendTime.value = typeof result.scanTime === 'number' ? result.scanTime : 0
-    mftAvailable.value = !!result.mftAvailable
-  } catch (error) {
-    console.error('加载分页失败:', error)
-    message.error('加载分页失败: ' + formatError(error))
-  } finally {
-    loading.value = false
-  }
-}
-
-const buildTreeData = async () => {
-  if (!currentPath.value) {
-    treeData.value = []
-    return
-  }
-  try {
-    const children = await invoke('get_dir_children', { path: currentPath.value })
-    treeData.value = (children || []).map(item => ({
-      key: item.path,
-      title: item.name,
-      size: item.size,
-      sizeFormatted: item.sizeFormatted,
-      isLeaf: false,
-      loaded: false,
-      children: [],
-    }))
-  } catch (error) {
-    console.error('加载目录树失败:', error)
-    treeData.value = []
-  }
-}
-
-const handleCollapseTree = () => {
-  treeData.value = treeData.value.map(node => ({ ...node, loaded: false, children: [] }))
-  treeKey.value += 1
-}
-
-const handleLoadTreeChildren = async (node) => {
-  try {
-    const children = await invoke('get_dir_children', { path: node.key })
-    const childNodes = (children || []).map(item => ({
-      key: item.path,
-      title: item.name,
-      size: item.size,
-      sizeFormatted: item.sizeFormatted,
-      isLeaf: false,
-      loaded: false,
-      children: [],
-    }))
-    node.children = childNodes
-    node.loaded = true
-    treeData.value = JSON.parse(JSON.stringify(treeData.value))
-  } catch (error) {
-    console.error('展开目录失败:', error)
-  }
-}
-
-const handleScan = async (path, addToHistory = true, forceRefresh = false) => {
-  if (!path || path.trim() === '') {
-    message.warning('请输入有效的目录路径')
-    return
-  }
-
-  loading.value = true
-  scanTime.value = 0
-  backendTime.value = 0
-  totalSize.value = 0
-  pageItems.value = []
-  treeData.value = []
-  currentPage.value = 1
-  scanPhase.value = { phase: '', message: '' }
-
-  const fullStartTime = performance.now()
-
-  try {
-    currentPath.value = path
-
-    const result = await invoke('scan_directory_paged', {
-      path: path.trim(),
-      forceRefresh,
-      page: 1,
-      pageSize: pageSize.value,
-      sortColumn: sortConfig.value.column,
-      sortDirection: sortConfig.value.direction,
-      filter: searchKeyword.value.trim(),
-      // 用户主动扫描 → 记录历史
-      recordHistory: true,
-    })
-
-    pageItems.value = result.items || []
-    totalItems.value = result.totalItems || 0
-    totalSize.value = result.totalSize || 0
-    fileCount.value = result.fileCount || 0
-    dirCount.value = result.dirCount || 0
-    topFiles.value = result.topFiles || []
-    backendTime.value = typeof result.scanTime === 'number' ? result.scanTime : 0
-    mftAvailable.value = !!result.mftAvailable
-
-    const fullEndTime = performance.now()
-    scanTime.value = parseFloat(((fullEndTime - fullStartTime) / 1000).toFixed(2))
-
-    await buildTreeData()
-
-    if (addToHistory) {
-      navigationHistory.value = navigationHistory.value.slice(0, navigationIndex.value + 1)
-      navigationHistory.value.push(path)
-      navigationIndex.value = navigationHistory.value.length - 1
-    }
-
-    // 全局索引追加放到后台，不阻塞 UI
-    invoke('global_search_add_scan_from_cache', { path: path.trim() }).catch(() => {})
-
-    message.success(`扫描完成 (总计: ${scanTime.value}s，找到 ${totalItems.value.toLocaleString()} 个项目)`)
-  } catch (error) {
-    console.error('扫描失败:', error)
-    message.error('扫描失败: ' + formatError(error))
-  } finally {
-    loading.value = false
-    scanPhase.value = { phase: '', message: '' }
-  }
-}
-
-// 忽略所有缓存（内存/磁盘/USN），强制全量重扫当前目录
-const handleForceRescan = async () => {
-  if (!currentPath.value) return
-  await handleScan(currentPath.value, true, true)
-}
-
-const handleSearchInput = debounce((keyword) => {
-  searchKeyword.value = keyword
-  currentPage.value = 1
-  loadPage()
-}, 250)
-
-const handleSort = (column, direction) => {
-  let newDirection = direction
-  if (!newDirection) {
-    newDirection = sortConfig.value.column === column
-      ? (sortConfig.value.direction === 'asc' ? 'desc' : 'asc')
-      : (column === 'name' ? 'asc' : 'desc')
-  }
-  sortConfig.value.column = column
-  sortConfig.value.direction = newDirection
-  currentPage.value = 1
-  loadPage()
-}
-
-const handlePageChange = (page) => {
-  currentPage.value = page
-  loadPage()
-}
-
-const handleSizeChange = (current, size) => {
-  pageSize.value = size
-  currentPage.value = current
-  loadPage()
-}
-
-const handleNavigate = async (direction) => {
-  if (direction === 'back' && canGoBack.value) {
-    navigationIndex.value--
-    const path = navigationHistory.value[navigationIndex.value]
-    await handleScan(path, false)
-  } else if (direction === 'forward' && canGoForward.value) {
-    navigationIndex.value++
-    const path = navigationHistory.value[navigationIndex.value]
-    await handleScan(path, false)
-  } else if (direction === 'up' && canGoUp.value) {
-    const parentPath = getParentPath(currentPath.value)
-    if (parentPath && parentPath !== currentPath.value) {
-      await handleScan(parentPath)
-    }
-  }
-}
-
-const handleBrowse = async () => {
-  try {
-    const selected = await openDialog({ title: '选择要扫描的目录', multiple: false, directory: true })
-    if (selected) await handleScan(selected)
-  } catch (error) {
-    message.error('选择目录失败: ' + formatError(error))
-  }
-}
-
-const handleSelectPath = async (path) => {
-  if (!path) return
-  try {
-    const isDir = await invoke('is_directory', { path })
-    if (isDir) await handleScan(path)
-    else await invoke('open_path', { path })
-  } catch (error) {
-    message.error('选择路径失败: ' + formatError(error))
-  }
-}
-
-const handleSelectItem = async (item) => {
-  if (!item) return
-  if (item.isDir) await handleScan(item.path)
-  else {
-    try { await invoke('open_path', { path: item.path }) } catch (error) { message.error('打开文件失败: ' + formatError(error)) }
-  }
-}
-
-const handleQuickAccess = async (action) => {
-  if (action === 'computer') { await handleBrowse(); return }
-  try {
-    const home = await homeDir()
-    let target = home
-    if (action === 'downloads') target = await join(home, 'Downloads')
-    else if (action === 'desktop') target = await join(home, 'Desktop')
-    await handleScan(target)
-  } catch (error) { message.error('快速访问失败: ' + formatError(error)) }
-}
-
-const handleSelectHistory = async (path) => {
-  historyVisible.value = false
-  await handleScan(path)
-}
-
-const handleClearHistory = async () => {
-  try {
-    await invoke('clear_history')
-    history.value = []
-    message.success('历史记录已清除')
-  } catch (error) { message.error('清除历史记录失败: ' + formatError(error)) }
-}
-
-const handleOpenDirFromSearch = (path) => {
-  if (path) handleScan(path)
-}
-
-const loadHistory = async () => {
-  try {
-    history.value = await invoke('get_history_summary') || []
-  } catch (error) { console.error('加载历史记录失败:', error) }
-}
-
-const openDiagnostics = async () => {
-  diagnosticsVisible.value = true
-  diagnosticsText.value = ''
-  try {
-    diagnosticsText.value = JSON.stringify(await invoke('get_diagnostics'), null, 2)
-  } catch (error) {
-    diagnosticsText.value = '获取诊断信息失败: ' + formatError(error)
-  }
-}
-
-const handleCancelScan = async () => {
-  try { await invoke('cancel_scan'); message.info('正在取消扫描…') } catch (error) { console.error('取消失败:', error) }
-}
-
-const onGlobalSearchKeydown = (e) => {
-  if ((e.ctrlKey || e.metaKey) && (e.key === 'k' || e.key === 'K')) {
-    e.preventDefault()
-    toolbarRef.value?.focusGlobalSearch?.()
-  }
-}
-
-onMounted(async () => {
-  loadHistory()
-  document.addEventListener('keydown', onGlobalSearchKeydown)
-
-  unlistenScanPhase = await listen('scan-phase', (event) => {
-    scanPhase.value = event.payload || { phase: '', message: '' }
-  })
-
-  try { isAdmin.value = await invoke('is_admin') } catch { isAdmin.value = false }
-})
-
-onUnmounted(() => {
-  if (unlistenScanPhase) { unlistenScanPhase(); unlistenScanPhase = null }
-  document.removeEventListener('keydown', onGlobalSearchKeydown)
-})
-
-watch(historyVisible, (isOpen) => { if (isOpen) loadHistory() })
-</script>
-
-<style scoped>
-.fd-app {
-  display: grid;
-  grid-template-rows: 56px 1fr 28px;
-  grid-template-columns: 240px 1fr 360px;
-  height: 100vh;
-  background: var(--fd-bg-0);
-  color: var(--fd-text-1);
-}
-.fd-app.fd-sidebar-collapsed {
-  grid-template-columns: 0px 1fr 360px;
-}
-.fd-main {
-  grid-row: 2 / 3;
-  grid-column: 2 / 3;
-  display: flex;
-  flex-direction: column;
-  background: var(--fd-bg-0);
-  min-width: 0;
-  overflow: hidden;
-}
-.diagnostics-pre {
-  max-height: 60vh;
-  overflow: auto;
-  background: var(--fd-bg-0);
-  color: var(--fd-text-0);
-  border: 1px solid var(--fd-border);
-  border-radius: 6px;
-  padding: 12px;
-  font-size: 12px;
-  font-family: Consolas, 'JetBrains Mono', monospace;
-  white-space: pre-wrap;
-  word-break: break-all;
-}
-.about-card {
-  text-align: center;
-  padding: 12px 8px;
-}
-.about-logo {
-  width: 64px;
-  height: 64px;
-  margin: 0 auto 12px;
-  border-radius: 16px;
-  background: var(--fd-accent);
-  color: #fff;
-  display: grid;
-  place-items: center;
-}
-.about-title {
-  font-size: 20px;
-  font-weight: 700;
-  color: var(--fd-text-0);
-}
-.about-subtitle {
-  font-size: 12px;
-  color: var(--fd-text-2);
-  margin: 4px 0 12px;
-}
-.about-desc {
-  font-size: 13px;
-  color: var(--fd-text-1);
-  line-height: 1.7;
-  max-width: 420px;
-  margin: 0 auto 16px;
-}
-.about-meta {
-  display: flex;
-  justify-content: center;
-  gap: 16px;
-  font-size: 12px;
-  color: var(--fd-text-2);
-}
-.about-meta a {
-  color: var(--fd-accent);
-  text-decoration: none;
-}
-</style>

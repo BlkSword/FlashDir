@@ -3,30 +3,13 @@
     <div class="snapshot-panel-content">
       <!-- 操作区 -->
       <div class="snapshot-actions">
-        <a-button
-          type="primary"
-          size="small"
-          :loading="saving"
-          :disabled="!props.items || props.items.length === 0"
-          @click="handleSaveSnapshot"
-        >
-          保存当前快照
-        </a-button>
-        <a-button
-          size="small"
-          :disabled="snapshots.length < 2"
-          @click="handleQuickCompare"
-        >
-          对比最近两次
-        </a-button>
-        <a-button
-          size="small"
-          :loading="comparingLatest"
-          :disabled="snapshots.length === 0 || !props.currentPath"
-          @click="handleCompareLatest"
-        >
-          对比当前
-        </a-button>
+        <button class="btn primary" :disabled="saving || !props.items || props.items.length === 0" @click="handleSaveSnapshot">
+          <span v-if="saving" class="spinner" />保存当前快照
+        </button>
+        <button class="btn" :disabled="snapshots.length < 2" @click="handleQuickCompare">对比最近两次</button>
+        <button class="btn" :disabled="comparingLatest || snapshots.length === 0 || !props.currentPath" @click="handleCompareLatest">
+          <span v-if="comparingLatest" class="spinner" />对比当前
+        </button>
       </div>
 
       <!-- 快照列表 -->
@@ -66,12 +49,7 @@
             <div class="snapshot-time">{{ formatTime(snap.scanTime * 1000) }}</div>
           </div>
           <div class="snapshot-action">
-            <a-button
-              type="link"
-              size="small"
-              danger
-              @click.stop="handleDelete(snap.id)"
-            >删除</a-button>
+            <button class="chip" @click.stop="handleDelete(snap.id)">删除</button>
           </div>
         </div>
       </div>
@@ -83,9 +61,9 @@
 
       <!-- 比较按钮 -->
       <div class="snapshot-compare-bar" v-if="selectedIds.length === 2">
-        <a-button type="primary" size="small" @click="handleCompare" :loading="comparing">
-          对比所选快照 ({{ selectedIds.length }})
-        </a-button>
+        <button class="btn primary" :disabled="comparing" @click="handleCompare">
+          <span v-if="comparing" class="spinner" />对比所选快照 ({{ selectedIds.length }})
+        </button>
       </div>
 
       <!-- 差异结果 -->
@@ -201,11 +179,13 @@
 
 <script setup>
 import { ref, watch, onMounted } from 'vue'
-import { message } from 'ant-design-vue'
+import { useToasts } from '../composables/useToasts.js'
 import { useTauri } from '../composables/useTauri'
 import { formatSize, formatTime, formatError } from '../utils/format.js'
 
 const { invoke } = useTauri()
+
+const toasts = useToasts()
 
 const props = defineProps({
   items: { type: Array, default: () => [] },
@@ -258,7 +238,7 @@ const toggleSelect = (id) => {
 
 const handleSaveSnapshot = async () => {
   if (!props.items || props.items.length === 0) {
-    message.warning('请先扫描目录')
+    toasts.warn('请先扫描目录')
     return
   }
   saving.value = true
@@ -267,10 +247,10 @@ const handleSaveSnapshot = async () => {
     // 旧实现会在缓存缺失时把"当前分页的 100 条"当作全量快照回传，
     // 生成残缺但看起来正常的快照。这里直接报错，要求重新扫描。
     await invoke('save_snapshot_from_cache', { path: props.currentPath })
-    message.success('快照已保存')
+    toasts.ok('快照已保存')
     await loadSnapshots()
   } catch (error) {
-    message.error('保存快照失败: ' + formatError(error))
+    toasts.err('保存快照失败: ' + formatError(error))
   } finally {
     saving.value = false
   }
@@ -285,10 +265,10 @@ const handleCompareLatest = async () => {
     })
     diffResult.value = result || null
     if (!result) {
-      message.info('当前目录还没有历史快照')
+      toasts.info('当前目录还没有历史快照')
     }
   } catch (error) {
-    message.error('对比当前失败: ' + error)
+    toasts.err('对比当前失败: ' + error)
   } finally {
     comparingLatest.value = false
   }
@@ -296,7 +276,7 @@ const handleCompareLatest = async () => {
 
 const handleQuickCompare = async () => {
   if (snapshots.value.length < 2) {
-    message.warning('至少需要两个快照才能对比')
+    toasts.warn('至少需要两个快照才能对比')
     return
   }
   selectedIds.value = [snapshots.value[1].id, snapshots.value[0].id]
@@ -319,7 +299,7 @@ const doCompare = async (oldId, newId) => {
     const result = await invoke('compare_snapshots', { oldId, newId })
     diffResult.value = result
   } catch (error) {
-    message.error('对比失败: ' + error)
+    toasts.err('对比失败: ' + error)
   } finally {
     comparing.value = false
   }
@@ -337,9 +317,9 @@ const handleDelete = async (id) => {
       }
     }
     await loadSnapshots()
-    message.success('快照已删除')
+    toasts.ok('快照已删除')
   } catch (error) {
-    message.error('删除失败: ' + error)
+    toasts.err('删除失败: ' + error)
   }
 }
 
@@ -382,7 +362,7 @@ onMounted(() => {
 /* 快照列表 */
 .snapshot-section-title {
   font-size: 11px;
-  color: var(--fd-text-2);
+  color: var(var(--tx-2));
   margin-bottom: 8px;
   text-transform: uppercase;
 }
@@ -396,25 +376,25 @@ onMounted(() => {
   align-items: flex-start;
   padding: 8px;
   margin-bottom: 4px;
-  background: var(--fd-bg-0);
-  border: 1px solid var(--fd-border);
+  background: var(var(--bg-0));
+  border: 1px solid var(var(--bd-1));
   border-radius: 6px;
   cursor: pointer;
   transition: all 0.15s;
 }
 
 .snapshot-item:hover {
-  border-color: var(--fd-accent);
-  background: var(--fd-bg-2);
+  border-color: var(var(--accent));
+  background: var(var(--bg-2));
 }
 
 .snapshot-selected {
-  border-color: var(--fd-accent);
-  background: var(--fd-selected);
+  border-color: var(var(--accent));
+  background: var(var(--sel));
 }
 
 .snapshot-latest {
-  border-left: 3px solid var(--fd-accent);
+  border-left: 3px solid var(var(--accent));
 }
 
 .snapshot-select {
@@ -425,7 +405,7 @@ onMounted(() => {
 .snapshot-checkbox {
   width: 16px;
   height: 16px;
-  border: 2px solid var(--fd-text-2);
+  border: 2px solid var(var(--tx-2));
   border-radius: 3px;
   display: flex;
   align-items: center;
@@ -436,8 +416,8 @@ onMounted(() => {
 }
 
 .snapshot-checkbox.checked {
-  background: var(--fd-accent);
-  border-color: var(--fd-accent);
+  background: var(var(--accent));
+  border-color: var(var(--accent));
 }
 
 .snapshot-info {
@@ -448,7 +428,7 @@ onMounted(() => {
 .snapshot-path {
   font-size: 12px;
   font-weight: 600;
-  color: var(--fd-text-0);
+  color: var(var(--tx-0));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -456,13 +436,13 @@ onMounted(() => {
 
 .snapshot-meta {
   font-size: 10px;
-  color: var(--fd-text-2);
+  color: var(var(--tx-2));
   margin-top: 2px;
 }
 
 .snapshot-size {
   font-weight: 500;
-  color: var(--fd-text-1);
+  color: var(var(--tx-1));
 }
 
 .snapshot-dot {
@@ -471,7 +451,7 @@ onMounted(() => {
 
 .snapshot-time {
   font-size: 10px;
-  color: var(--fd-text-2);
+  color: var(var(--tx-2));
   margin-top: 2px;
 }
 
@@ -491,7 +471,7 @@ onMounted(() => {
 /* 空状态 */
 .snapshot-empty {
   text-align: center;
-  color: var(--fd-text-2);
+  color: var(var(--tx-2));
   font-size: 12px;
   padding: 32px 0;
 }
@@ -514,8 +494,8 @@ onMounted(() => {
 
 .diff-stat {
   flex: 1;
-  background: var(--fd-bg-0);
-  border: 1px solid var(--fd-border);
+  background: var(var(--bg-0));
+  border: 1px solid var(var(--bd-1));
   border-radius: 6px;
   padding: 8px;
   text-align: center;
@@ -528,40 +508,40 @@ onMounted(() => {
 
 .diff-stat-label {
   font-size: 10px;
-  color: var(--fd-text-2);
+  color: var(var(--tx-2));
   margin-top: 2px;
 }
 
-.diff-grow .diff-stat-value { color: var(--fd-success); }
-.diff-shrink .diff-stat-value { color: var(--fd-danger); }
+.diff-grow .diff-stat-value { color: var(var(--ok)); }
+.diff-shrink .diff-stat-value { color: var(var(--bad)); }
 .diff-modify .diff-stat-value { color: #faad14; }
 
 /* 增长条 */
 .diff-growth-bar {
   margin-bottom: 12px;
   padding: 8px;
-  background: var(--fd-bg-0);
+  background: var(var(--bg-0));
   border-radius: 6px;
-  border: 1px solid var(--fd-border);
+  border: 1px solid var(var(--bd-1));
 }
 
 .diff-growth-label {
   font-size: 11px;
-  color: var(--fd-text-2);
+  color: var(var(--tx-2));
   margin-bottom: 4px;
   text-align: center;
 }
 
 .diff-bar-track {
   height: 6px;
-  background: var(--fd-bg-3);
+  background: var(var(--bg-3));
   border-radius: 3px;
   overflow: hidden;
 }
 
 .diff-bar-grow {
   height: 100%;
-  background: linear-gradient(90deg, var(--fd-success), var(--fd-danger));
+  background: linear-gradient(90deg, var(var(--ok)), var(var(--bad)));
   border-radius: 3px;
   transition: width 0.3s;
 }
@@ -579,8 +559,8 @@ onMounted(() => {
   border-radius: 4px;
 }
 
-.diff-title-grow { background: rgba(137,209,133,0.15); color: var(--fd-success); }
-.diff-title-shrink { background: rgba(244,135,113,0.15); color: var(--fd-danger); }
+.diff-title-grow { background: rgba(137,209,133,0.15); color: var(var(--ok)); }
+.diff-title-shrink { background: rgba(244,135,113,0.15); color: var(var(--bad)); }
 .diff-title-modify { background: rgba(250,173,20,0.15); color: #faad14; }
 
 .diff-items {
@@ -597,7 +577,7 @@ onMounted(() => {
 }
 
 .diff-item:hover {
-  background: var(--fd-bg-2);
+  background: var(var(--bg-2));
 }
 
 .diff-item-name {
@@ -606,7 +586,7 @@ onMounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--fd-text-1);
+  color: var(var(--tx-1));
 }
 
 .diff-item-size {
@@ -621,12 +601,12 @@ onMounted(() => {
   font-weight: 500;
 }
 
-.diff-grow-text { color: var(--fd-success); }
-.diff-shrink-text { color: var(--fd-danger); }
+.diff-grow-text { color: var(var(--ok)); }
+.diff-shrink-text { color: var(var(--bad)); }
 
 .diff-more {
   font-size: 11px;
-  color: var(--fd-text-2);
+  color: var(var(--tx-2));
   text-align: center;
   padding: 4px;
 }

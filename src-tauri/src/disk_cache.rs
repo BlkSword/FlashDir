@@ -28,7 +28,8 @@ fn blob_file_name(path: &str) -> String {
 }
 
 const BLOB_MAGIC: &[u8; 4] = b"FDBL";
-const BLOB_VERSION: u8 = 1;
+// 2 = Item 增加 atime 字段（旧 blob 直接判为未命中，触发重扫）
+const BLOB_VERSION: u8 = 2;
 
 /// 组装 blob 文件内容：magic + version + path_len + path + bincode(items)
 fn encode_blob(path: &str, payload: &[u8]) -> Vec<u8> {

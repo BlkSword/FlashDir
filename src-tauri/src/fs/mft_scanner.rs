@@ -122,6 +122,8 @@ struct MftEntry {
     is_reparse: bool,
     /// 修改时间（Unix 秒级时间戳，来自 $FILE_NAME.ModifiedTime）
     mtime: i64,
+    /// 访问时间（Unix 秒级时间戳，来自 $FILE_NAME.AccessTime；Windows 可能延迟更新）
+    atime: i64,
 }
 
 /// Windows FILETIME（1601 年起 100ns 间隔）→ Unix 秒级时间戳
@@ -176,6 +178,8 @@ pub struct MftFileInfo {
     pub is_dir: bool,
     /// 修改时间（Unix 秒级时间戳）
     pub mtime: i64,
+    /// 访问时间（Unix 秒级时间戳，0 = 未知）
+    pub atime: i64,
 }
 
 /// 单条 MFT 记录解析结果（用于 FRN → 路径解析）
@@ -187,6 +191,8 @@ pub struct MftRecordInfo {
     pub real_size: u64,
     /// 修改时间（Unix 秒级时间戳）
     pub mtime: i64,
+    /// 访问时间（Unix 秒级时间戳）
+    pub atime: i64,
 }
 
 impl MftScanner {
@@ -600,6 +606,7 @@ impl MftScanner {
                         size: entry.real_size,
                         is_dir: entry.is_dir,
                         mtime: entry.mtime,
+                        atime: entry.atime,
                     });
                 }
             }
@@ -815,6 +822,7 @@ fn parse_mft_record_info(data: &[u8], frn: u64) -> Option<MftRecordInfo> {
             let name = read_utf16le(&fn_data[name_start..name_end]);
             let name_type = fn_data[FN_NAME_NAMESPACE];
             let mtime = filetime_to_unix(u64_from_le(&fn_data[FN_MODIFY_TIME..FN_MODIFY_TIME + 8]));
+            let atime = filetime_to_unix(u64_from_le(&fn_data[FN_ACCESS_TIME..FN_ACCESS_TIME + 8]));
 
             let info = MftRecordInfo {
                 name,
@@ -822,6 +830,7 @@ fn parse_mft_record_info(data: &[u8], frn: u64) -> Option<MftRecordInfo> {
                 is_dir,
                 real_size,
                 mtime,
+                atime,
             };
 
             // 1 = Win32, 3 = Win32+DOS：优先长名，且第一个长名优先
@@ -875,6 +884,7 @@ fn parse_mft_record_info(data: &[u8], frn: u64) -> Option<MftRecordInfo> {
             is_dir,
             real_size: data_size,
             mtime: 0,
+            atime: 0,
         });
     }
 
@@ -952,8 +962,9 @@ fn parse_mft_record(data: &[u8], record_index: usize) -> Option<MftEntry> {
                 let file_attrs = u32_from_le(&fn_data[FN_FLAGS..FN_FLAGS + 4]);
                 let is_reparse = (file_attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
 
-                // 提取修改时间（FILETIME → Unix 秒）
+                // 提取修改时间 / 访问时间（FILETIME → Unix 秒）
                 let mtime = filetime_to_unix(u64_from_le(&fn_data[FN_MODIFY_TIME..FN_MODIFY_TIME + 8]));
+                let atime = filetime_to_unix(u64_from_le(&fn_data[FN_ACCESS_TIME..FN_ACCESS_TIME + 8]));
 
                 // 提取文件名
                 let name_len = fn_data[FN_NAME_LENGTH] as usize;
@@ -971,6 +982,7 @@ fn parse_mft_record(data: &[u8], record_index: usize) -> Option<MftEntry> {
                         is_dir,
                         is_reparse,
                         mtime,
+                        atime,
                     };
 
                     // 1 = Win32, 3 = Win32 + DOS；这两个都是长名，优先使用
@@ -1018,6 +1030,7 @@ fn parse_mft_record(data: &[u8], record_index: usize) -> Option<MftEntry> {
             is_dir,
             is_reparse: false,
             mtime: 0,
+            atime: 0,
         });
     }
 

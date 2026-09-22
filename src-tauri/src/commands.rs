@@ -141,6 +141,8 @@ pub struct ScanPageResponse {
     pub page: usize,
     pub page_size: usize,
     pub top_files: Vec<flashdir::scan::Item>,
+    /// 本次结果来源：memory / disk / usn / usn-disk / derived / scan
+    pub cache_source: String,
 }
 
 /// 分页扫描：后端只返回当前页，避免大目录把全量 items 传到前端导致崩溃。
@@ -223,6 +225,7 @@ pub async fn scan_directory_paged(
     if sort_column != "size" || sort_direction != "desc" {
         filtered.sort_unstable_by(|a, b| {
             let ord = match sort_column.as_str() {
+                "atime" => a.atime.cmp(&b.atime),
                 "name" => compare_ignore_case(a.name.as_str(), b.name.as_str()),
                 "mtime" => a.mtime.cmp(&b.mtime),
                 _ => a.size.cmp(&b.size),
@@ -267,6 +270,7 @@ pub async fn scan_directory_paged(
         mft_available: view.mft_available,
         page,
         page_size,
+        cache_source: view.cache_source.clone().unwrap_or_else(|| "scan".to_string()),
         top_files,
     })
 }
@@ -455,6 +459,11 @@ pub async fn is_directory(path: String) -> Result<bool, String> {
 }
 
 /// 检测当前进程是否以管理员/提升权限运行
+#[command]
+pub fn get_volumes() -> Vec<crate::volumes::VolumeInfo> {
+    crate::volumes::list_volumes()
+}
+
 #[command]
 pub fn is_admin() -> bool {
     flashdir::fs::is_admin()

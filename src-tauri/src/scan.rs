@@ -61,6 +61,8 @@ pub struct Item {
     pub is_dir: bool,
     /// 修改时间（Unix 秒级时间戳，0 = 未知）
     pub mtime: i64,
+    /// 访问时间（Unix 秒级时间戳，0 = 未知；系统可能延迟更新，仅作热度参考）
+    pub atime: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1185,6 +1187,7 @@ fn try_mft_scan_path(
             size_formatted: CompactString::new(), // 下面统一格式化
             is_dir: f.is_dir,
             mtime: f.mtime,
+            atime: f.atime,
         })
         .collect();
 
@@ -1726,10 +1729,15 @@ fn try_usn_incremental_update(
                 continue;
             }
             // 从 MFT 读取真实大小 / 目录标志 / 修改时间
-            let (file_size, is_dir, file_mtime) =
+            let (file_size, is_dir, file_mtime, file_atime) =
                 match scanner.read_single_record(change.file_ref) {
-                    Ok(Some(record)) => (record.real_size as i64, record.is_dir, record.mtime),
-                    _ => (0i64, (change.attributes & 0x10) != 0, mtime),
+                    Ok(Some(record)) => (
+                        record.real_size as i64,
+                        record.is_dir,
+                        record.mtime,
+                        record.atime,
+                    ),
+                    _ => (0i64, (change.attributes & 0x10) != 0, mtime, 0),
                 };
             applied += 1;
             let new_item = Item {
@@ -1739,6 +1747,7 @@ fn try_usn_incremental_update(
                 size_formatted: format_size(file_size),
                 is_dir,
                 mtime: file_mtime,
+                atime: file_atime,
             };
             items_map.insert(item_key, new_item);
 
@@ -2026,6 +2035,7 @@ fn scan_directory_optimized_v4(
                                 size,
                                 is_dir: entry.is_dir,
                                 mtime: entry.mtime,
+                                atime: entry.atime,
                             });
                         }
                         }
@@ -2137,6 +2147,7 @@ fn scan_directory_optimized_v4(
                 size_formatted: format_size(size),
                 is_dir: internal.is_dir,
                 mtime: internal.mtime,
+                atime: internal.atime,
             }
         })
         .collect();
@@ -2184,6 +2195,7 @@ struct ItemInternal {
     size: i64,
     is_dir: bool,
     mtime: i64,
+    atime: i64,
 }
 
 #[inline]
@@ -2267,6 +2279,7 @@ mod tests {
                 size_formatted: CompactString::new(),
                 is_dir: true,
                 mtime: 0,
+                atime: 0,
             });
         }
         for f in 0..300_000 {
@@ -2278,6 +2291,7 @@ mod tests {
                 size_formatted: CompactString::new(),
                 is_dir: false,
                 mtime: 0,
+                atime: 0,
             });
         }
 
@@ -2349,10 +2363,10 @@ mod tests {
     #[test]
     fn test_aggregate_directory_sizes() {
         let mut items = vec![
-            Item { path: CompactString::from("C:/a"), name: CompactString::from("a"), size: 0, size_formatted: CompactString::new(), is_dir: true, mtime: 0 },
-            Item { path: CompactString::from("C:/a/b"), name: CompactString::from("b"), size: 0, size_formatted: CompactString::new(), is_dir: true, mtime: 0 },
-            Item { path: CompactString::from("C:/a/b/f"), name: CompactString::from("f"), size: 10, size_formatted: CompactString::new(), is_dir: false, mtime: 0 },
-            Item { path: CompactString::from("C:/a/f2"), name: CompactString::from("f2"), size: 5, size_formatted: CompactString::new(), is_dir: false, mtime: 0 },
+            Item { path: CompactString::from("C:/a"), name: CompactString::from("a"), size: 0, size_formatted: CompactString::new(), is_dir: true, mtime: 0, atime: 0 },
+            Item { path: CompactString::from("C:/a/b"), name: CompactString::from("b"), size: 0, size_formatted: CompactString::new(), is_dir: true, mtime: 0, atime: 0 },
+            Item { path: CompactString::from("C:/a/b/f"), name: CompactString::from("f"), size: 10, size_formatted: CompactString::new(), is_dir: false, mtime: 0, atime: 0 },
+            Item { path: CompactString::from("C:/a/f2"), name: CompactString::from("f2"), size: 5, size_formatted: CompactString::new(), is_dir: false, mtime: 0, atime: 0 },
         ];
         let total = aggregate_directory_sizes(&mut items);
         assert_eq!(total, 15);

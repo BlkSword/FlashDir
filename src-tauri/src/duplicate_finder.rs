@@ -158,6 +158,7 @@ mod tests {
             size_formatted: CompactString::new(),
             is_dir: false,
             mtime: 0,
+            atime: 0,
         }
     }
 

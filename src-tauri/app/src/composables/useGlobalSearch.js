@@ -6,9 +6,7 @@
 
 import { reactive, computed } from 'vue'
 import { listen } from '@tauri-apps/api/event'
-import { useTauri } from './useTauri'
-
-const { invoke } = useTauri()
+import { invoke } from '@tauri-apps/api/core'
 
 const state = reactive({
   // global_search_status 返回值：{ kind: 'notLoaded' | 'loading' | 'ready' | 'failed', data? }

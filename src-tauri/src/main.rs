@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use parking_lot::Mutex;
 
 mod commands;
+mod volumes;
 
 use flashdir::scan;
 use flashdir::global_search;
@@ -177,6 +178,7 @@ async fn main() {
             commands::get_memory_cache_stats,
             commands::get_diagnostics,
             commands::is_admin,
+            commands::get_volumes,
             commands::cancel_scan,
             commands::open_path,
             commands::is_directory,

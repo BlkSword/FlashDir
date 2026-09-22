@@ -8,6 +8,7 @@
 
 pub mod cancel;
 pub mod scan;
+pub mod volumes;
 pub mod perf;
 pub mod disk_cache;
 pub mod fs;

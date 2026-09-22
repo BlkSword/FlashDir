@@ -1,100 +1,74 @@
-<template>
-  <footer class="fd-statusbar">
-    <div class="fd-status-left">
-      <span v-if="loading" class="fd-status-loading">
-        <svg class="animate-spin" width="12" height="12" fill="none" viewBox="0 0 24 24">
-          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-        </svg>
-        {{ scanPhase.message || '扫描中' }}
-      </span>
-      <span v-else-if="globalSearchFailed" class="fd-status-warning truncate" :title="globalSearchStatus">
-        {{ globalSearchStatus }}
-      </span>
-      <span v-else-if="globalSearchLoading" class="fd-status-loading truncate" :title="globalSearchStatus">
-        <svg class="animate-spin" width="12" height="12" fill="none" viewBox="0 0 24 24">
-          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-        </svg>
-        {{ globalSearchStatus }}
-      </span>
-      <span v-else>就绪</span>
-      <span class="fd-status-path truncate">{{ path || '未选择目录' }}</span>
-    </div>
-    <div class="fd-status-right">
-      <span>{{ totalItems.toLocaleString() }} 项</span>
-      <span class="mono">{{ formatSize(totalSize) }}</span>
-      <span v-if="backendTime > 0" class="mono">后端 {{ backendTime.toFixed(2) }}s</span>
-      <span v-if="scanTime > 0" class="mono">总耗时 {{ scanTime.toFixed(2) }}s</span>
-      <span v-if="mftAvailable" class="fd-status-pill fd-pill-mft" title="使用 NTFS MFT 直接读取">MFT</span>
-      <span v-else class="fd-status-pill fd-pill-walk" title="使用目录遍历">遍历</span>
-      <span v-if="isAdmin" class="fd-status-pill fd-pill-admin" title="当前进程已提升为管理员">管理员</span>
-    </div>
-  </footer>
-</template>
-
 <script setup>
-import { formatSize } from '../utils/format.js'
+import { computed } from 'vue'
+import Icon from './Icon.vue'
+import { formatSize, formatSizeCompact } from '../utils/format.js'
 
-defineProps({
+const props = defineProps({
   path: { type: String, default: '' },
   totalItems: { type: Number, default: 0 },
   totalSize: { type: Number, default: 0 },
+  fileCount: { type: Number, default: 0 },
+  dirCount: { type: Number, default: 0 },
   scanTime: { type: Number, default: 0 },
-  backendTime: { type: Number, default: 0 },
-  loading: { type: Boolean, default: false },
+  cacheSource: { type: String, default: '' },
   mftAvailable: { type: Boolean, default: false },
   isAdmin: { type: Boolean, default: false },
-  globalSearchLoading: { type: Boolean, default: false },
-  globalSearchFailed: { type: Boolean, default: false },
-  globalSearchStatus: { type: String, default: '' },
-  scanPhase: { type: Object, default: () => ({ phase: '', message: '' }) },
+  indexState: { type: String, default: '' },
+  indexCount: { type: Number, default: 0 },
+  indexPartial: { type: Boolean, default: false },
+  usnVerified: { type: Boolean, default: false },
+  filter: { type: String, default: '' },
+  selected: { type: Object, default: null },
+})
+const emit = defineEmits(['restart-admin', 'index-action', 'diagnostics'])
+
+const cacheLabel = computed(() => ({
+  memory: '内存命中',
+  disk: '磁盘 blob',
+  usn: 'USN 增量',
+  'usn-disk': 'USN 增量',
+  derived: '上层推导',
+  scan: props.mftAvailable ? 'MFT 直读' : '目录遍历',
+}[props.cacheSource] || '—'))
+
+const indexLabel = computed(() => {
+  if (!props.indexCount) return '未建立'
+  return `${props.indexCount.toLocaleString()} 项`
 })
 </script>
 
-<style scoped>
-.fd-statusbar {
-  grid-column: 1 / -1;
-  display: flex;
-  align-items: center;
-  padding: 0 12px;
-  background: var(--fd-accent);
-  color: #fff;
-  font-size: 12px;
-  flex-shrink: 0;
-}
-.fd-status-left {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex: 1;
-  min-width: 0;
-}
-.fd-status-path { color: rgba(255,255,255,0.85); }
-.fd-status-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-shrink: 0;
-}
-.fd-status-loading {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-.fd-status-warning {
-  color: #ffe082;
-  font-weight: 500;
-}
-.fd-status-pill {
-  padding: 1px 6px;
-  border-radius: 3px;
-  font-size: 11px;
-  font-weight: 600;
-  border: 1px solid rgba(255,255,255,0.25);
-}
-.fd-pill-mft { background: rgba(137,209,133,0.2); }
-.fd-pill-walk { background: rgba(220,182,122,0.2); }
-.fd-pill-admin { background: rgba(255,255,255,0.2); }
-.mono { font-family: Consolas, 'JetBrains Mono', monospace; }
-</style>
+<template>
+  <div class="statusbar">
+    <span class="st" :title="mftAvailable ? '扫描走 NTFS MFT 直读（管理员）' : '未以管理员运行，回退目录遍历'">
+      <span class="dot" :class="mftAvailable ? '' : 'warn'" />
+      {{ mftAvailable ? 'MFT 直读' : '目录遍历' }}
+    </span>
+    <span class="st click" :title="usnVerified ? '该目录的已校验 USN 已生效，刷新走增量快路径' : '尚无已校验 USN，刷新依赖 mtime 判断'" @click="emit('diagnostics')">
+      <span class="dot" :class="usnVerified ? '' : 'idle'" />
+      {{ usnVerified ? 'USN 已校验' : 'USN 未校验' }}
+    </span>
+    <span class="st" :title="'本次结果来源'">
+      缓存 <b>{{ cacheLabel }}</b>
+      <template v-if="scanTime"> · {{ scanTime < 1 ? Math.round(scanTime * 1000) + 'ms' : scanTime.toFixed(2) + 's' }}</template>
+    </span>
+    <span class="st click" :title="'全局索引：' + indexLabel + '（点击重建/刷新）'" @click="emit('index-action')">
+      <Icon name="search" :size="12" />
+      索引 <b>{{ indexLabel }}</b>
+      <span v-if="indexPartial" class="badge warn">部分</span>
+    </span>
+    <span v-if="!isAdmin" class="st click" title="以管理员重启可获得 MFT 直读与 USN 增量" @click="emit('restart-admin')">
+      <Icon name="shield" :size="12" />
+      以管理员重启
+    </span>
+    <span class="spacer" />
+    <span v-if="selected" class="st">
+      选中 <b>{{ selected.name }}</b> · {{ formatSizeCompact(selected.size) }}
+    </span>
+    <span class="st">
+      {{ totalItems.toLocaleString() }} 项 · {{ formatSize(totalSize) }}
+      <template v-if="dirCount"> · {{ fileCount.toLocaleString() }} 文件 / {{ dirCount.toLocaleString() }} 目录</template>
+    </span>
+    <span v-if="filter" class="st">过滤 <b>{{ filter }}</b></span>
+    <span class="st" :title="path"><Icon name="folder" :size="12" />{{ (path || '').split('/').filter(Boolean).pop() || '—' }}</span>
+  </div>
+</template>

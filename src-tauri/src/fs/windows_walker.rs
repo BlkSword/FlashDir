@@ -36,6 +36,8 @@ pub struct FastDirEntry {
     pub is_symlink: bool,
     /// 修改时间（Unix 秒级时间戳，来自 ftLastWriteTime）
     pub mtime: i64,
+    /// 访问时间（Unix 秒级时间戳，来自 ftLastAccessTime；系统可能延迟更新）
+    pub atime: i64,
 }
 
 /// 使用 Windows 原生 API 快速遍历目录
@@ -105,6 +107,11 @@ pub fn read_dir_entries(dir_path: &Path) -> io::Result<Vec<FastDirEntry>> {
                     | (find_data.ftLastWriteTime.dwLowDateTime as u64);
                 let mtime = ((ft as i64 - 116444736000000000) / 10_000_000).max(0);
 
+                // ftLastAccessTime → Unix 秒（Windows 可能延迟/关闭访问时间更新）
+                let fta = ((find_data.ftLastAccessTime.dwHighDateTime as u64) << 32)
+                    | (find_data.ftLastAccessTime.dwLowDateTime as u64);
+                let atime = ((fta as i64 - 116444736000000000) / 10_000_000).max(0);
+
                 let full_path = dir_path.join(&name);
 
                 entries.push(FastDirEntry {
@@ -114,6 +121,7 @@ pub fn read_dir_entries(dir_path: &Path) -> io::Result<Vec<FastDirEntry>> {
                     is_dir,
                     is_symlink,
                     mtime,
+                    atime,
                 });
             }
 
