@@ -19,8 +19,10 @@ const props = defineProps({
   usnVerified: { type: Boolean, default: false },
   filter: { type: String, default: '' },
   selected: { type: Object, default: null },
+  /** MCP 状态：null = 未启用/不可用 */
+  mcp: { type: Object, default: null },
 })
-const emit = defineEmits(['restart-admin', 'index-action', 'diagnostics'])
+const emit = defineEmits(['restart-admin', 'index-action', 'diagnostics', 'mcp-config'])
 
 const cacheLabel = computed(() => ({
   memory: '内存命中',
@@ -50,6 +52,21 @@ const indexLabel = computed(() => {
     <span class="st" :title="'本次结果来源'">
       缓存 <b>{{ cacheLabel }}</b>
       <template v-if="scanTime"> · {{ scanTime < 1 ? Math.round(scanTime * 1000) + 'ms' : scanTime.toFixed(2) + 's' }}</template>
+    </span>
+    <span
+      v-if="mcp"
+      class="st click"
+      :title="mcp.connected
+        ? 'AI 客户端已通过 MCP 连接' + (mcp.client ? '（' + mcp.client + '）' : '') + '，点击查看配置'
+        : 'MCP 未连接（点击复制配置到 Claude Desktop / Cursor）'"
+      @click="emit('mcp-config')"
+    >
+      <Icon name="dev" :size="12" />
+      MCP
+      <b v-if="mcp.connected" style="color:var(--ok)">已连接</b>
+      <b v-else>未连接</b>
+      <template v-if="mcp.connected && mcp.lastTool"> · {{ mcp.lastTool }}</template>
+      <template v-else-if="mcp.calls"> · {{ mcp.calls }} 次</template>
     </span>
     <span class="st click" :title="'全局索引：' + indexLabel + '（点击重建/刷新）'" @click="emit('index-action')">
       <Icon name="search" :size="12" />

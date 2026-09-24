@@ -476,6 +476,45 @@ pub async fn is_directory(path: String) -> Result<bool, String> {
 }
 
 /// 检测当前进程是否以管理员/提升权限运行
+/// MCP 运行状态（状态栏展示：是否被 AI 客户端连接、最近调用了什么）
+#[cfg(feature = "mcp")]
+#[command]
+pub fn get_mcp_status() -> serde_json::Value {
+    flashdir::mcp::status_json()
+}
+
+/// MCP 配置片段（含桥接二进制的绝对路径），供设置页一键复制。
+///
+/// 用 serde_json 生成而不是手工拼字符串：路径里的反斜杠在 JSON 中需要转义，
+/// 手工拼接极易出错（Windows 路径 + 转义 = 双重反斜杠）。
+#[cfg(feature = "mcp")]
+#[command]
+pub fn get_mcp_config() -> serde_json::Value {
+    let bridge = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("flashdir-mcp.exe")))
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "flashdir-mcp.exe".to_string());
+
+    let cfg = serde_json::json!({
+        "mcpServers": {
+            "flashdir": {
+                "command": bridge,
+                "args": ["--bridge"],
+            }
+        }
+    });
+    let config_text = serde_json::to_string_pretty(&cfg).unwrap_or_default();
+
+    serde_json::json!({
+        "command": bridge,
+        "args": ["--bridge"],
+        "config": config_text,
+        "endpoint": flashdir::mcp::endpoint_info(),
+        "status": flashdir::mcp::status_json(),
+    })
+}
+
 #[command]
 pub fn get_volumes() -> Vec<crate::volumes::VolumeInfo> {
     crate::volumes::list_volumes()

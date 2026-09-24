@@ -9,6 +9,9 @@
 pub mod cancel;
 pub mod scan;
 pub mod volumes;
+/// MCP（Model Context Protocol）服务器核心：stdio / 本机端点 / 桥接
+#[cfg(feature = "mcp")]
+pub mod mcp;
 pub mod perf;
 pub mod disk_cache;
 pub mod fs;

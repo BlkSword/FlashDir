@@ -194,6 +194,21 @@ async fn main() {
                 });
             }
 
+            // MCP 本机端点：与桌面端共享索引/缓存，并继承管理员权限（MFT 直读）
+            #[cfg(feature = "mcp")]
+            {
+                std::thread::spawn(|| {
+                    let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            eprintln!("[MCP] 运行时不创建失败: {}", e);
+                            return;
+                        }
+                    };
+                    rt.block_on(flashdir::mcp::serve_endpoint());
+                });
+            }
+
             // 创建系统托盘
             if let Err(e) = setup_tray(&app_handle) {
                 eprintln!("[Tray] 创建托盘失败: {}", e);
@@ -287,6 +302,10 @@ async fn main() {
             commands::get_diagnostics,
             commands::is_admin,
             commands::get_volumes,
+            #[cfg(feature = "mcp")]
+            commands::get_mcp_status,
+            #[cfg(feature = "mcp")]
+            commands::get_mcp_config,
             commands::cancel_scan,
             commands::open_path,
             commands::is_directory,

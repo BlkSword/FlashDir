@@ -68,6 +68,11 @@ const searchTotal = ref(0)
 const searchTruncated = ref(false)
 const searchLoadingMore = ref(false)
 const searchExporting = ref(false)
+/* MCP（AI 客户端接入）状态与配置 */
+const mcpStatus = ref(null)
+const mcpConfigOpen = ref(false)
+const mcpConfigText = ref('')
+const mcpConfigCommand = ref('')
 const paletteSeed = ref('')
 
 /** 每页加载条数（"加载更多"步长） */
@@ -177,6 +182,30 @@ const usnVerified = computed(() =>
 )
 const parentTotal = computed(() => totalSize.value)
 const scopeLabel = computed(() => (currentDrive.value ? currentDrive.value + ': ' : ''))
+
+async function loadMcpStatus() {
+  try {
+    mcpStatus.value = await invoke('get_mcp_status')
+  } catch (e) {
+    mcpStatus.value = null // 未编译 MCP 特性时静默隐藏
+  }
+}
+
+async function openMcpConfig() {
+  mcpConfigOpen.value = true
+  mcpConfigText.value = '正在获取…'
+  try {
+    const cfg = await invoke('get_mcp_config')
+    mcpConfigText.value = cfg.config || ''
+    mcpConfigCommand.value = cfg.command || ''
+  } catch (e) {
+    mcpConfigText.value = '获取失败：' + formatError(e)
+  }
+}
+
+async function copyMcpConfig() {
+  await copyText(mcpConfigText.value)
+}
 
 /* ── 卷信息 ─────────────────────────────────────────────── */
 async function refreshVolumes() {
@@ -445,6 +474,7 @@ const commands = computed(() => [
   { id: 'export', label: '导出当前页 CSV', icon: 'tray', keywords: 'export csv' },
   { id: 'theme', label: '切换主题（跟随系统 / 深色 / 浅色）', icon: 'sun', keywords: 'theme dark light' },
   { id: 'diagnostics', label: '运行诊断', icon: 'info', keywords: 'diagnostics debug' },
+  { id: 'mcp-config', label: 'MCP：复制 AI 客户端配置（Claude Desktop / Cursor）', icon: 'dev', keywords: 'mcp ai claude cursor config' },
   { id: 'admin', label: '以管理员重启（启用 MFT / USN）', icon: 'shield', keywords: 'admin elevate mft' },
   { id: 'about', label: '关于 FlashDir', icon: 'info', keywords: 'about version' },
 ])
@@ -464,6 +494,7 @@ function runCommand(id) {
     export: () => exportCsv(),
     theme: () => cycleTheme(),
     diagnostics: () => showDiagnostics(),
+    'mcp-config': () => openMcpConfig(),
     admin: () => restartAsAdmin(),
     about: () => { aboutOpen.value = true },
   }
@@ -506,6 +537,7 @@ function onKeydown(e) {
 
 /* ── 生命周期 ───────────────────────────────────────────── */
 let unlistenPhase = null
+let mcpTimer = null
 async function loadHistory() {
   try { history.value = (await invoke('get_history_summary')) || [] } catch (e) { history.value = [] }
 }
@@ -522,10 +554,13 @@ onMounted(async () => {
   }
   refreshVolumes()
   loadHistory()
+  loadMcpStatus()
+  mcpTimer = setInterval(loadMcpStatus, 3000)
   try { isAdmin.value = await invoke('is_admin') } catch (e) { isAdmin.value = false }
 })
 
 onUnmounted(() => {
+  if (mcpTimer) clearInterval(mcpTimer)
   document.removeEventListener('keydown', onKeydown)
   if (unlistenPhase) unlistenPhase()
 })
@@ -728,6 +763,8 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
       :usn-verified="usnVerified"
       :filter="filter"
       :selected="selectedItem"
+      :mcp="mcpStatus"
+      @mcp-config="openMcpConfig"
       @restart-admin="restartAsAdmin"
       @index-action="indexAction"
       @diagnostics="showDiagnostics"
@@ -771,6 +808,28 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
             <kbd>Ctrl</kbd>+<kbd>1..6</kbd> 洞察标签
           </div>
         </div>
+      </div>
+    </UiModal>
+
+    <UiModal :open="mcpConfigOpen" title="MCP：让 AI 客户端接入 FlashDir" width="720px" @close="mcpConfigOpen = false">
+      <div class="section-note" style="line-height:1.9">
+        把下面这段加到 <b>Claude Desktop</b>（<span class="mono">%APPDATA%\Claude\claude_desktop_config.json</span>）
+        或 <b>Cursor</b>（<span class="mono">~/.cursor/mcp.json</span>）的配置里，重启客户端即可。
+        桥接模式会复用桌面端的索引与缓存，并继承它的管理员权限（MFT 直读）。
+      </div>
+      <pre class="mono-block" style="margin-top:8px;max-height:320px">{{ mcpConfigText }}</pre>
+      <div class="section-note" style="margin-top:8px">
+        工具：list_volumes · search_files · scan_directory · list_directory · cache_stats · diagnostics（全部只读）
+        <template v-if="mcpStatus && mcpStatus.endpoint">
+          <br />当前端点：<span class="mono">127.0.0.1:{{ mcpStatus.endpoint.port }}</span>
+          （PID {{ mcpStatus.endpoint.pid }}）· 客户端：{{ mcpStatus.client || '未连接' }}
+          · 累计调用 {{ mcpStatus.calls }} 次
+        </template>
+      </div>
+      <div class="chips" style="margin-top:10px">
+        <span class="chip" @click="copyMcpConfig"><Icon name="copy" />复制配置</span>
+        <span class="chip" @click="copyText(mcpConfigCommand)"><Icon name="copy" />只复制命令路径</span>
+        <span class="chip" @click="mcpConfigOpen = false">关闭</span>
       </div>
     </UiModal>
 
