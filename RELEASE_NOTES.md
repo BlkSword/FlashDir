@@ -1,5 +1,24 @@
 # FlashDir Release Notes
 
+## Unreleased（十二）—— MCP 单实例模式（方案 C）
+
+```
+Host ──stdio──> flashdir-mcp.exe --bridge ──127.0.0.1+token──> 桌面端内 MCP 端点
+```
+- 桌面端启动时自动开启**本机端点**（随机端口 + 一次性 token），与桌面端共享同一份索引与扫描缓存，
+  并继承其管理员权限（实测 `管理员=true`，扫描走 MFT 直读）
+- `--bridge` 为薄字节泵：token 握手 → 双向转发；桌面端未运行会**自动拉起**并等待就绪；
+  stdin 关闭时先排空响应再退出
+- 端点支持多客户端并发（每连接独立任务；修复了串行 accept 让第二个客户端永久等待的问题）
+- 不用命名管道的原因：管理员运行时管道的强制完整性标签会阻止非管理员桥进程读写
+- 三种形态共用 `mcp.rs`：桥接（推荐）/ 独立 stdio / 本机端点；不带 `mcp` feature 仍可构建
+
+可观测：状态栏 `MCP 已连接 · search_files`（含客户端名与累计调用次数）→ 点击打开配置弹窗，
+一键复制 Claude Desktop / Cursor 配置；命令面板新增「MCP：复制 AI 客户端配置」
+
+验证：`--selftest` 11 项 · `--selftest-endpoint` 6 项（含错误 token 拒绝）·
+`--selftest-bridge` → 索引 ready 433,545 项 · 管道 sessions 全部合法 JSON · 自动拉起实测通过
+
 ## Unreleased（十一）—— 原生 MCP 服务器（P0）
 
 - 新增 **`flashdir-mcp.exe`**：stdio + JSON-RPC 2.0（NDJSON）的 MCP 服务器，

@@ -159,3 +159,39 @@ Srv  → notifications/message （可选：索引进度、扫描耗时等日志�
 | 大目录返回过大 | 强制 `limit` 截断 + `truncated`；文本 JSON 控制在数十 KB |
 | 协议版本演进 | 版本协商 + 只实现稳定方法（initialize/tools/*）；未知方法返回 -32601 |
 | 与 GUI 同时运行 | 共享同一 SQLite（WAL）与外部 blob 文件，已有并发保护（busy_timeout + 单写线程） |
+
+## 8. 单实例模式（方案 C）实现说明
+
+**最终架构**
+
+```
+Claude Desktop / Cursor
+        │ stdio (JSON-RPC, NDJSON)
+        ▼
+flashdir-mcp.exe --bridge           ← 薄桥：只搬运字节
+        │ 127.0.0.1:随机端口 + 一次性 token
+        ▼
+flashdir.exe（桌面端内后台线程）      ← 热索引 / 扫描缓存 / 管理员权限
+```
+
+**为什么不用命名管道**：桌面端通常以管理员运行，命名管道对象的强制完整性标签会
+阻止非管理员进程（Host 启动的桥）读写；本机回环 + 仅当前用户可读的 token 文件
+既跨完整性级别可用，也不对外开放（绑定 127.0.0.1 不触发防火墙提示）。
+
+**三种形态（同一份 `mcp.rs`）**
+
+| 形态 | 启动 | 特点 |
+|------|------|------|
+| 桥接（推荐） | `flashdir-mcp.exe --bridge` | 共享桌面端索引/缓存，继承管理员权限；桌面端未运行会自动拉起并等待 |
+| 独立 stdio | `flashdir-mcp.exe` | 不依赖桌面端；权限继承 Host（通常非管理员）→ 扫描走目录遍历 |
+| 本机端点 | 桌面端启动时自动开启 | 端点文件 `~/.flashdir/mcp-endpoint.json`（port/token/pid），仅当前用户可读 |
+
+**关键实现点**
+
+- 端点每连接独立任务（并发多客户端）；`stdin` 关闭时先排空响应再退出
+- token 校验失败立即断开；握手超时 5s；等待桌面端上限 25s；命令索引就绪等待 3s
+- 桌面端状态栏展示 `MCP 已连接 · 最近调用`（客户端名 + 累计次数），点击可复制配置
+- 自测：`--selftest`（11 项）/`--selftest-endpoint`（6 项）/`--selftest-bridge`（需桌面端）
+
+**实测**：`--selftest-bridge` → `管理员=true · 索引=ready（433,545 项）· 缓存 7 个目录`；
+管道一次性调用（initialize + search_files）响应全部合法 JSON。

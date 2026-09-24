@@ -183,6 +183,10 @@ FlashDir 可作为 **MCP 服务器**被 AI 客户端调用（Claude Desktop / Cu
 }
 ```
 
+推荐用**桥接模式**（`"args": ["--bridge"]`）：桌面端未运行会**自动拉起**，并共享它的热索引与扫描缓存、
+继承其管理员权限（MFT 直读）；桌面端状态栏会显示 `MCP 已连接 · 最近调用`，点击可一键复制配置。
+也可用独立模式（`flashdir-mcp.exe`，不依赖桌面端，但权限继承 Host）。
+
 工具（全部只读）：`list_volumes` · `search_files`（Everything 语法，毫秒级，含命中总数与分页）
 · `scan_directory` · `list_directory` · `cache_stats` · `diagnostics`。
 自测：`flashdir-mcp.exe --selftest`。设计细节见 `docs/mcp-design.md`。
