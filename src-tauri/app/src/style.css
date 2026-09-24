@@ -79,17 +79,29 @@ kbd {
 }
 
 /* ── 应用骨架 ─────────────────────────────────────────────── */
+/* 骨架用 flex 列：对"扫描进度条是否渲染"这类子元素数量变化免疫。
+   早期用固定 6 行的 grid，进度条 v-if 不渲染时所有行会错位一格，
+   导致状态栏浮在离底部 24px 处、洞察坞下方多出空隙。 */
 .fd-app {
-  display: grid;
-  grid-template-rows: var(--titlebar-h) var(--toolbar-h) auto minmax(0, 1fr) auto var(--status-h);
+  display: flex;
+  flex-direction: column;
   height: 100vh;
+  overflow: hidden;
   background: var(--bg-1);
 }
 .fd-app.no-dock { --dock-h: 0px; }
+/* 固定高度的横条 */
+.titlebar,
+.toolbar,
+.scan-strip,
+.statusbar {
+  flex: 0 0 auto;
+}
 .fd-body {
+  flex: 1 1 auto;
+  min-height: 0;
   display: grid;
   grid-template-columns: var(--tree-w, 236px) minmax(0, 1fr) var(--insp-w, 272px);
-  min-height: 0;
   background: var(--bg-2);
 }
 .fd-body.tree-collapsed { --tree-w: 0px; }
@@ -100,7 +112,8 @@ kbd {
 
 /* ── 标题栏 ──────────────────────────────────────────────── */
 .titlebar {
-  display: flex; align-items: center; gap: 8px; padding-left: 10px;
+  display: flex; align-items: center; gap: 8px; height: var(--titlebar-h);
+  padding-left: 10px;
   background: var(--bg-2); border-bottom: 1px solid var(--bd-0); user-select: none;
 }
 .titlebar .brand { display: flex; align-items: center; gap: 6px; font-weight: 600; font-size: 12px; }
@@ -139,7 +152,7 @@ kbd {
 
 /* ── 工具栏 ──────────────────────────────────────────────── */
 .toolbar {
-  display: flex; align-items: center; gap: 6px; padding: 0 8px;
+  display: flex; align-items: center; gap: 6px; height: var(--toolbar-h); padding: 0 8px;
   background: var(--bg-1); border-bottom: 1px solid var(--bd-0);
 }
 .btn {
