@@ -36,6 +36,7 @@ struct Args {
     json: bool,
     no_cache: bool,
     no_mft: bool,
+    filter: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -58,6 +59,7 @@ fn parse_args() -> Result<Args, String> {
     let mut json = false;
     let mut no_cache = false;
     let mut no_mft = false;
+    let mut filter: Option<String> = None;
 
     let mut i = 1;
     while i < raw.len() {
@@ -84,6 +86,14 @@ fn parse_args() -> Result<Args, String> {
             "--json" => json = true,
             "--no-cache" => no_cache = true,
             "--no-mft" => no_mft = true,
+            "--filter" => {
+                i += 1;
+                filter = Some(
+                    raw.get(i)
+                        .ok_or("--filter 需要一个表达式（如 ext:zip size:>100MB）")?
+                        .clone(),
+                );
+            }
             arg if !arg.starts_with('-') && path.is_none() => {
                 path = Some(arg.to_string());
             }
@@ -106,6 +116,7 @@ fn parse_args() -> Result<Args, String> {
         json,
         no_cache,
         no_mft,
+        filter,
     })
 }
 
@@ -121,6 +132,7 @@ fn print_help() {
   --json          以 JSON 格式输出
   --no-cache      跳过缓存，强制重新扫描
   --no-mft        禁用 MFT 直接读取
+  --filter <EXPR> 过滤表达式，与 GUI 同一套语法（ext:zip size:>100MB dir:node_modules !tmp）
   --help, -h      显示此帮助
 
 示例:
@@ -295,8 +307,36 @@ async fn main() {
         eprintln!("完成 ({:.2}s)", elapsed);
     }
 
-    // 准备输出项：按指定列排序，取 top N
+    // 过滤（与 GUI 的 scan_directory_paged 使用同一套 parse_search_filter + item_matches_filters）
     let mut items = result.items.clone();
+    if let Some(expr) = args.filter.as_deref() {
+        let filters = flashdir::global_search::parse_search_filter(expr);
+        let before = items.len();
+        // 与 GUI 一致：匹配相对扫描根的路径
+        let root_prefix = {
+            let mut p = args.path.replace('\\', "/");
+            if !p.ends_with('/') {
+                p.push('/');
+            }
+            p
+        };
+        items.retain(|i| {
+            let match_path = i.path.as_str().strip_prefix(root_prefix.as_str()).unwrap_or(i.path.as_str());
+            flashdir::global_search::item_matches_filters(
+                i.name.as_str(),
+                match_path,
+                i.size,
+                i.is_dir,
+                i.mtime,
+                &filters,
+            )
+        });
+        if !args.json {
+            eprintln!("过滤 \"{}\" : {} → {} 条", expr, before, items.len());
+        }
+    }
+
+    // 按指定列排序，取 top N
     match args.sort {
         SortBy::Size => items.sort_unstable_by(|a, b| b.size.cmp(&a.size)),
         SortBy::Name => items.sort_unstable_by(|a, b| {

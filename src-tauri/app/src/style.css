@@ -12,7 +12,7 @@
   --titlebar-h: 32px;
   --toolbar-h: 38px;
   --status-h: 24px;
-  --dock-h: 168px;
+  --dock-h: 208px;
   --transition: 120ms ease;
 }
 
@@ -81,7 +81,7 @@ kbd {
 /* ── 应用骨架 ─────────────────────────────────────────────── */
 .fd-app {
   display: grid;
-  grid-template-rows: var(--titlebar-h) var(--toolbar-h) auto minmax(150px, 1fr) auto var(--status-h);
+  grid-template-rows: var(--titlebar-h) var(--toolbar-h) auto minmax(0, 1fr) auto var(--status-h);
   height: 100vh;
   background: var(--bg-1);
 }
@@ -297,21 +297,15 @@ kbd {
   position: relative;
   border-top: 1px solid var(--bd-0);
   background: var(--bg-1);
-  height: var(--dock-h);
+  /* 固定高度但随视口收敛：窗口变矮时自动压缩，保证底栏始终在窗口底部 */
+  height: min(var(--dock-h), 36vh);
   min-height: 96px;
+  flex: 0 0 auto;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
-.dock-resizer {
-  position: absolute; left: 0; right: 0; top: -3px; height: 7px; z-index: 4;
-  cursor: row-resize; display: flex; align-items: center; justify-content: center;
-}
-.dock-resizer::after {
-  content: ''; width: 46px; height: 3px; border-radius: 2px;
-  background: var(--bd-1); transition: background var(--transition);
-}
-.dock-resizer:hover::after { background: var(--accent); }
-.dock-tabs .grip { color: var(--tx-3); font-size: 11px; display: flex; align-items: center; gap: 4px; }
+.dock-tabs .grip { color: var(--tx-3); font-size: 10.5px; display: flex; align-items: center; gap: 4px; }
 .dock-body { overscroll-behavior: contain; }
 .dock-tabs { display: flex; align-items: center; gap: 2px; height: 28px; padding: 0 8px; border-bottom: 1px solid var(--bd-0); }
 .dock-tabs button {
@@ -327,8 +321,11 @@ kbd {
 
 .statusbar {
   display: flex; align-items: center; height: var(--status-h);
-  background: var(--bg-2); border-top: 1px solid var(--bd-0);
+  background: var(--bg-3);
+  border-top: 1px solid var(--bd-1);
+  box-shadow: 0 -1px 0 0 color-mix(in srgb, var(--bg-0) 60%, transparent);
   color: var(--tx-2); font-size: 11px; overflow: hidden;
+  flex: 0 0 auto;
 }
 .statusbar .st {
   display: flex; align-items: center; gap: 6px; padding: 0 10px; height: 100%;

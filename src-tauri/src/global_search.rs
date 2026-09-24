@@ -856,9 +856,16 @@ pub fn parse_search_filter(input: &str) -> Vec<SearchFilter> {
             continue;
         }
 
+        // `!xxx` 与 `NOT xxx` 等价（界面与文档一直宣传 `!tmp` 这类写法，
+        // 但早期只实现了 NOT，导致 `!tmp` 被当成字面量 "!tmp" 去匹配、结果恒为空）
+        let (word, bang) = match word.strip_prefix('!') {
+            Some(rest) if !rest.is_empty() => (rest, true),
+            _ => (word, false),
+        };
+
         if let Some((key, value)) = word.split_once(':') {
             let key = key.to_lowercase();
-            let negate = negate_next;
+            let negate = negate_next || bang;
             negate_next = false;
             let kind = match key.as_str() {
                 "ext" => Some(SearchFilterKind::Ext(value.to_lowercase())),
@@ -880,7 +887,7 @@ pub fn parse_search_filter(input: &str) -> Vec<SearchFilter> {
             }
         } else {
             let value = word.to_lowercase();
-            let negate = negate_next;
+            let negate = negate_next || bang;
             negate_next = false;
             if let Some(kind) = parse_wildcard_filter(&value) {
                 filters.push(SearchFilter { kind, negate });
@@ -1227,6 +1234,29 @@ pub fn list_ntfs_drives() -> Vec<char> {
 
 #[cfg(test)]
 mod tests {
+    /// 诊断：过滤表达式解析与匹配（本地过滤 / 在此目录内过滤共用）
+    #[test]
+    fn diag_filter_parse_and_match() {
+        for expr in ["windows", "dir:Windows", "ext:exe", "size:>100MB", "!tmp", "type:dir", "*.pdf", "report*.pdf", "name:abc"] {
+            let f = parse_search_filter(expr);
+            eprintln!("[diag] 解析 {:>14} → {} 个过滤器 {:?}", expr, f.len(), f);
+        }
+        let items = [
+            ("report.pdf", "C:/docs/report.pdf", 1024i64, false, 0i64),
+            ("tmp.txt", "C:/tmp/tmp.txt", 10, false, 0),
+            ("docs", "C:/docs", 0, true, 0),
+        ];
+        for expr in ["report", "!tmp", "dir:docs", "type:dir", "ext:pdf", "size:>100B"] {
+            let f = parse_search_filter(expr);
+            let hits: Vec<&str> = items
+                .iter()
+                .filter(|(n, p, sz, d, m)| item_matches_filters(n, p, *sz, *d, *m, &f))
+                .map(|(_, p, ..)| *p)
+                .collect();
+            eprintln!("[diag] 匹配 {:>12} → {:?}", expr, hits);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1278,6 +1308,33 @@ mod tests {
         assert!(
             matches!(&filters[1].kind, SearchFilterKind::Mtime { op, seconds } if matches!(op, FilterOp::Gt) && *seconds == 7 * 24 * 60 * 60)
         );
+    }
+
+    #[test]
+    fn test_bang_prefix_negation() {
+        // `!tmp` 必须解析为"否定 Text(tmp)"，而不是字面量 "!tmp"
+        let f = parse_search_filter("!tmp");
+        assert_eq!(f.len(), 1);
+        assert!(f[0].negate);
+        assert!(matches!(&f[0].kind, SearchFilterKind::Text(t) if t == "tmp"));
+
+        // 与 NOT 等价
+        let g = parse_search_filter("NOT tmp");
+        assert_eq!(g.len(), 1);
+        assert!(g[0].negate);
+
+        // 组合：ext:zip !tmp
+        let h = parse_search_filter("ext:zip !tmp");
+        assert_eq!(h.len(), 2);
+        assert!(!h[0].negate);
+        assert!(h[1].negate);
+        assert!(item_matches_filters("a.zip", "C:/x/a.zip", 10, false, 0, &h));
+        assert!(!item_matches_filters("a.tmp", "C:/x/a.tmp", 10, false, 0, &h));
+
+        // 单独的 `!` 不做否定（保持字面量，避免误吞）
+        let k = parse_search_filter("!");
+        assert_eq!(k.len(), 1);
+        assert!(!k[0].negate);
     }
 
     #[test]

@@ -11,6 +11,7 @@ import Inspector from './components/Inspector.vue'
 import InsightDock from './components/InsightDock.vue'
 import StatusBar from './components/StatusBar.vue'
 import Treemap from './components/Treemap.vue'
+import SearchResults from './components/SearchResults.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import ContextMenu from './components/ContextMenu.vue'
 import UiModal from './components/UiModal.vue'
@@ -40,7 +41,7 @@ const sortConfig = ref({ column: 'size', direction: 'desc' })
 const page = ref(1)
 const pageSize = ref(200)
 const view = ref('list')
-const dockTab = ref('map')
+const dockTab = ref('big')
 const selectedItem = ref(null)
 const treeVisible = ref(true)
 const inspVisible = ref(true)
@@ -50,46 +51,52 @@ const diagnosticsOpen = ref(false)
 const diagnosticsText = ref('')
 const aboutOpen = ref(false)
 const snapshotCount = ref(0)
-
-/* 洞察坞高度：可拖拽调整，有最小/最大限制并记忆 */
-const DOCK_MIN = 120
-const DOCK_DEFAULT = 230
-const dockHeight = ref(Number(localStorage.getItem('flashdir.dockHeight')) || DOCK_DEFAULT)
-const dockMax = ref(720)
-function computeDockBounds() {
-  // 顶部固定行 + 状态栏 + 文件表最小高度之后剩下的空间
-  const reserve = 32 + 38 + 24 + 170
-  dockMax.value = Math.max(DOCK_MIN + 40, window.innerHeight - reserve)
-  dockHeight.value = Math.min(dockMax.value, Math.max(DOCK_MIN, dockHeight.value))
-}
-function onDockResizeStart(e) {
-  e.preventDefault()
-  const startY = e.clientY
-  const startH = dockHeight.value
-  const onMove = (ev) => {
-    const next = Math.min(dockMax.value, Math.max(DOCK_MIN, startH - (ev.clientY - startY)))
-    dockHeight.value = Math.round(next)
-  }
-  const onUp = () => {
-    localStorage.setItem('flashdir.dockHeight', String(dockHeight.value))
-    window.removeEventListener('mousemove', onMove)
-    window.removeEventListener('mouseup', onUp)
-    document.body.style.cursor = ''
-  }
-  window.addEventListener('mousemove', onMove)
-  window.addEventListener('mouseup', onUp)
-  document.body.style.cursor = 'row-resize'
-}
-function resetDockHeight() {
-  dockHeight.value = Math.min(DOCK_DEFAULT, dockMax.value)
-  localStorage.setItem('flashdir.dockHeight', String(dockHeight.value))
-}
 const scanPhase = ref({ phase: '', message: '' })
 const history = ref([])
 const navStack = ref([])
 const navIndex = ref(-1)
 
 const ctx = reactive({ open: false, x: 0, y: 0, items: [], target: null })
+
+/* ── 全局搜索（工具栏回车 / 命令面板 / 右键"全局搜索同名文件"） ── */
+const searchQuery = ref('')
+const searchResults = ref([])
+const searching = ref(false)
+const searchElapsed = ref(0)
+const paletteSeed = ref('')
+
+async function runGlobalSearch(q) {
+  const query = (q || '').trim()
+  if (!query) {
+    toasts.warn('请输入搜索关键字')
+    return
+  }
+  view.value = 'search'
+  searching.value = true
+  searchQuery.value = query
+  searchResults.value = []
+  const t0 = performance.now()
+  try {
+    const rows = await invoke('global_search', { query, limit: 1000 })
+    searchResults.value = rows || []
+    searchElapsed.value = Math.round(performance.now() - t0)
+    if (!searchResults.value.length && !gs.indexMeta.value) {
+      toasts.warn('全局索引尚未建立，正在后台构建，稍后重试')
+      gs.ensureIndex().catch(() => {})
+    }
+  } catch (e) {
+    searchElapsed.value = Math.round(performance.now() - t0)
+    const msg = formatError(e)
+    toasts.err('搜索失败：' + msg)
+    if (/索引|index/i.test(msg)) gs.ensureIndex().catch(() => {})
+  } finally {
+    searching.value = false
+  }
+}
+
+function openSearchResult(path) {
+  invoke('open_path', { path }).catch((e) => toasts.err('打开失败：' + formatError(e)))
+}
 
 const { mode: themeMode, cycle: cycleTheme } = useTheme()
 const toasts = useToasts()
@@ -308,7 +315,7 @@ function onContextPick(id) {
   else if (id === 'copy') copyText(item.path)
   else if (id === 'copyName') copyText(item.name)
   else if (id === 'searchHere') searchHere(item.path)
-  else if (id === 'globalSearch') paletteOpen.value = true
+  else if (id === 'globalSearch') { paletteSeed.value = item.name; paletteOpen.value = true }
   else if (id === 'dupes') { dockTab.value = 'dupes'; dockVisible.value = true }
   else if (id === 'snapshot') saveSnapshot(currentPath.value)
 }
@@ -365,10 +372,11 @@ const commands = computed(() => [
   { id: 'cancel', label: '取消当前扫描', icon: 'xc', keywords: 'cancel stop', shortcut: 'Esc' },
   { id: 'up', label: '上一级目录', icon: 'up', keywords: 'up parent', shortcut: 'Backspace' },
   { id: 'index', label: gs.ready.value ? '刷新全局索引' : '建立全局索引', icon: 'search', keywords: 'index global' },
+  { id: 'search-global', label: '用当前关键字做全局搜索', icon: 'search', keywords: 'search global find', shortcut: 'Enter' },
   { id: 'snapshot', label: '保存当前目录快照', icon: 'clock', keywords: 'snapshot save' },
   { id: 'dupes', label: '重复文件检测', icon: 'dupes', keywords: 'duplicate same' },
   { id: 'dev', label: '开发缓存分析', icon: 'dev', keywords: 'node_modules target cache' },
-  { id: 'map', label: '体积构成（热图）', icon: 'grid', keywords: 'treemap map' },
+  { id: 'map', label: '切换主视图：热图', icon: 'grid', keywords: 'treemap map' },
   { id: 'export', label: '导出当前页 CSV', icon: 'tray', keywords: 'export csv' },
   { id: 'theme', label: '切换主题（跟随系统 / 深色 / 浅色）', icon: 'sun', keywords: 'theme dark light' },
   { id: 'diagnostics', label: '运行诊断', icon: 'info', keywords: 'diagnostics debug' },
@@ -383,10 +391,11 @@ function runCommand(id) {
     cancel: () => cancelScan(),
     up: () => goUp(),
     index: () => indexAction(),
+    'search-global': () => runGlobalSearch(filter.value),
     snapshot: () => saveSnapshot(currentPath.value),
     dupes: () => { dockTab.value = 'dupes'; dockVisible.value = true },
     dev: () => { dockTab.value = 'dev'; dockVisible.value = true },
-    map: () => { dockTab.value = 'map'; dockVisible.value = true },
+    map: () => { view.value = view.value === 'map' ? 'list' : 'map' },
     export: () => exportCsv(),
     theme: () => cycleTheme(),
     diagnostics: () => showDiagnostics(),
@@ -397,7 +406,7 @@ function runCommand(id) {
 }
 
 /* ── 键盘 ───────────────────────────────────────────────── */
-const dockTabs = ['map', 'big', 'growth', 'dupes', 'snapshot', 'dev']
+const dockTabs = ['big', 'growth', 'dupes', 'snapshot', 'dev']
 function onKeydown(e) {
   const mod = e.ctrlKey || e.metaKey
   const inInput = ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)
@@ -423,7 +432,7 @@ function onKeydown(e) {
   if (mod && (e.key === 'b' || e.key === 'B')) { e.preventDefault(); treeVisible.value = !treeVisible.value; return }
   if (mod && (e.key === 'j' || e.key === 'J')) { e.preventDefault(); dockVisible.value = !dockVisible.value; return }
   if (mod && (e.key === 'i' || e.key === 'I')) { e.preventDefault(); inspVisible.value = !inspVisible.value; return }
-  if (mod && /^[1-6]$/.test(e.key)) {
+  if (mod && /^[1-5]$/.test(e.key)) {
     e.preventDefault()
     dockVisible.value = true
     dockTab.value = dockTabs[Number(e.key) - 1]
@@ -438,9 +447,14 @@ async function loadHistory() {
 
 onMounted(async () => {
   document.addEventListener('keydown', onKeydown)
-  window.addEventListener('resize', computeDockBounds)
-  computeDockBounds()
-  unlistenPhase = await listen('scan-phase', (ev) => { scanPhase.value = ev.payload || { phase: '', message: '' } })
+  try {
+    unlistenPhase = await listen('scan-phase', (ev) => {
+      scanPhase.value = ev.payload || { phase: '', message: '' }
+    })
+  } catch (e) {
+    // 非 Tauri 环境或事件系统异常：不影响其余初始化
+    unlistenPhase = null
+  }
   refreshVolumes()
   loadHistory()
   try { isAdmin.value = await invoke('is_admin') } catch (e) { isAdmin.value = false }
@@ -448,7 +462,6 @@ onMounted(async () => {
 
 onUnmounted(() => {
   document.removeEventListener('keydown', onKeydown)
-  window.removeEventListener('resize', computeDockBounds)
   if (unlistenPhase) unlistenPhase()
 })
 
@@ -529,8 +542,9 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
       @refresh="refresh"
       @navigate="navigate"
       @update:filter="onFilterInput"
-      @update:view="view = $event"
+      @update:view="view = $event === 'search' ? 'list' : $event"
       @export="exportCsv"
+      @search-global="runGlobalSearch"
       @up="goUp"
       @back="goBack"
       @forward="goForward"
@@ -556,8 +570,24 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
         @error="toasts.err($event)"
       />
 
+      <SearchResults
+        v-if="view === 'search'"
+        :query="searchQuery"
+        :results="searchResults"
+        :loading="searching"
+        :elapsed-ms="searchElapsed"
+        :index-count="gs.indexMeta.value ? (gs.indexMeta.value.fileCount || 0) + (gs.indexMeta.value.dirCount || 0) : 0"
+        :index-partial="!!gs.indexMeta.value?.partial"
+        :scope="scopeLabel"
+        @open="openSearchResult"
+        @navigate="navigate"
+        @back="view = 'list'"
+        @retry="runGlobalSearch(searchQuery)"
+        @copy="copyText"
+      />
+
       <FileTable
-        v-if="view === 'list'"
+        v-else-if="view === 'list'"
         :items="items"
         :total-size="totalSize"
         :parent-total="parentTotal"
@@ -602,10 +632,6 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
     <InsightDock
       v-if="dockVisible"
       :tab="dockTab"
-      :height="dockHeight"
-      :min-height="DOCK_MIN"
-      @resize-start="onDockResizeStart"
-      @reset-height="resetDockHeight"
       :items="items"
       :top-files="topFiles"
       :total-size="totalSize"
@@ -638,6 +664,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
 
     <CommandPalette
       :open="paletteOpen"
+      :seed="paletteSeed"
       :commands="commands"
       :index-count="gs.indexMeta.value ? (gs.indexMeta.value.fileCount || 0) + (gs.indexMeta.value.dirCount || 0) : 0"
       :index-partial="!!gs.indexMeta.value?.partial"

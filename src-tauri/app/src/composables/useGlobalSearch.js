@@ -32,7 +32,13 @@ function startPolling() {
   }, 1000)
 }
 
+/** 是否运行在 Tauri 容器内（纯浏览器/预览环境下不调用 IPC，避免模块加载期抛错导致界面空白） */
+function hasTauri() {
+  return typeof window !== 'undefined' && !!window.__TAURI_INTERNALS__
+}
+
 async function fetchStatus() {
+  if (!hasTauri()) return
   try {
     state.index = await invoke('global_search_status')
     if (state.index?.kind === 'loading') {
@@ -46,9 +52,10 @@ async function fetchStatus() {
 }
 
 function ensureListener() {
-  if (listenStarted) return
+  if (listenStarted || !hasTauri()) return
   listenStarted = true
-  listen('global-search-progress', (event) => {
+  try {
+    listen('global-search-progress', (event) => {
     state.progress = event.payload
     if (event.payload?.phase === 'done') {
       stopPolling()
@@ -63,7 +70,11 @@ function ensureListener() {
       }
       startPolling()
     }
-  })
+    })
+  } catch (e) {
+    // 事件订阅失败不应影响界面：状态保持未加载，搜索时再按需重试
+    console.warn('[GlobalIndex] 事件订阅失败:', e)
+  }
 }
 
 // 模块加载即启动监听（原 App.vue onMounted 行为），并拉取一次当前状态

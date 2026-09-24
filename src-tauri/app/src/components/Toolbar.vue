@@ -18,7 +18,7 @@ const props = defineProps({
 })
 const emit = defineEmits([
   'scan', 'force-scan', 'cancel-scan', 'refresh', 'navigate',
-  'update:filter', 'update:view', 'export', 'up', 'back', 'forward',
+  'update:filter', 'update:view', 'export', 'up', 'back', 'forward', 'search-global',
 ])
 
 const editing = ref(false)
@@ -115,15 +115,21 @@ const browse = async () => {
       </span>
     </div>
 
-    <label class="filter-box" title="过滤语法：ext:zip size:>100MB dir:node_modules !tmp type:file mtime:>7d">
+    <label
+      class="filter-box"
+      title="输入即过滤当前目录（匹配名称与相对路径）；按 Enter 用全局索引搜索整个磁盘。语法：ext:zip size:>100MB dir:node_modules !tmp type:file mtime:>7d"
+    >
       <Icon name="filter" :size="13" />
       <input
         :value="filter"
-        placeholder="过滤：ext:zip size:>100MB !tmp"
+        placeholder="过滤当前目录；回车全局搜索"
         spellcheck="false"
         @input="onFilterInput"
+        @keydown.enter.prevent="emit('search-global', filter)"
       />
-      <span class="hits">{{ filter ? `${hits} 命中` : '' }}</span>
+      <span class="hits">
+        <template v-if="filter">{{ hits }} 命中 · <kbd>Enter</kbd> 全局</template>
+      </span>
     </label>
 
     <div class="seg">

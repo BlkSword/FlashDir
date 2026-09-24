@@ -60,8 +60,6 @@ export default defineConfig(({ mode }) => {
         output: {
           // 优化代码分割策略
           manualChunks: {
-            // 将 Ant Design Vue 单独打包
-            'ant-design': ['ant-design-vue', '@ant-design/icons-vue'],
             // Vue 核心
             'vue-core': ['vue'],
             // Tauri API
@@ -88,8 +86,9 @@ export default defineConfig(({ mode }) => {
         // 排除 Tauri 注入的全局变量
         external: [],
       },
-      // 启用压缩
-      minify: 'terser',
+      // 压缩：使用 Vite 默认的 esbuild（terser 的激进压缩此前导致生产构建渲染期
+      // 出现 "Cannot read properties of undefined" 且被 drop_console 吞掉，难以排查）
+      minify: 'esbuild',
       terserOptions: {
         compress: {
           // 删除 console 和 debugger

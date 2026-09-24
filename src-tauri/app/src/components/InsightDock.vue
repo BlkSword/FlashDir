@@ -1,7 +1,6 @@
 <script setup>
 import { computed } from 'vue'
 import Icon from './Icon.vue'
-import Treemap from './Treemap.vue'
 import GrowthPanel from './GrowthPanel.vue'
 import DevAnalyzer from './DevAnalyzer.vue'
 import DuplicateFinder from './DuplicateFinder.vue'
@@ -14,13 +13,10 @@ const props = defineProps({
   topFiles: { type: Array, default: () => [] },
   totalSize: { type: Number, default: 0 },
   currentPath: { type: String, default: '' },
-  height: { type: Number, default: 230 },
-  minHeight: { type: Number, default: 120 },
 })
-const emit = defineEmits(['update:tab', 'navigate', 'open', 'refresh', 'resize-start', 'reset-height'])
+const emit = defineEmits(['update:tab', 'navigate', 'open', 'refresh'])
 
 const tabs = [
-  { key: 'map', label: '体积构成', hint: '按面积表示体积，点击进入子目录' },
   { key: 'big', label: '大文件', hint: '当前目录最大的文件' },
   { key: 'growth', label: '增长趋势', hint: '基于历史快照的体积变化' },
   { key: 'dupes', label: '重复文件', hint: '按内容哈希检测重复' },
@@ -38,15 +34,7 @@ const maxBig = computed(() => bigList.value.reduce((m, i) => Math.max(m, i.size)
 </script>
 
 <template>
-  <div class="dock" :style="{ '--dock-h': height + 'px', minHeight: minHeight + 'px' }">
-    <!-- 顶部拖拽条：调整洞察坞高度（双击复位） -->
-    <div
-      class="dock-resizer"
-      title="拖拽调整洞察坞高度（双击复位）"
-      @mousedown="emit('resize-start', $event)"
-      @dblclick="emit('reset-height')"
-    />
-
+  <div class="dock">
     <div class="dock-tabs">
       <button
         v-for="(t, i) in tabs"
@@ -58,19 +46,12 @@ const maxBig = computed(() => bigList.value.reduce((m, i) => Math.max(m, i.size)
         {{ t.label }}
       </button>
       <span class="spacer" />
-      <span class="grip"><Icon name="grip" :size="12" />{{ height }}px · 拖拽上边缘调整</span>
       <span class="note">{{ activeHint }}</span>
+      <span class="grip"><kbd>Ctrl</kbd>+<kbd>J</kbd> 隐藏</span>
     </div>
 
     <div class="dock-body" :class="{ 'no-pad': isPanel }">
-      <Treemap
-        v-if="tab === 'map'"
-        :items="items"
-        :total="totalSize"
-        @navigate="emit('navigate', $event)"
-      />
-
-      <div v-else-if="tab === 'big'" class="rows">
+      <div v-if="tab === 'big'" class="rows">
         <div v-if="!bigList.length" class="section-note">没有可展示的文件。</div>
         <div
           v-for="f in bigList"
@@ -87,21 +68,21 @@ const maxBig = computed(() => bigList.value.reduce((m, i) => Math.max(m, i.size)
       </div>
 
       <GrowthPanel
-        v-else-if="tab === 'growth'"
+        v-if="tab === 'growth'"
         :current-path="currentPath"
         :total-size="totalSize"
         @refresh="emit('refresh')"
       />
-      <DuplicateFinder v-else-if="tab === 'dupes'" :items="items" :current-path="currentPath" />
+      <DuplicateFinder v-if="tab === 'dupes'" :items="items" :current-path="currentPath" />
       <SnapshotCompare
-        v-else-if="tab === 'snapshot'"
+        v-if="tab === 'snapshot'"
         :items="items"
         :total-size="totalSize"
         :current-path="currentPath"
         @refresh="emit('refresh')"
       />
       <DevAnalyzer
-        v-else-if="tab === 'dev'"
+        v-if="tab === 'dev'"
         :items="items"
         :total-size="totalSize"
         :current-path="currentPath"

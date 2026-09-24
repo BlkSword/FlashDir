@@ -183,6 +183,17 @@ pub async fn scan_directory_paged(
         .unwrap_or_default();
     let use_filter = !filters.is_empty();
 
+    // 过滤匹配"相对扫描根的路径"：否则扫描 C:/Windows 时输入 windows 会命中全部条目
+    //（每个条目的绝对路径都含 C:/Windows），用户会以为过滤没生效。
+    let root_prefix: String = {
+        let p = view.path.to_string();
+        if p.ends_with('/') {
+            p
+        } else {
+            format!("{}/", p)
+        }
+    };
+
     // 只收集引用，避免为过滤/排序克隆整份条目
     let mut filtered: Vec<&flashdir::scan::Item> = Vec::new();
     for item in view.items() {
@@ -190,10 +201,15 @@ pub async fn scan_directory_paged(
         if item.name.starts_with("<record_") {
             continue;
         }
+        let match_path = item
+            .path
+            .as_str()
+            .strip_prefix(root_prefix.as_str())
+            .unwrap_or(item.path.as_str());
         if use_filter
             && !flashdir::global_search::item_matches_filters(
                 item.name.as_str(),
-                item.path.as_str(),
+                match_path,
                 item.size,
                 item.is_dir,
                 item.mtime,

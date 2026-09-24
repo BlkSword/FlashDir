@@ -10,6 +10,7 @@ const props = defineProps({
   indexCount: { type: Number, default: 0 },
   indexPartial: { type: Boolean, default: false },
   scope: { type: String, default: '' },
+  seed: { type: String, default: '' },
 })
 const emit = defineEmits(['close', 'run', 'open-path', 'navigate'])
 
@@ -76,11 +77,12 @@ watch(q, () => {
 
 watch(() => props.open, async (v) => {
   if (!v) return
-  q.value = ''
+  q.value = props.seed || ''
   results.value = []
   active.value = 0
   await nextTick()
   inputRef.value?.focus()
+  if (q.value) runSearch()
 })
 
 const move = (delta) => {
@@ -103,7 +105,12 @@ const onKey = (e) => {
   else if (e.key === 'ArrowUp') { e.preventDefault(); move(-1) }
   else if (e.key === 'Enter') { e.preventDefault(); choose() }
   else if (e.key === 'Escape') { e.preventDefault(); emit('close') }
-  else if (e.key === 'Tab') { e.preventDefault(); q.value = '> ' }
+  else if (e.key === 'Tab') {
+    // Tab 在"文件搜索 / 命令"之间来回切换（早期只能单向进入命令模式，用户会以为搜索坏了）
+    e.preventDefault()
+    q.value = isCommandMode.value ? q.value.replace(/^>\s*/, '') : '> ' + q.value.trim()
+    if (!isCommandMode.value) runSearch()
+  }
 }
 </script>
 
