@@ -105,7 +105,19 @@ const fill = (node) => {
   return Math.max(2, Math.round((node.size / maxSize.value) * 100))
 }
 
-const historyTop = computed(() => (props.history || []).slice(0, 6))
+const historyTop = computed(() => {
+  // 去重（同一路径多次扫描只留最近一次），避免列表里出现重复项
+  const seen = new Set()
+  const out = []
+  for (const h of props.history || []) {
+    const key = (h.path || '').toLowerCase()
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    out.push(h)
+    if (out.length >= 6) break
+  }
+  return out
+})
 
 /** 扁平化的可见节点（支持任意层级），fill = 占父目录体积 */
 const visible = computed(() => {

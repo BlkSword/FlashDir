@@ -12,7 +12,7 @@
   --titlebar-h: 32px;
   --toolbar-h: 38px;
   --status-h: 24px;
-  --dock-h: 208px;
+  --dock-h: 196px;
   --transition: 120ms ease;
 }
 
@@ -298,8 +298,9 @@ kbd {
   border-top: 1px solid var(--bd-0);
   background: var(--bg-1);
   /* 固定高度但随视口收敛：窗口变矮时自动压缩，保证底栏始终在窗口底部 */
-  height: min(var(--dock-h), 36vh);
-  min-height: 96px;
+  /* 矮窗口下自动压缩：保证文件表与状态栏都有位置 */
+  height: min(var(--dock-h), 30vh);
+  min-height: 88px;
   flex: 0 0 auto;
   display: flex;
   flex-direction: column;
@@ -329,7 +330,12 @@ kbd {
 }
 .statusbar .st {
   display: flex; align-items: center; gap: 6px; padding: 0 10px; height: 100%;
-  border-right: 1px solid var(--bd-0); white-space: nowrap;
+  border-right: 1px solid var(--bd-0); white-space: nowrap; flex: 0 0 auto;
+}
+.statusbar .st.grow { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* 窄窗口（如 1228px 逻辑宽的云桌面）下隐藏次要状态段，避免把主信息挤掉 */
+@media (max-width: 1240px) {
+  .statusbar .st.optional { display: none; }
 }
 .statusbar .st b { color: var(--tx-1); font-weight: 600; font-family: var(--font-mono); }
 .statusbar .st.click { cursor: pointer; }

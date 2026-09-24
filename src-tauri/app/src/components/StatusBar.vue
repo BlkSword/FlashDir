@@ -61,14 +61,14 @@ const indexLabel = computed(() => {
       以管理员重启
     </span>
     <span class="spacer" />
-    <span v-if="selected" class="st">
+    <span v-if="selected" class="st optional">
       选中 <b>{{ selected.name }}</b> · {{ formatSizeCompact(selected.size) }}
     </span>
-    <span class="st">
+    <span class="st grow">
       {{ totalItems.toLocaleString() }} 项 · {{ formatSize(totalSize) }}
       <template v-if="dirCount"> · {{ fileCount.toLocaleString() }} 文件 / {{ dirCount.toLocaleString() }} 目录</template>
     </span>
-    <span v-if="filter" class="st">过滤 <b>{{ filter }}</b></span>
+    <span v-if="filter" class="st optional">过滤 <b>{{ filter }}</b></span>
     <span class="st" :title="path"><Icon name="folder" :size="12" />{{ (path || '').split('/').filter(Boolean).pop() || '—' }}</span>
   </div>
 </template>
