@@ -168,6 +168,25 @@ SIZE     TYPE       NAME
 | `Enter`（搜索框内） | 用全局索引搜索整个磁盘 |
 | 树内 `↑ ↓ ← →` `Enter` `Home` `End` | 目录树键盘导航（移动/展开折叠/扫描） |
 
+## MCP（Model Context Protocol）支持
+
+FlashDir 可作为 **MCP 服务器**被 AI 客户端调用（Claude Desktop / Cursor 等），
+把本机磁盘能力交给模型：全局索引搜索、目录体积构成、卷容量、缓存/索引诊断。
+**原生 Rust 实现，不需要 Node/Python**；与桌面端共享同一份缓存与索引。
+
+```jsonc
+// Claude Desktop / Cursor 配置
+{
+  "mcpServers": {
+    "flashdir": { "command": "C:\path\to\flashdir-mcp.exe" }
+  }
+}
+```
+
+工具（全部只读）：`list_volumes` · `search_files`（Everything 语法，毫秒级，含命中总数与分页）
+· `scan_directory` · `list_directory` · `cache_stats` · `diagnostics`。
+自测：`flashdir-mcp.exe --selftest`。设计细节见 `docs/mcp-design.md`。
+
 ## 核心功能
 
 ### 🔎 全局文件搜索

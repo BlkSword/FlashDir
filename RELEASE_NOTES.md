@@ -1,5 +1,18 @@
 # FlashDir Release Notes
 
+## Unreleased（十一）—— 原生 MCP 服务器（P0）
+
+- 新增 **`flashdir-mcp.exe`**：stdio + JSON-RPC 2.0（NDJSON）的 MCP 服务器，
+  纯 Rust 实现，无 Node/Python 依赖；与桌面端共享磁盘缓存与全局索引
+- 工具（6 个，全部只读）：`list_volumes`、`search_files`（Everything 语法 + 命中总数 + offset 分页）、
+  `scan_directory`、`list_directory`、`cache_stats`、`diagnostics`
+- 协议：版本协商（2025-06-18 / 2025-03-26 / 2024-11-05）、`notifications/cancelled` → 取消扫描、
+  标准错误码（-32700/-32601…）；stdout 只输出协议消息，日志全部走 stderr
+- 启动即后台加载持久化索引；`search_files` 会短暂等待索引就绪（最多 3s）再返回
+- `--selftest` 脚本化自测（11 项检查，退出码即结果）；实测 stdio 端到端 5 条响应全部合法 JSON
+- 设计文档：`docs/mcp-design.md`（含 P1/P2 规划：重复文件、开发缓存、快照、HTTP/SSE、resources）
+- 界面：目录树去掉加载圆圈与占位文字（刷新时保留旧内容，不再闪空）
+
 ## Unreleased（十）—— 搜索"查看更多"能力
 
 此前搜索结果是硬上限：命令面板 60 条、主搜索视图 1000 条，且没有总数、无法继续加载。

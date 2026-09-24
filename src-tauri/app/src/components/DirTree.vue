@@ -42,8 +42,10 @@ const toNode = (item) => ({
 
 const loadRoot = async () => {
   const root = props.rootPath
-  nodes.value = []
-  if (!root) return
+  if (!root) {
+    nodes.value = []
+    return
+  }
   loading.value = true
   try {
     const children = await invoke('get_dir_children', { path: root })
@@ -204,11 +206,7 @@ const baseName = (p) => (p || '').split(/[\/]/).filter(Boolean).pop() || p || ''
       </button>
     </div>
     <div class="tree-scroll" tabindex="0" @keydown="onKey" @click="ensureFocus">
-      <div v-if="loading" class="tree-empty"><span class="spinner" style="display:inline-block;vertical-align:-3px" /> 正在读取…</div>
-      <div v-else-if="!nodes.length" class="tree-empty">
-        选择一个卷或目录后，这里会列出子目录占用。
-      </div>
-      <template v-else>
+      <template v-if="nodes.length">
         <div
           v-for="(row, i) in visible"
           :key="row.node.path"
@@ -227,7 +225,6 @@ const baseName = (p) => (p || '').split(/[\/]/).filter(Boolean).pop() || p || ''
           <span class="lbl">{{ row.node.name }}</span>
           <span class="sz">{{ formatSizeCompact(row.node.size) }}</span>
         </div>
-        <div v-if="!visible.length" class="tree-empty">该目录没有子目录。</div>
       </template>
 
       <template v-if="volumes.length">
