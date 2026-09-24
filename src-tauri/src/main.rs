@@ -93,10 +93,33 @@ fn work_area_physical() -> Option<(i32, i32, u32, u32)> {
 fn clamp_window_to_work_area(win: &tauri::WebviewWindow) {
     use tauri::{PhysicalPosition, PhysicalSize};
 
+    let Ok(size) = win.outer_size() else { return };
+
+    // SPI_GETWORKAREA 在部分环境（远程桌面 / 显示旋转 / DPI 虚拟化）会返回不可信的值
+    // （实测同一台机器上返回过 1256x2376 的"竖屏"工作区，而实际显示器是 2456x1256）。
+    // 这里用 Tauri 自己的显示器信息做交叉校验：不可信时直接最大化（由系统保证落在工作区内）。
+    if let Ok(Some(monitor)) = win.current_monitor() {
+        let mw = monitor.size().width;
+        let mh = monitor.size().height;
+        let plausible = match work_area_physical() {
+            Some((_, _, w, h)) => {
+                w <= mw && h <= mh && (w as u64) * 10 >= (mw as u64) * 3 && (h as u64) * 10 >= (mh as u64) * 3
+            }
+            None => false,
+        };
+        if !plausible {
+            eprintln!(
+                "[Window] 工作区读数不可信（显示器 {}x{}）→ 直接最大化",
+                mw, mh
+            );
+            let _ = win.maximize();
+            return;
+        }
+    }
+
     let Some((wx, wy, work_w, work_h)) = work_area_physical() else {
         return;
     };
-    let Ok(size) = win.outer_size() else { return };
     let margin: u32 = 16;
 
     if size.width <= work_w && size.height <= work_h {

@@ -121,6 +121,10 @@ mod tests {
     fn list_volumes_returns_sane_data() {
         let vols = super::list_volumes();
         assert!(!vols.is_empty(), "至少应枚举到一个卷");
+
+        // 契约：前端 v-for 直接遍历，必须序列化为数组
+        let json = serde_json::to_value(&vols).expect("序列化失败");
+        assert!(json.is_array(), "卷列表必须序列化为数组");
         for v in &vols {
             assert!(!v.letter.is_empty());
             if v.ready {

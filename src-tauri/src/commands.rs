@@ -2,6 +2,7 @@
 // 负责 IPC 边界：参数校验、历史记录、调用后端引擎、重活下沉到线程池
 
 use flashdir::scan::{self, HistoryItem, HistoryItemSummary};
+use flashdir::global_search::GlobalSearchResponse;
 use crate::AppState;
 use chrono::Utc;
 use std::collections::VecDeque;
@@ -653,20 +654,6 @@ pub fn delete_snapshot(id: i64) -> Result<(), String> {
 
 // ─── 全局文件搜索 ──────────────────────────────────────────
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GlobalSearchResponse {
-    pub ready: bool,
-    pub state: flashdir::global_search::IndexState,
-    pub results: Vec<flashdir::global_search::IndexEntry>,
-    /// 诊断：搜索无结果时返回索引实际条目数
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub index_size: Option<usize>,
-    /// 诊断：搜索无结果时返回前几个索引条目名称(确认 name 字段是否正常)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sample_names: Option<Vec<String>>,
-}
-
 /// 查询全局索引状态
 #[command]
 pub fn global_search_status() -> flashdir::global_search::IndexState {
@@ -783,7 +770,10 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
 /// 全局搜索：按文件名匹配，返回结果（索引未就绪时 ready=false）。
 /// 使用 spawn_blocking：索引过滤/排序可能扫描百万级条目。
 #[command]
-pub async fn global_search(query: String, limit: Option<usize>) -> GlobalSearchResponse {
+pub async fn global_search(
+    query: String,
+    limit: Option<usize>,
+) -> flashdir::global_search::GlobalSearchResponse {
     let limit = limit.unwrap_or(500);
     tauri::async_runtime::spawn_blocking(move || {
         let idx = flashdir::global_search::instance();
@@ -887,3 +877,4 @@ pub async fn global_search_refresh(app: tauri::AppHandle) -> Result<(), String> 
     );
     Ok(())
 }
+

@@ -22,6 +22,7 @@ import { useTheme } from './composables/useTheme.js'
 import { useToasts } from './composables/useToasts.js'
 import { useGlobalSearch } from './composables/useGlobalSearch.js'
 import { formatSize, formatDateTime, formatError, getParentPath, normalizePath } from './utils/format.js'
+import { searchGlobal } from './utils/globalSearchApi.js'
 
 /* ── 状态 ───────────────────────────────────────────────── */
 const currentPath = ref('')
@@ -77,12 +78,14 @@ async function runGlobalSearch(q) {
   searchResults.value = []
   const t0 = performance.now()
   try {
-    const rows = await invoke('global_search', { query, limit: 1000 })
-    searchResults.value = rows || []
+    const res = await searchGlobal(query, 1000)
+    searchResults.value = res.results
     searchElapsed.value = Math.round(performance.now() - t0)
-    if (!searchResults.value.length && !gs.indexMeta.value) {
-      toasts.warn('全局索引尚未建立，正在后台构建，稍后重试')
+    if (!res.ready) {
+      toasts.warn('全局索引尚未就绪，正在后台构建，稍后重试')
       gs.ensureIndex().catch(() => {})
+    } else if (!res.results.length && res.indexSize) {
+      toasts.info('索引中有 ' + res.indexSize.toLocaleString() + ' 项，但没有匹配“' + query + '”')
     }
   } catch (e) {
     searchElapsed.value = Math.round(performance.now() - t0)

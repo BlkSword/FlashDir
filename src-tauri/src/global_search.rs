@@ -112,6 +112,26 @@ fn path_hash(path: &str) -> u128 {
     ((a as u128) << 64) | b as u128
 }
 
+/// 全局搜索命令的返回结构。
+///
+/// 放在 lib 内（而不是 bin 的 commands.rs）有两个原因：
+/// 1. 契约可被 `cargo test --lib` 覆盖（bin crate 的测试二进制在本环境无法加载）；
+/// 2. 前端依赖 `results` 是数组、字段为 camelCase —— 曾经前端把整个响应当数组用，
+///    导致 `rows.map is not a function` 让命令面板渲染失败。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalSearchResponse {
+    pub ready: bool,
+    pub state: IndexState,
+    pub results: Vec<IndexEntry>,
+    /// 诊断：搜索无结果时返回索引实际条目数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index_size: Option<usize>,
+    /// 诊断：搜索无结果时返回前几个索引条目名称（确认 name 字段是否正常）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_names: Option<Vec<String>>,
+}
+
 /// 从绝对路径取文件名（存储态不再保存 name，结果/诊断时才派生）
 fn name_from_path(path: &str) -> String {
     path.rsplit_once('/')
@@ -1532,6 +1552,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 契约：响应是对象且 results 为数组、字段为 camelCase（前端据此渲染列表）
+    #[test]
+    fn contract_global_search_response_shape() {
+        let resp = GlobalSearchResponse {
+            ready: true,
+            state: IndexState::NotLoaded,
+            results: Vec::new(),
+            index_size: Some(42),
+            sample_names: Some(vec!["a.txt".to_string()]),
+        };
+        let json = serde_json::to_value(&resp).expect("序列化失败");
+        assert_eq!(json["ready"], serde_json::json!(true));
+        assert!(json["results"].is_array(), "results 必须是数组");
+        assert_eq!(json["indexSize"], serde_json::json!(42));
+        assert!(json["sampleNames"].is_array());
     }
 
     #[test]

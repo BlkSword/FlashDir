@@ -2,7 +2,8 @@
 import { ref, computed, watch, nextTick } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import Icon from './Icon.vue'
-import { formatSizeCompact, formatError } from '../utils/format.js'
+import { formatSizeCompact } from '../utils/format.js'
+import { searchGlobal } from '../utils/globalSearchApi.js'
 
 const props = defineProps({
   open: { type: Boolean, default: false },
@@ -18,6 +19,8 @@ const q = ref('')
 const active = ref(0)
 const results = ref([])
 const searching = ref(false)
+/** 索引未就绪 / 空结果时的诊断信息 */
+const searchNote = ref('')
 const inputRef = ref(null)
 let timer = null
 let seq = 0
@@ -58,11 +61,23 @@ const runSearch = async () => {
   }
   const my = ++seq
   searching.value = true
+  searchNote.value = ''
   try {
-    const rows = await invoke('global_search', { query, limit: 60 })
-    if (my === seq) results.value = rows || []
+    const res = await searchGlobal(query, 60)
+    if (my !== seq) return
+    results.value = res.results
+    if (!res.ready) {
+      searchNote.value = '全局索引尚未就绪，正在后台构建；稍后重试或按 Ctrl+K 运行“建立全局索引”'
+    } else if (!res.results.length && res.indexSize) {
+      searchNote.value =
+        '索引中有 ' + res.indexSize.toLocaleString() + ' 项但没有匹配' +
+        (res.sampleNames.length ? '；索引内名称示例：' + res.sampleNames.slice(0, 3).join('、') : '')
+    }
   } catch (e) {
-    if (my === seq) results.value = []
+    if (my === seq) {
+      results.value = []
+      searchNote.value = '搜索失败：' + (e && (e.message || e))
+    }
   } finally {
     if (my === seq) searching.value = false
   }
@@ -79,6 +94,7 @@ watch(() => props.open, async (v) => {
   if (!v) return
   q.value = props.seed || ''
   results.value = []
+  searchNote.value = ''
   active.value = 0
   await nextTick()
   inputRef.value?.focus()
@@ -136,7 +152,8 @@ const onKey = (e) => {
 
       <div class="palette-list">
         <div v-if="searching" style="padding:10px 12px;color:var(--tx-3);font-size:11.5px">正在搜索…</div>
-        <div v-else-if="!items.length" style="padding:10px 12px;color:var(--tx-3);font-size:11.5px">
+        <div v-else-if="searchNote" style="padding:8px 12px;color:var(--warn);font-size:11.5px;line-height:1.7">{{ searchNote }}</div>
+        <div v-else-if="!items.length && !searchNote" style="padding:10px 12px;color:var(--tx-3);font-size:11.5px">
           <template v-if="isCommandMode">没有匹配的命令。</template>
           <template v-else-if="q.trim()">没有匹配的文件。语法：ext:zip size:&gt;1GB dir:node_modules !tmp type:dir</template>
           <template v-else>输入文件名开始搜索；Tab 切换到命令模式（&gt;）。</template>

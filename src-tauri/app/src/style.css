@@ -110,6 +110,23 @@ kbd {
 .fd-col.tree { border-right: 1px solid var(--bd-0); background: var(--bg-1); }
 .fd-col.insp { border-left: 1px solid var(--bd-0); background: var(--bg-1); }
 
+/* 窄窗口响应式：优先保证文件表可用（云桌面/竖屏/分屏场景） */
+@media (max-width: 1100px) {
+  .fd-body {
+    grid-template-columns: clamp(180px, 20vw, 236px) minmax(0, 1fr) clamp(198px, 22vw, 272px);
+  }
+}
+@media (max-width: 880px) {
+  .fd-body {
+    grid-template-columns: clamp(168px, 26vw, 220px) minmax(0, 1fr);
+  }
+  .fd-col.insp { display: none; }
+}
+@media (max-width: 620px) {
+  .fd-body { grid-template-columns: minmax(0, 1fr); }
+  .fd-col.tree { display: none; }
+}
+
 /* ── 标题栏 ──────────────────────────────────────────────── */
 .titlebar {
   display: flex; align-items: center; gap: 8px; height: var(--titlebar-h);

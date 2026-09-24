@@ -1,5 +1,26 @@
 # FlashDir Release Notes
 
+## Unreleased（九）—— 搜索响应结构修复 + 窗口/布局健壮性
+
+### 修复：命令面板报 `g.value.map is not a function`，搜索不可用
+- 根因：后端 `global_search` 返回的是**对象**
+  `{ ready, state, results, indexSize?, sampleNames? }`，而前端（命令面板与主搜索框）
+  直接把它当数组用（`results.value = rows || []` → `rows.map(...)` 崩溃），
+  组件渲染抛错、命令面板直接不可用
+- 修复：新增 `utils/globalSearchApi.js` 统一归一化响应；两处调用点都改用它
+- 顺带用上后端已有的诊断字段：索引未就绪 → 明确提示并触发构建；
+  有索引但无匹配 → 提示"索引 N 项无匹配 + 索引内名称示例"
+- **新增契约测试**（lib 内，可被 `cargo test --lib` 覆盖）：
+  把 `GlobalSearchResponse` 从 bin 的 commands.rs 移到 lib 的 global_search.rs，
+  并断言 `results` 是数组、字段为 camelCase；卷列表同样断言为数组
+
+### 窗口与布局健壮性
+- 工作区读数可信度校验：`SPI_GETWORKAREA` 在远程桌面/显示旋转/DPI 虚拟化下可能返回
+  不可信值（实测同机出现过 1256x2376 的"竖屏"工作区），现在与 Tauri 显示器信息交叉校验，
+  不可信则直接最大化
+- 窄窗口响应式：≤1100px 收窄两侧栏；≤880px 隐藏检查器；≤620px 隐藏目录树，
+  始终保证文件表可用（云桌面/竖屏/分屏场景）
+
 ## Unreleased（八）—— 小屏/高 DPI 窗口适配
 
 ### 修复 2：状态栏不贴底 / 与洞察坞"黏连"（真正的根因）
