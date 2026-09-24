@@ -773,25 +773,31 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
 pub async fn global_search(
     query: String,
     limit: Option<usize>,
+    offset: Option<usize>,
 ) -> flashdir::global_search::GlobalSearchResponse {
-    let limit = limit.unwrap_or(500);
+    // 上限 20 万条：既够"查看更多"，又不至于把 IPC 打爆
+    let limit = limit.unwrap_or(500).clamp(1, 200_000);
+    let offset = offset.unwrap_or(0);
     tauri::async_runtime::spawn_blocking(move || {
         let idx = flashdir::global_search::instance();
         let state = idx.state();
         let ready = matches!(state, flashdir::global_search::IndexState::Ready(..));
-        let (results, index_size, sample_names) = if ready {
-            let r = idx.search_with_filter(&query, limit);
+        let (results, total, index_size, sample_names) = if ready {
+            let (r, total) = idx.search_with_filter_paged(&query, limit, offset);
             let empty = r.is_empty() && !query.trim().is_empty();
             let n = if empty { Some(idx.entries_len()) } else { None };
             let sn = if empty { Some(idx.sample_names(5)) } else { None };
-            (r, n, sn)
+            (r, total, n, sn)
         } else {
-            (vec![], None, None)
+            (vec![], 0usize, None, None)
         };
+        let truncated = total > offset + results.len();
         GlobalSearchResponse {
             ready,
             state,
             results,
+            total,
+            truncated,
             index_size,
             sample_names,
         }
@@ -801,6 +807,8 @@ pub async fn global_search(
         ready: false,
         state: flashdir::global_search::IndexState::NotLoaded,
         results: Vec::new(),
+        total: 0,
+        truncated: false,
         index_size: None,
         sample_names: None,
     })

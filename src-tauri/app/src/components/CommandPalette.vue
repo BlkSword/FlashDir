@@ -13,7 +13,7 @@ const props = defineProps({
   scope: { type: String, default: '' },
   seed: { type: String, default: '' },
 })
-const emit = defineEmits(['close', 'run', 'open-path', 'navigate'])
+const emit = defineEmits(['close', 'run', 'open-path', 'navigate', 'open-full'])
 
 const q = ref('')
 const active = ref(0)
@@ -21,6 +21,8 @@ const results = ref([])
 const searching = ref(false)
 /** 索引未就绪 / 空结果时的诊断信息 */
 const searchNote = ref('')
+/** 命中总数（可能远大于面板显示的条数） */
+const totalHits = ref(0)
 const inputRef = ref(null)
 let timer = null
 let seq = 0
@@ -62,12 +64,18 @@ const runSearch = async () => {
   const my = ++seq
   searching.value = true
   searchNote.value = ''
+  totalHits.value = 0
   try {
-    const res = await searchGlobal(query, 60)
+    const res = await searchGlobal(query, { limit: 60 })
     if (my !== seq) return
     results.value = res.results
+    totalHits.value = res.total || res.results.length
     if (!res.ready) {
       searchNote.value = '全局索引尚未就绪，正在后台构建；稍后重试或按 Ctrl+K 运行“建立全局索引”'
+    } else if (res.total > res.results.length) {
+      searchNote.value =
+        '共 ' + res.total.toLocaleString() + ' 项命中，这里只显示前 ' + res.results.length +
+        ' 项（按 Ctrl+Enter 查看全部结果）'
     } else if (!res.results.length && res.indexSize) {
       searchNote.value =
         '索引中有 ' + res.indexSize.toLocaleString() + ' 项但没有匹配' +
@@ -121,7 +129,11 @@ const onKey = (e) => {
   else if (e.key === 'ArrowUp') { e.preventDefault(); move(-1) }
   else if (e.key === 'Enter') { e.preventDefault(); choose() }
   else if (e.key === 'Escape') { e.preventDefault(); emit('close') }
-  else if (e.key === 'Tab') {
+  else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+    e.preventDefault()
+    emit('open-full', q.value.trim())
+    emit('close')
+  } else if (e.key === 'Tab') {
     // Tab 在"文件搜索 / 命令"之间来回切换（早期只能单向进入命令模式，用户会以为搜索坏了）
     e.preventDefault()
     q.value = isCommandMode.value ? q.value.replace(/^>\s*/, '') : '> ' + q.value.trim()
@@ -180,6 +192,10 @@ const onKey = (e) => {
         <span><kbd>Enter</kbd> 打开</span>
         <span><kbd>Tab</kbd> 命令模式</span>
         <span><kbd>Esc</kbd> 关闭</span>
+        <span v-if="!isCommandMode && totalHits > 0" class="hits">
+          共 <b class="mono">{{ totalHits.toLocaleString() }}</b> 项命中
+          <template v-if="totalHits > items.length"> · <kbd>Ctrl</kbd>+<kbd>Enter</kbd> 查看全部</template>
+        </span>
         <span style="margin-left:auto">文件搜索走全局索引；目录项回车进入并扫描</span>
       </div>
     </div>

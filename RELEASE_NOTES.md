@@ -1,5 +1,24 @@
 # FlashDir Release Notes
 
+## Unreleased（十）—— 搜索"查看更多"能力
+
+此前搜索结果是硬上限：命令面板 60 条、主搜索视图 1000 条，且没有总数、无法继续加载。
+
+### 后端
+- `search_with_filter_paged(query, limit, offset) -> (结果, 命中总数)`：
+  命中总数在 top-K 收集过程中顺带统计（每线程计数后归并），不受 limit/offset 影响
+- `global_search(query, limit, offset)`：limit 上限提到 20 万，响应新增 `total` / `truncated`
+- 新增单测：分页不重叠、最后一页余量、越界返回空、总数与 limit 无关
+
+### 前端
+- 结果视图 `SearchResults.vue` 重写：
+  - **虚拟滚动**（只渲染可视窗口内的行，5 万条也流畅）
+  - 头部显示"命中 N 项 · 已显示前 M 项 · 索引规模 · 耗时"
+  - **加载更多**：按钮 + 滚到底部自动续加载（1000 条/页）
+  - **导出全部**：最多 5 万条导出为 CSV（带 BOM，Excel 直接打开）
+  - 键盘：↑↓ / PgUp PgDn / Enter 打开 / Esc 返回；追加分页不重置滚动位置
+- 命令面板：显示"共 N 项命中"，`Ctrl+Enter` 打开完整结果视图（面板仍只取 60 条做快速跳转）
+
 ## Unreleased（九）—— 搜索响应结构修复 + 窗口/布局健壮性
 
 ### 修复：命令面板报 `g.value.map is not a function`，搜索不可用

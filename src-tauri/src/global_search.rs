@@ -124,6 +124,10 @@ pub struct GlobalSearchResponse {
     pub ready: bool,
     pub state: IndexState,
     pub results: Vec<IndexEntry>,
+    /// 命中总数（不受 limit/offset 影响）：前端用于"共 N 项命中，已显示前 M 项"
+    pub total: usize,
+    /// 是否还有更多结果（total > offset + results.len()）
+    pub truncated: bool,
     /// 诊断：搜索无结果时返回索引实际条目数
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_size: Option<usize>,
@@ -608,17 +612,40 @@ impl GlobalIndex {
             .collect()
     }
 
-    /// 支持 Everything 式过滤语法与相关性排序的搜索。
+    /// 支持 Everything 式过滤语法与相关性排序的搜索（返回前 limit 条）。
     /// 过滤语法：ext:zip size:>100MB type:file dir:xxx name:xxx mtime:>7d NOT .tmp
     pub fn search_with_filter(&self, query: &str, limit: usize) -> Vec<IndexEntry> {
+        self.search_with_filter_paged(query, limit, 0).0
+    }
+
+    /// 分页搜索：返回 `(结果, 命中总数)`。
+    ///
+    /// 实现方式是"取前 limit+offset 条再丢弃前 offset 条"——搜索本身是 top-K 收集，
+    /// 没有可随机访问的全序结果；offset 通常很小（前端按页加载），代价可接受。
+    pub fn search_with_filter_paged(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> (Vec<IndexEntry>, usize) {
+        let (mut all, total) = self.search_internal(query, limit.saturating_add(offset));
+        let page = if offset >= all.len() {
+            Vec::new()
+        } else {
+            all.split_off(offset)
+        };
+        (page, total)
+    }
+
+    fn search_internal(&self, query: &str, limit: usize) -> (Vec<IndexEntry>, usize) {
         if limit == 0 {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
         let filters = parse_search_filter(query);
         // 过滤条件为空（例如输入只有 AND/OR 或未识别的空 token）：
         // 直接返回空结果，绝不能退化成"全量按大小返回前 N 条"。
         if filters.is_empty() {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
 
         // 只把"正向文本条件"用于首字符分桶。
@@ -638,7 +665,7 @@ impl GlobalIndex {
 
         // 每线程维护一个大小为 limit 的 top-K 堆，最后归并；
         // 只会 clone 最终 ≤limit 条，而不是克隆全部命中。
-        let results = if !has_text || q_lower.chars().count() <= 2 {
+        let topk = if !has_text || q_lower.chars().count() <= 2 {
             // 无文本条件（*.pdf / size:>1GB 等）或短查询：全量并行过滤
             let values: Vec<&IndexEntry> = entries.iter().collect();
             values
@@ -653,12 +680,11 @@ impl GlobalIndex {
                     },
                 )
                 .reduce(|| TopK::new(limit), TopK::merge)
-                .into_entries()
         } else if let Some(first_char) = q_lower.chars().next() {
             // 长文本：只扫首字符桶。
             // 注意这里收集的是 &String 引用（几百 KB），不再 clone 每个候选路径。
             let name_index = self.name_index.read();
-            let results = match name_index.get(&first_char) {
+            let bucket_topk = match name_index.get(&first_char) {
                 Some(bucket) => bucket
                     .par_iter()
                     .fold(
@@ -672,18 +698,20 @@ impl GlobalIndex {
                             acc
                         },
                     )
-                    .reduce(|| TopK::new(limit), TopK::merge)
-                    .into_entries(),
-                None => Vec::new(),
+                    .reduce(|| TopK::new(limit), TopK::merge),
+                None => TopK::new(limit),
             };
             drop(name_index);
-            results
+            bucket_topk
         } else {
-            Vec::new()
+            TopK::new(limit)
         };
 
+        let total = topk.total();
+        let results = topk.into_entries();
+
         drop(entries);
-        results
+        (results, total)
     }
 }
 
@@ -1063,6 +1091,8 @@ fn extension_matches(name: &str, ext_lower: &str) -> bool {
 struct TopK<'a> {
     limit: usize,
     heap: BinaryHeap<Candidate<'a>>,
+    /// 命中总数（用于"共 N 项命中，已显示前 M 项"）
+    count: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -1111,10 +1141,12 @@ impl<'a> TopK<'a> {
         Self {
             limit,
             heap: BinaryHeap::with_capacity(limit.min(1024)),
+            count: 0,
         }
     }
 
     fn push(&mut self, entry: &'a IndexEntry, score: i64) {
+        self.count += 1;
         let candidate = Candidate { entry, score };
         if self.heap.len() < self.limit {
             self.heap.push(candidate);
@@ -1127,6 +1159,7 @@ impl<'a> TopK<'a> {
     }
 
     fn merge(mut self, other: Self) -> Self {
+        self.count += other.count;
         for candidate in other.heap {
             if self.heap.len() < self.limit {
                 self.heap.push(candidate);
@@ -1138,6 +1171,11 @@ impl<'a> TopK<'a> {
             }
         }
         self
+    }
+
+    /// 命中总数
+    fn total(&self) -> usize {
+        self.count
     }
 
     /// 升序出堆（最优在前），此时才 clone 结果条目并补上文件名
@@ -1449,6 +1487,56 @@ mod tests {
         ));
     }
 
+    /// 分页 + 命中总数：前端"查看更多"依赖这两个能力
+    #[test]
+    fn test_search_paging_and_total_count() {
+        let idx = empty_instance_for_test();
+        for i in 0..25 {
+            let name = format!("report_{:02}.pdf", i);
+            idx.upsert(IndexEntry {
+                path: format!("C:/docs/{}", name),
+                name_lower: name.to_lowercase(),
+                size: 1024 + i as i64,
+                is_dir: false,
+                mtime: 0,
+            });
+        }
+        for i in 0..5 {
+            let name = format!("other_{}.txt", i);
+            idx.upsert(IndexEntry {
+                path: format!("C:/docs/{}", name),
+                name_lower: name.to_lowercase(),
+                size: 10,
+                is_dir: false,
+                mtime: 0,
+            });
+        }
+
+        let (page1, total1) = idx.search_with_filter_paged("report", 10, 0);
+        assert_eq!(total1, 25, "命中总数应为 25（与 limit 无关）");
+        assert_eq!(page1.len(), 10);
+
+        let (page2, total2) = idx.search_with_filter_paged("report", 10, 10);
+        assert_eq!(total2, 25);
+        assert_eq!(page2.len(), 10);
+
+        let (page3, _) = idx.search_with_filter_paged("report", 10, 20);
+        assert_eq!(page3.len(), 5, "最后一页只剩 5 条");
+
+        // 页间不重复
+        let p1: Vec<&str> = page1.iter().map(|e| e.path.as_str()).collect();
+        let p2: Vec<&str> = page2.iter().map(|e| e.path.as_str()).collect();
+        assert!(p1.iter().all(|p| !p2.contains(p)), "分页结果不应重叠");
+
+        // 越界返回空
+        let (empty, total4) = idx.search_with_filter_paged("report", 10, 100);
+        assert!(empty.is_empty());
+        assert_eq!(total4, 25);
+
+        // 单页便捷接口仍可用
+        assert_eq!(idx.search_with_filter("report", 10).len(), 10);
+    }
+
     #[test]
     fn test_search_with_filter_suffix_syntax() {
         let idx = empty_instance_for_test();
@@ -1561,12 +1649,16 @@ mod tests {
             ready: true,
             state: IndexState::NotLoaded,
             results: Vec::new(),
+            total: 42,
+            truncated: false,
             index_size: Some(42),
             sample_names: Some(vec!["a.txt".to_string()]),
         };
         let json = serde_json::to_value(&resp).expect("序列化失败");
         assert_eq!(json["ready"], serde_json::json!(true));
         assert!(json["results"].is_array(), "results 必须是数组");
+        assert_eq!(json["total"], serde_json::json!(42), "命中总数必须返回");
+        assert_eq!(json["truncated"], serde_json::json!(false));
         assert_eq!(json["indexSize"], serde_json::json!(42));
         assert!(json["sampleNames"].is_array());
     }

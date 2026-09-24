@@ -64,36 +64,98 @@ const searchQuery = ref('')
 const searchResults = ref([])
 const searching = ref(false)
 const searchElapsed = ref(0)
+const searchTotal = ref(0)
+const searchTruncated = ref(false)
+const searchLoadingMore = ref(false)
+const searchExporting = ref(false)
 const paletteSeed = ref('')
 
-async function runGlobalSearch(q) {
+/** 每页加载条数（"加载更多"步长） */
+const SEARCH_PAGE = 1000
+/** 导出上限：避免一次性把几十万条塞进内存/CSV */
+const SEARCH_EXPORT_MAX = 50000
+
+async function runGlobalSearch(q, { append = false } = {}) {
   const query = (q || '').trim()
   if (!query) {
     toasts.warn('请输入搜索关键字')
     return
   }
-  view.value = 'search'
-  searching.value = true
-  searchQuery.value = query
-  searchResults.value = []
+  if (!append) {
+    view.value = 'search'
+    searchQuery.value = query
+    searchResults.value = []
+    searchTotal.value = 0
+    searchTruncated.value = false
+  }
+  const offset = append ? searchResults.value.length : 0
+  if (append) searchLoadingMore.value = true
+  else searching.value = true
+
   const t0 = performance.now()
   try {
-    const res = await searchGlobal(query, 1000)
-    searchResults.value = res.results
+    const res = await searchGlobal(query, { limit: SEARCH_PAGE, offset })
+    if (append) searchResults.value = searchResults.value.concat(res.results)
+    else searchResults.value = res.results
+    searchTotal.value = res.total
+    searchTruncated.value = res.truncated
     searchElapsed.value = Math.round(performance.now() - t0)
+
     if (!res.ready) {
       toasts.warn('全局索引尚未就绪，正在后台构建，稍后重试')
       gs.ensureIndex().catch(() => {})
-    } else if (!res.results.length && res.indexSize) {
+    } else if (!append && !res.results.length && res.indexSize) {
       toasts.info('索引中有 ' + res.indexSize.toLocaleString() + ' 项，但没有匹配“' + query + '”')
     }
   } catch (e) {
-    searchElapsed.value = Math.round(performance.now() - t0)
     const msg = formatError(e)
     toasts.err('搜索失败：' + msg)
     if (/索引|index/i.test(msg)) gs.ensureIndex().catch(() => {})
   } finally {
     searching.value = false
+    searchLoadingMore.value = false
+  }
+}
+
+/** 加载下一页搜索结果 */
+function loadMoreSearch() {
+  if (searchLoadingMore.value || !searchTruncated.value) return
+  runGlobalSearch(searchQuery.value, { append: true })
+}
+
+/** 导出全部命中（上限 5 万条）为 CSV */
+async function exportSearchCsv() {
+  const query = searchQuery.value
+  if (!query) return
+  searchExporting.value = true
+  try {
+    const want = Math.min(searchTotal.value || SEARCH_EXPORT_MAX, SEARCH_EXPORT_MAX)
+    const res = await searchGlobal(query, { limit: Math.max(1, want), offset: 0 })
+    const rows = res.results
+    if (!rows.length) {
+      toasts.warn('没有可导出的结果')
+      return
+    }
+    const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`
+    const lines = ['名称,大小(字节),类型,修改时间,完整路径']
+    for (const r of rows) {
+      lines.push([esc(r.name), r.size, r.isDir ? '目录' : '文件', esc(formatDateTime(r.mtime)), esc(r.path)].join(','))
+    }
+    const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' })
+
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = `flashdir-search-${Date.now()}.csv`
+    a.click()
+    URL.revokeObjectURL(a.href)
+    toasts.ok(
+      '已导出 ' + rows.length.toLocaleString() + ' 条' +
+      (res.total > rows.length ? '（共 ' + res.total.toLocaleString() + ' 条，已达上限 ' + SEARCH_EXPORT_MAX.toLocaleString() + '）' : '')
+    )
+  } catch (e) {
+    toasts.err('导出失败：' + formatError(e))
+  } finally {
+    searchExporting.value = false
   }
 }
 
@@ -577,7 +639,11 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
         v-if="view === 'search'"
         :query="searchQuery"
         :results="searchResults"
+        :total="searchTotal"
+        :truncated="searchTruncated"
         :loading="searching"
+        :loading-more="searchLoadingMore"
+        :exporting="searchExporting"
         :elapsed-ms="searchElapsed"
         :index-count="gs.indexMeta.value ? (gs.indexMeta.value.fileCount || 0) + (gs.indexMeta.value.dirCount || 0) : 0"
         :index-partial="!!gs.indexMeta.value?.partial"
@@ -587,6 +653,8 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
         @back="view = 'list'"
         @retry="runGlobalSearch(searchQuery)"
         @copy="copyText"
+        @more="loadMoreSearch"
+        @export-all="exportSearchCsv"
       />
 
       <FileTable
@@ -674,6 +742,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
       :scope="scopeLabel"
       @close="paletteOpen = false"
       @run="runCommand"
+      @open-full="runGlobalSearch($event)"
       @open-path="(p) => invoke('open_path', { path: p }).catch((e) => toasts.err('打开失败：' + formatError(e)))"
       @navigate="navigate"
     />
