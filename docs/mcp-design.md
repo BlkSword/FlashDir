@@ -4,46 +4,46 @@
 > （扫描、全局索引搜索、重复文件、开发缓存、快照对比）暴露给 AI 客户端
 > （Claude Desktop / Cursor / 其他 MCP Host），且**不引入 Node/Python 运行时**。
 
-## 0. 实现状态（P0 已完成并验证）
+## 0. 实现状态（已完成并验证）
 
-产物：**`flashdir-mcp.exe`**（console 二进制，3.7 MB，与 GUI 共享同一份磁盘缓存与全局索引）
+**单一产物**：MCP 是 `flashdir.exe` 的命令行模式，不再有第二个二进制。
 
-```jsonc
-// Claude Desktop / Cursor 的 MCP 配置
-{
-  "mcpServers": {
-    "flashdir": {
-      "command": "C:\path\to\flashdir-mcp.exe"
-    }
-  }
-}
+```
+Claude Desktop / Cursor
+   │ 方式一：HTTP   POST http://127.0.0.1:47821/mcp?token=<持久 token>
+   │ 方式二：stdio  flashdir.exe --bridge（自动拉起桌面端）
+   ▼
+flashdir.exe（桌面端内后台线程的 HTTP 端点）  ← 热索引 / 扫描缓存 / 管理员权限
 ```
 
-自测（不需要 Host，CI 可跑）：
+| 模式 | 命令 | 说明 |
+|------|------|------|
+| 桌面端（默认） | `flashdir.exe` | 启动 GUI，并在后台开启 HTTP 端点 |
+| 桥接（Host 用） | `flashdir.exe --bridge` | stdio ↔ 本机 HTTP；桌面端未运行会自动拉起 |
+| 独立 stdio | `flashdir.exe --mcp` | 不依赖桌面端；权限继承 Host（通常非管理员） |
+| 自测 | `--selftest` / `--selftest-endpoint` / `--selftest-bridge` | 11 / 6 / 链路 |
+| 帮助 | `--mcp-help` | 打印当前 HTTP 地址与用法 |
 
-```powershell
-flashdir-mcp.exe --selftest
-# [PASS] initialize 返回协议版本与 serverInfo
-# [PASS] tools/list 返回工具清单
-# ... 共 11 项 → 退出码 0
-```
+**端点约定**
 
-已实现工具（6 个，全部只读）：
+- 端口固定 `47821`（占用则顺延 47822…47825），仅监听 `127.0.0.1`
+- token 持久化于 `~/.flashdir/mcp-token`（仅当前用户可读）→ 配置里的 URL 长期有效
+- 支持 `Authorization: Bearer <token>` 或 `?token=`；无 token → 401
+- 传输形态：MCP **Streamable HTTP** 最小合规子集 —— `POST /mcp`（单条/批量 JSON-RPC，
+  返回 `application/json`）、`GET /mcp`（`Accept: text/event-stream` 时保持 SSE 心跳）、
+  `DELETE /mcp`（204）、notification → 202
+- 端点文件 `~/.flashdir/mcp-endpoint.json` 记录 `{port,pid,url}`，桥接据此发现端点
+- 为什么不用命名管道：桌面端常以管理员运行，管道的强制完整性标签会阻止非管理员桥进程读写
+- 为什么桥接要用 HTTP 而不是自定义握手：Host 侧只用一次协议实现（stdio），
+  本机侧复用同一套 HTTP 语义，减少两套协议分叉
 
-| 工具 | 说明 |
-|------|------|
-| `list_volumes` | 卷容量/可用/文件系统/是否 NTFS |
-| `search_files` | 全局索引搜索（Everything 语法，毫秒级，返回命中总数，支持 offset 分页） |
-| `scan_directory` | 目录体积构成（完整流水线，返回来源/耗时/文件数/Top N） |
-| `list_directory` | 分页列目录（同流水线 + offset） |
-| `cache_stats` | 磁盘缓存统计 |
-| `diagnostics` | 版本/管理员/索引状态/缓存/卷列表 |
+**实测**
 
-实测：`search_files {"query":"*.pdf size:>1MB"}` → 命中 2 项并返回路径与大小；
-`scan_directory {"path":"C:/Windows/System32","filter":"ext:dll"}` → 981 项 / 1.99 GB / 2459ms / source=scan。
+- `--selftest` 11 项、`--selftest-endpoint` 6 项（含 401、202、批量）、`--selftest-bridge` 全通过
+- `curl POST http://127.0.0.1:47821/mcp?token=…` → 200 且返回真实搜索结果；无 token → 401
+- 自动拉起：桌面端未运行时桥接自动启动它并完成调用，退出码 0
+- 修复的真问题：被拉起的桌面端会继承桥的 stdio 管道导致 Host 卡住 → 现在完全脱离 stdio
 
-> 注意：GUI 的 `flashdir.exe` 是 `windows_subsystem = "windows"`（无 stdio），
-> 因此 MCP 必须用独立的 console 二进制；两者共享 SQLite（WAL）与外部 blob 缓存。
 
 ## 1. 为什么"原生 Rust"实现
 ## 1. 为什么"原生 Rust"实现

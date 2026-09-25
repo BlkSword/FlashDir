@@ -170,26 +170,55 @@ SIZE     TYPE       NAME
 
 ## MCP（Model Context Protocol）支持
 
-FlashDir 可作为 **MCP 服务器**被 AI 客户端调用（Claude Desktop / Cursor 等），
-把本机磁盘能力交给模型：全局索引搜索、目录体积构成、卷容量、缓存/索引诊断。
-**原生 Rust 实现，不需要 Node/Python**；与桌面端共享同一份缓存与索引。
+FlashDir 可作为 **MCP 服务器**被 AI 客户端调用（Claude Desktop / Cursor 等）：
+让模型直接查询本机磁盘——全局索引搜索、目录体积构成、卷容量、缓存/索引诊断。
+**原生 Rust 实现，无 Node/Python 依赖**；与桌面端**共享同一份索引与扫描缓存**，并继承其管理员权限。
+
+**只有一个产物**：`flashdir.exe`（MCP 模式是它的命令行参数，不再有第二个二进制）。
+
+### 配置方式一：HTTP 地址（推荐，端口固定、配置跨机器一致）
 
 ```jsonc
-// Claude Desktop / Cursor 配置
 {
   "mcpServers": {
-    "flashdir": { "command": "C:\path\to\flashdir-mcp.exe" }
+    "flashdir": { "url": "http://127.0.0.1:47821/mcp?token=<本机 token>" }
   }
 }
 ```
 
-推荐用**桥接模式**（`"args": ["--bridge"]`）：桌面端未运行会**自动拉起**，并共享它的热索引与扫描缓存、
-继承其管理员权限（MFT 直读）；桌面端状态栏会显示 `MCP 已连接 · 最近调用`，点击可一键复制配置。
-也可用独立模式（`flashdir-mcp.exe`，不依赖桌面端，但权限继承 Host）。
+- 端口**固定为 47821**（被占用时自动顺延，实际地址见桌面端设置页/状态栏）
+- token 持久保存在 `~/.flashdir/mcp-token`，所以这段配置**长期有效、重启不用改**
+- 只监听 127.0.0.1，不需要防火墙放行；无 token 访问返回 401
 
-工具（全部只读）：`list_volumes` · `search_files`（Everything 语法，毫秒级，含命中总数与分页）
-· `scan_directory` · `list_directory` · `cache_stats` · `diagnostics`。
-自测：`flashdir-mcp.exe --selftest`。设计细节见 `docs/mcp-design.md`。
+### 配置方式二：stdio 命令（兼容只支持 command 的 Host）
+
+```jsonc
+{
+  "mcpServers": {
+    "flashdir": { "command": "C:\path\to\flashdir.exe", "args": ["--bridge"] }
+  }
+}
+```
+
+桌面端未运行时会**自动拉起**并等待就绪；桌面端状态栏显示 `MCP 已连接 · 最近调用`，
+点击即可复制上面两种配置。
+
+### 工具（全部只读）
+
+`list_volumes` · `search_files`（Everything 语法，毫秒级，含命中总数与分页）·
+`scan_directory` · `list_directory` · `cache_stats` · `diagnostics`
+
+### 自测
+
+```powershell
+flashdir.exe --selftest            # 协议与工具（11 项）
+flashdir.exe --selftest-endpoint   # HTTP 端点与 token（6 项）
+flashdir.exe --selftest-bridge     # 桥接链路（需桌面端运行）
+flashdir.exe --mcp-help            # 查看当前 HTTP 地址与用法
+```
+
+设计细节见 `docs/mcp-design.md`。
+
 
 ## 核心功能
 

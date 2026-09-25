@@ -71,8 +71,9 @@ const searchExporting = ref(false)
 /* MCP（AI 客户端接入）状态与配置 */
 const mcpStatus = ref(null)
 const mcpConfigOpen = ref(false)
-const mcpConfigText = ref('')
-const mcpConfigCommand = ref('')
+const mcpConfigHttp = ref('')
+const mcpConfigStdio = ref('')
+const mcpUrl = ref('')
 const paletteSeed = ref('')
 
 /** 每页加载条数（"加载更多"步长） */
@@ -193,18 +194,15 @@ async function loadMcpStatus() {
 
 async function openMcpConfig() {
   mcpConfigOpen.value = true
-  mcpConfigText.value = '正在获取…'
+  mcpConfigHttp.value = '正在获取…'
   try {
     const cfg = await invoke('get_mcp_config')
-    mcpConfigText.value = cfg.config || ''
-    mcpConfigCommand.value = cfg.command || ''
+    mcpConfigHttp.value = cfg.configHttp || ''
+    mcpConfigStdio.value = cfg.configStdio || ''
+    mcpUrl.value = cfg.url || ''
   } catch (e) {
-    mcpConfigText.value = '获取失败：' + formatError(e)
+    mcpConfigHttp.value = '获取失败：' + formatError(e)
   }
-}
-
-async function copyMcpConfig() {
-  await copyText(mcpConfigText.value)
 }
 
 /* ── 卷信息 ─────────────────────────────────────────────── */
@@ -811,25 +809,34 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
       </div>
     </UiModal>
 
-    <UiModal :open="mcpConfigOpen" title="MCP：让 AI 客户端接入 FlashDir" width="720px" @close="mcpConfigOpen = false">
+    <UiModal :open="mcpConfigOpen" title="MCP：让 AI 客户端接入 FlashDir" width="760px" @close="mcpConfigOpen = false">
       <div class="section-note" style="line-height:1.9">
-        把下面这段加到 <b>Claude Desktop</b>（<span class="mono">%APPDATA%\Claude\claude_desktop_config.json</span>）
-        或 <b>Cursor</b>（<span class="mono">~/.cursor/mcp.json</span>）的配置里，重启客户端即可。
-        桥接模式会复用桌面端的索引与缓存，并继承它的管理员权限（MFT 直读）。
+        加到 <b>Claude Desktop</b>（<span class="mono">%APPDATA%\Claude\claude_desktop_config.json</span>）
+        或 <b>Cursor</b>（<span class="mono">~/.cursor/mcp.json</span>）后重启客户端。
+        两种方式都**复用桌面端的索引与扫描缓存**，并继承它的管理员权限（MFT 直读）。
       </div>
-      <pre class="mono-block" style="margin-top:8px;max-height:320px">{{ mcpConfigText }}</pre>
-      <div class="section-note" style="margin-top:8px">
+
+      <div class="insp-h">方式一：HTTP 地址（推荐 · 端口固定，配置跨机器一致）</div>
+      <pre class="mono-block" style="max-height:150px">{{ mcpConfigHttp }}</pre>
+      <div class="chips">
+        <span class="chip" @click="copyText(mcpConfigHttp)"><Icon name="copy" />复制 HTTP 配置</span>
+        <span class="chip" @click="copyText(mcpUrl)"><Icon name="copy" />只复制地址</span>
+      </div>
+
+      <div class="insp-h">方式二：stdio 命令（兼容只支持 command 的 Host）</div>
+      <pre class="mono-block" style="max-height:170px">{{ mcpConfigStdio }}</pre>
+      <div class="chips">
+        <span class="chip" @click="copyText(mcpConfigStdio)"><Icon name="copy" />复制 stdio 配置</span>
+        <span class="chip" @click="mcpConfigOpen = false">关闭</span>
+      </div>
+
+      <div class="section-note" style="margin-top:10px">
         工具：list_volumes · search_files · scan_directory · list_directory · cache_stats · diagnostics（全部只读）
         <template v-if="mcpStatus && mcpStatus.endpoint">
           <br />当前端点：<span class="mono">127.0.0.1:{{ mcpStatus.endpoint.port }}</span>
           （PID {{ mcpStatus.endpoint.pid }}）· 客户端：{{ mcpStatus.client || '未连接' }}
           · 累计调用 {{ mcpStatus.calls }} 次
         </template>
-      </div>
-      <div class="chips" style="margin-top:10px">
-        <span class="chip" @click="copyMcpConfig"><Icon name="copy" />复制配置</span>
-        <span class="chip" @click="copyText(mcpConfigCommand)"><Icon name="copy" />只复制命令路径</span>
-        <span class="chip" @click="mcpConfigOpen = false">关闭</span>
       </div>
     </UiModal>
 

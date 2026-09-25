@@ -164,6 +164,48 @@ fn clamp_window_to_work_area(_win: &tauri::WebviewWindow) {}
 
 #[tokio::main]
 async fn main() {
+    // MCP 模式：不创建窗口，直接以 stdio 服务或桥接到本机端点。
+    // 这些模式由 MCP Host（Claude Desktop / Cursor）以子进程方式启动，
+    // 因此启动路径必须尽量短，且绝不弹出窗口。
+    #[cfg(feature = "mcp")]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        let has = |f: &str| args.iter().any(|a| a == f);
+        if has("--mcp") || has("--bridge") || has("--selftest") || has("--selftest-endpoint")
+            || has("--selftest-bridge") || has("--mcp-help")
+        {
+            let code = if has("--selftest") {
+                flashdir::mcp::selftest().await
+            } else if has("--selftest-endpoint") {
+                flashdir::mcp::selftest_endpoint().await
+            } else if has("--selftest-bridge") {
+                flashdir::mcp::selftest_bridge().await
+            } else if has("--bridge") {
+                flashdir::mcp::serve_bridge().await
+            } else if has("--mcp-help") {
+                eprintln!(
+                    "FlashDir MCP 模式
+
+  --mcp               以 stdio 运行 MCP 服务器（独立进程）
+  --bridge            桥接到运行中的桌面端（推荐：共享索引/缓存与管理员权限）
+  --selftest          协议与工具自测
+  --selftest-endpoint HTTP 端点与 token 自测
+  --selftest-bridge   桥接链路自测（需桌面端运行）
+  --mcp-help          显示本帮助
+
+HTTP 地址（可写进支持 url 的 Host）: {}
+",
+                    flashdir::mcp::http_url_for_display()
+                );
+                0
+            } else {
+                flashdir::mcp::serve_stdio().await;
+                0
+            };
+            std::process::exit(code);
+        }
+    }
+
     let _ = flashdir::disk_cache::DiskCache::instance();
 
     tauri::Builder::default()

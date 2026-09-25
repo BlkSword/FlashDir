@@ -1,5 +1,29 @@
 # FlashDir Release Notes
 
+## Unreleased（十三）—— MCP 单一产物 + HTTP 端点（固定端口）
+
+根据反馈做了两处结构性调整：
+
+**1. 不再需要第二个产物**
+- 之前认为 GUI 二进制（`windows_subsystem="windows"`）无法走 stdio，因此单列了 `flashdir-mcp.exe`；
+  实测证明该假设错误，MCP 现已并入 `flashdir.exe`：`--mcp` / `--bridge` / `--selftest*` / `--mcp-help`
+- 已删除 `flashdir-mcp.exe` 与对应 Cargo `[[bin]]`；`mcp` 特性改为**默认开启**（任何 GUI 构建都带 MCP）
+
+**2. 配置改为"端口地址"，跨机器一致**
+- 新增 **HTTP 端点（MCP Streamable HTTP 子集）**：固定端口 `47821`（占用自动顺延），
+  仅监听 127.0.0.1；支持 POST（单条/批量，返回 JSON）、GET（SSE 心跳）、DELETE、notification→202
+- token **持久化**在 `~/.flashdir/mcp-token` → 配置 `http://127.0.0.1:47821/mcp?token=…`
+  **重启/换机器都不用改**（地址一致），无 token 访问 401
+- stdio 方式仍保留：`{"command": "...\flashdir.exe", "args": ["--bridge"]}`，桌面端未运行会自动拉起
+- 设置页弹窗同时给出两种配置，各自一键复制
+
+**顺带修复**
+- 被拉起的桌面端会继承桥的 stdin/stdout（Host 管道），导致 Host 一直等不到 stdout 关闭而卡住 → 完全脱离 stdio
+- `--selftest-endpoint` 会覆盖真实端点文件 → 自测改用独立端口且不写端点文件
+
+**验证**：`--selftest` 11 项 · `--selftest-endpoint` 6 项（401/202/批量）· `--selftest-bridge` 通过 ·
+curl 直连 200 并返回真实搜索结果 · 自动拉起后退出码 0
+
 ## Unreleased（十二）—— MCP 单实例模式（方案 C）
 
 ```

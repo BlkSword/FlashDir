@@ -8,7 +8,8 @@ description = "FlashDir - Disk observability platform for Windows"
 tauri-build = { version = "2", features = [] }
 
 [features]
-# MCP 服务器（stdio / 本机端点 / 桥接）；不默认开启以免影响 lib 单测链接
+default = ["mcp"]
+# MCP 服务器（stdio / HTTP 端点 / 桥接）
 mcp = []
 # 生产构建必须启用（Tauri 模板标准做法）：
 # tauri 用该 feature 判定 dev/prod —— 未启用时 generate_context! 会走 dev 分支，
@@ -60,8 +61,3 @@ strip = true
 panic = "abort"
 overflow-checks = false
 debug-assertions = false
-
-[[bin]]
-name = "flashdir-mcp"
-path = "src/bin/flashdir-mcp.rs"
-required-features = ["mcp"]

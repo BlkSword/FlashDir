@@ -743,17 +743,28 @@ pub async fn selftest() -> i32 {
     }
 }
 
-/* ─── 本机端点（GUI 内后台线程）───────────────────────────── */
+/* ─── 本机 HTTP 端点（GUI 内后台线程）──────────────────────── */
 
-/// 端点信息文件：`~/.flashdir/mcp-endpoint.json`
-/// 内容 `{ "port": 12345, "token": "<随机>" }`，仅当前用户可读（用户目录默认 ACL）
-pub fn endpoint_file_path() -> Option<std::path::PathBuf> {
+/// 配置里写死的默认端口：`http://127.0.0.1:47821/mcp`
+/// 被占用时自动顺延（实际端口写在端点文件与设置页里）
+pub const DEFAULT_MCP_PORT: u16 = 47821;
+const PORT_FALLBACKS: u16 = 5;
+
+fn flashdir_dir() -> Option<std::path::PathBuf> {
     let home = std::env::var("USERPROFILE").ok()?;
-    Some(std::path::PathBuf::from(home).join(".flashdir").join("mcp-endpoint.json"))
+    Some(std::path::PathBuf::from(home).join(".flashdir"))
 }
 
-fn random_token() -> String {
-    // 不引入 rand 依赖：用时间 + 进程号 + 地址熵拼一个 128 位 hex
+/// 端点信息文件：`~/.flashdir/mcp-endpoint.json`
+pub fn endpoint_file_path() -> Option<std::path::PathBuf> {
+    Some(flashdir_dir()?.join("mcp-endpoint.json"))
+}
+
+fn token_file_path() -> Option<std::path::PathBuf> {
+    Some(flashdir_dir()?.join("mcp-token"))
+}
+
+fn random_hex() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -767,7 +778,27 @@ fn random_token() -> String {
     format!("{:032x}", x)
 }
 
-/// 当前端点信息（未启动时返回 null）
+/// 持久 token：首次生成后固定保存在 `~/.flashdir/mcp-token`，
+/// 这样配置里的 URL 长期有效（跨桌面端重启也不需要改配置）。
+pub fn persistent_token() -> String {
+    if let Some(path) = token_file_path() {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let t = text.trim().to_string();
+            if t.len() >= 16 {
+                return t;
+            }
+        }
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let token = random_hex();
+        let _ = std::fs::write(&path, &token);
+        return token;
+    }
+    random_hex()
+}
+
+/// 当前端点信息（桌面端未运行时为 null）
 pub fn endpoint_info() -> Value {
     match endpoint_file_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         Some(text) => serde_json::from_str(&text).unwrap_or(Value::Null),
@@ -775,26 +806,74 @@ pub fn endpoint_info() -> Value {
     }
 }
 
-/// 在 GUI 内启动本机端点（阻塞循环，放在后台线程里跑）
-pub async fn serve_endpoint() {
-    let token = random_token();
-    let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[MCP] 本机端点监听失败: {}", e);
-            return;
+/// MCP 的 HTTP 地址（含 token），供设置页展示/复制
+pub fn endpoint_url() -> String {
+    let token = persistent_token();
+    if let Some(info) = endpoint_info().as_object() {
+        if let Some(port) = info.get("port").and_then(|p| p.as_u64()) {
+            return format!("http://127.0.0.1:{}/mcp?token={}", port, token);
         }
-    };
-    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    }
+    format!("http://127.0.0.1:{}/mcp?token={}", DEFAULT_MCP_PORT, token)
+}
+
+fn write_endpoint_file(port: u16) {
     if let Some(path) = endpoint_file_path() {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let payload = json!({ "port": port, "token": token, "pid": std::process::id() });
-        if std::fs::write(&path, payload.to_string()).is_ok() {
-            eprintln!("[MCP] 本机端点已就绪: 127.0.0.1:{}", port);
+        let payload = json!({
+            "port": port,
+            "pid": std::process::id(),
+            "url": format!("http://127.0.0.1:{}/mcp", port),
+        });
+        let _ = std::fs::write(&path, payload.to_string());
+    }
+}
+
+/// 在 GUI 内启动 HTTP 端点（正式实例：固定端口 + 写端点文件）
+pub async fn serve_endpoint() {
+    serve_endpoint_inner(DEFAULT_MCP_PORT, true, None).await
+}
+
+/// 端点实现：base_port 起顺延找可用端口；write_file=false 时不覆盖端点文件
+/// （自测用：否则会在桌面端运行时把真实端点文件改成自测端口）
+async fn serve_endpoint_inner(
+    base_port: u16,
+    write_file: bool,
+    ready: Option<tokio::sync::oneshot::Sender<u16>>,
+) {
+    let token = persistent_token();
+    let mut listener = None;
+    let mut port = base_port;
+    for offset in 0..PORT_FALLBACKS {
+        let p = base_port + offset;
+        match tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
+            Ok(l) => {
+                listener = Some(l);
+                port = p;
+                break;
+            }
+            Err(e) => {
+                eprintln!("[MCP] 端口 {} 不可用: {}", p, e);
+            }
         }
     }
+    let Some(listener) = listener else {
+        eprintln!("[MCP] 无法监听本机端口，MCP 端点未启动");
+        return;
+    };
+
+    if write_file {
+        write_endpoint_file(port);
+    }
+    if let Some(tx) = ready {
+        let _ = tx.send(port);
+    }
+    eprintln!(
+        "[MCP] HTTP 端点已就绪: http://127.0.0.1:{}/mcp（配置里可直接使用该地址）",
+        port
+    );
 
     loop {
         let (stream, _) = match listener.accept().await {
@@ -805,72 +884,262 @@ pub async fn serve_endpoint() {
                 continue;
             }
         };
-        // 每个连接独立任务：桥可能重连，且不能因为一条长连接阻塞其它客户端
-        let expected = token.clone();
+        let token = token.clone();
+        // 每个连接独立任务：桥可能重连，长连接（SSE）不能阻塞其它客户端
         tokio::spawn(async move {
             conn_opened();
-            if let Err(e) = handle_endpoint_conn(stream, &expected).await {
-                eprintln!("[MCP] 端点连接结束: {}", e);
+            if let Err(e) = handle_http_conn(stream, &token).await {
+                if e != "client closed" {
+                    eprintln!("[MCP] 连接结束: {}", e);
+                }
             }
             conn_closed();
         });
     }
 }
 
-/// 单个端点连接：先校验 token，然后与 stdio 相同的 NDJSON 协议
-async fn handle_endpoint_conn(
-    stream: tokio::net::TcpStream,
-    expected_token: &str,
+fn http_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        202 => "Accepted",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        411 => "Length Required",
+        _ => "OK",
+    }
+}
+
+async fn write_http(
+    w: &mut (impl tokio::io::AsyncWrite + Unpin),
+    status: u16,
+    content_type: &str,
+    body: &str,
 ) -> Result<(), String> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-    let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
-
-    // 1) 握手：第一行必须是 {"token":"..."}，超时保护
-    let first = tokio::time::timeout(
-        std::time::Duration::from_millis(HANDSHAKE_TIMEOUT_MS),
-        lines.next_line(),
-    )
-    .await
-    .map_err(|_| "握手超时".to_string())?
-    .map_err(|e| e.to_string())?
-    .ok_or("连接被关闭".to_string())?;
-
-    let ok = serde_json::from_str::<Value>(&first)
-        .ok()
-        .and_then(|v| v.get("token").and_then(|t| t.as_str()).map(|t| t == expected_token))
-        .unwrap_or(false);
-    if !ok {
-        let _ = write_half.write_all("{\"error\":\"token 无效\"}\n".as_bytes()).await;
-        return Err("token 校验失败".into());
-    }
-    let _ = write_half.write_all(b"{\"ok\":true}\n").await;
-    let _ = write_half.flush().await;
-
-    // 2) 协议循环
-    while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
-        if let Some(resp) = handle_line(&line).await {
-            write_half
-                .write_all(resp.as_bytes())
-                .await
-                .map_err(|e| e.to_string())?;
-            write_half.write_all(b"\n").await.map_err(|e| e.to_string())?;
-            write_half.flush().await.map_err(|e| e.to_string())?;
-        }
-    }
+    use tokio::io::AsyncWriteExt;
+    let head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        http_reason(status),
+        content_type,
+        body.len()
+    );
+    w.write_all(head.as_bytes()).await.map_err(|e| e.to_string())?;
+    w.write_all(body.as_bytes()).await.map_err(|e| e.to_string())?;
+    w.flush().await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
-/* ─── 桥接模式（Host 的 stdio ↔ GUI 本机端点）───────────────── */
+/// 处理一个 HTTP 连接（MCP Streamable HTTP 的最小合规子集）
+async fn handle_http_conn(stream: tokio::net::TcpStream, token: &str) -> Result<(), String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-fn read_endpoint() -> Option<(u16, String)> {
-    let path = endpoint_file_path()?;
-    let text = std::fs::read_to_string(path).ok()?;
-    let v: Value = serde_json::from_str(&text).ok()?;
-    let port = v.get("port")?.as_u64()? as u16;
-    let token = v.get("token")?.as_str()?.to_string();
-    Some((port, token))
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    let mut request_line = String::new();
+    if reader
+        .read_line(&mut request_line)
+        .await
+        .map_err(|e| e.to_string())?
+        == 0
+    {
+        return Err("client closed".into());
+    }
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_uppercase();
+    let target = parts.next().unwrap_or("/").to_string();
+
+    // 头
+    let mut headers: Vec<(String, String)> = Vec::new();
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await.map_err(|e| e.to_string())?;
+        if n == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_lowercase(), v.trim().to_string()));
+        }
+    }
+    let header = |name: &str| -> Option<&str> {
+        headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    };
+
+    let path = target.split('?').next().unwrap_or("/");
+    let query = target.split_once('?').map(|(_, q)| q.to_string()).unwrap_or_default();
+
+    // token 校验：Authorization: Bearer xxx 或 ?token=xxx
+    let bearer_ok = header("authorization")
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t.trim() == token)
+        .unwrap_or(false);
+    let query_ok = query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .any(|(k, v)| k == "token" && v == token);
+
+    match method.as_str() {
+        "OPTIONS" => {
+            write_http(&mut write_half, 204, "text/plain", "").await?;
+            Ok(())
+        }
+        "DELETE" => {
+            // 会话终止（我们无状态，直接确认）
+            write_http(&mut write_half, 204, "text/plain", "").await?;
+            Ok(())
+        }        "GET" => {
+            // Host 可能打开 SSE 流等待服务端消息：保持连接并周期发心跳
+            let wants_sse = header("accept")
+                .map(|a| a.contains("text/event-stream"))
+                .unwrap_or(false);
+            if !wants_sse {
+                write_http(&mut write_half, 405, "text/plain", "请使用 POST /mcp（MCP Streamable HTTP）").await?;
+                return Ok(());
+            }
+            if !bearer_ok && !query_ok {
+                write_http(&mut write_half, 401, "text/plain", "token 无效").await?;
+                return Ok(());
+            }
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+            if write_half.write_all(head.as_bytes()).await.is_err() {
+                return Ok(());
+            }
+            let _ = write_half.flush().await;
+            for _ in 0..240 {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                if write_half.write_all(b": keep-alive\n\n").await.is_err() {
+                    break;
+                }
+                let _ = write_half.flush().await;
+            }
+            Ok(())
+        }
+        "POST" => {
+            if path != "/mcp" && path != "/" {
+                write_http(&mut write_half, 404, "text/plain", "未知路径").await?;
+                return Ok(());
+            }
+            if !bearer_ok && !query_ok {
+                write_http(&mut write_half, 401, "application/json", "{\"error\":\"token 无效\"}").await?;
+                return Ok(());
+            }
+            let Some(len) = header("content-length").and_then(|v| v.parse::<usize>().ok()) else {
+                write_http(&mut write_half, 411, "text/plain", "需要 Content-Length").await?;
+                return Ok(());
+            };
+            let mut body = vec![0u8; len];
+            reader.read_exact(&mut body).await.map_err(|e| e.to_string())?;
+            let text = String::from_utf8_lossy(&body).to_string();
+            let messages: Vec<Value> = match serde_json::from_str::<Value>(&text) {
+                Ok(Value::Array(arr)) => arr,
+                Ok(v) => vec![v],
+                Err(e) => {
+                    let err = rpc_error(&Value::Null, -32700, &format!("JSON 解析失败: {}", e));
+                    write_http(&mut write_half, 200, "application/json", &err.to_string()).await?;
+                    return Ok(());
+                }
+            };
+            let mut responses: Vec<Value> = Vec::new();
+            for msg in messages {
+                let line = msg.to_string();
+                if let Some(resp) = handle_line(&line).await {
+                    responses.push(serde_json::from_str(&resp).unwrap_or(Value::Null));
+                }
+            }
+            if responses.is_empty() {
+                write_http(&mut write_half, 202, "text/plain", "").await?;
+                return Ok(());
+            }
+            let payload = if responses.len() == 1 {
+                responses[0].to_string()
+            } else {
+                Value::Array(responses).to_string()
+            };
+            write_http(&mut write_half, 200, "application/json", &payload).await?;
+            Ok(())
+        }
+        _ => {
+            write_http(&mut write_half, 405, "text/plain", "unsupported method").await?;
+            Ok(())
+        }
+    }
+}
+
+/* ─── 桥接：Host 的 stdio ↔ 本机 HTTP 端点 ─────────────────── */
+
+fn endpoint_port() -> Option<u16> {
+    let info = endpoint_info();
+    info.get("port").and_then(|p| p.as_u64()).map(|p| p as u16)
+}
+
+/// 极简 HTTP POST（本机端点专用）：返回 (状态码, body)
+async fn http_post(port: u16, path_with_query: &str, body: &str) -> Result<(u16, String), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .map_err(|e| format!("连接端点失败: {}", e))?;
+    let req = format!(
+        "POST {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path_with_query,
+        port,
+        body.len(),
+        body
+    );
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = stream.flush().await;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let (head, body) = text.split_once("\r\n\r\n").ok_or("响应格式错误")?;
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    Ok((status, body.to_string()))
+}
+
+/// 探测端点是否活着（JSON-RPC ping）
+async fn endpoint_alive(port: u16) -> bool {
+    let token = persistent_token();
+    let path = format!("/mcp?token={}", token);
+    matches!(
+        http_post(port, &path, r#"{"jsonrpc":"2.0","id":0,"method":"ping"}"#).await,
+        Ok((200, _))
+    )
+}
+
+/// 确保端点可用：不存在或不可达时拉起桌面端并等待
+async fn ensure_endpoint() -> Option<u16> {
+    if let Some(port) = endpoint_port() {
+        if endpoint_alive(port).await {
+            return Some(port);
+        }
+    } else {
+    }
+    launch_gui();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(GUI_WAIT_TIMEOUT_MS);
+    loop {
+        if let Some(port) = endpoint_port() {
+            if endpoint_alive(port).await {
+                return Some(port);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
 }
 
 /// 拉起桌面端（与桥同目录的 flashdir.exe）
@@ -882,107 +1151,76 @@ fn launch_gui() {
         eprintln!("[MCP] 未找到桌面端: {}", gui.display());
         return;
     }
-    match std::process::Command::new(&gui).spawn() {
+    // 关键：必须完全脱离 stdio。否则被拉起的桌面端会继承本进程的
+    // stdin/stdout（也就是 MCP Host 的管道），Host 会一直等不到 stdout 关闭而卡住。
+    match std::process::Command::new(&gui)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
         Ok(_) => eprintln!("[MCP] 已拉起桌面端: {}", gui.display()),
         Err(e) => eprintln!("[MCP] 拉起桌面端失败: {}", e),
     }
 }
 
-/// 等待端点可用（轮询端点文件 + 试连）
-async fn wait_endpoint(timeout_ms: u64) -> Option<(tokio::net::TcpStream, u16, String)> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    loop {
-        if let Some((port, token)) = read_endpoint() {
-            if let Ok(stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-                return Some((stream, port, token));
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-}
-
-/// 桥接：把 Host 的 stdio 与桌面端端点对接；桌面端未运行则自动拉起
+/// 桥接：stdin 的 NDJSON 请求逐条转发到本机端点，响应写回 stdout
 pub async fn serve_bridge() -> i32 {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-    let mut endpoint = read_endpoint();
-    if endpoint.is_none() {
-        launch_gui();
-    }
-
-    let (mut stream, port, token) = match wait_endpoint(GUI_WAIT_TIMEOUT_MS).await {
-        Some(v) => v,
-        None => {
-            eprintln!(
-                "[MCP] 等待桌面端端点超时（{}ms）。请先启动 FlashDir 桌面端，或改用 --mcp 独立模式。",
-                GUI_WAIT_TIMEOUT_MS
-            );
-            return 2;
-        }
+    let Some(port) = ensure_endpoint().await else {
+        eprintln!(
+            "[MCP] 等待桌面端端点超时（{}ms）。请先启动 FlashDir 桌面端，或用 --mcp 独立模式。",
+            GUI_WAIT_TIMEOUT_MS
+        );
+        return 2;
     };
+    let token = persistent_token();
+    let path = format!("/mcp?token={}", token);
+    eprintln!("[MCP] 已连接桌面端 127.0.0.1:{}（共享其索引/缓存与管理员权限）", port);
 
-    // 握手：token 校验（响应不转发给 Host）
-    let hello = json!({ "token": token }).to_string();
-    if stream.write_all(hello.as_bytes()).await.is_err()
-        || stream.write_all(b"\n").await.is_err()
-        || stream.flush().await.is_err()
-    {
-        eprintln!("[MCP] 端点握手写入失败");
-        return 3;
-    }
-    let (read_half, write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
-    let mut first = String::new();
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(HANDSHAKE_TIMEOUT_MS),
-        reader.read_line(&mut first),
-    )
-    .await
-    {
-        Ok(Ok(n)) if n > 0 => {
-            if !first.contains("\"ok\":true") {
-                eprintln!("[MCP] 端点拒绝连接: {}", first.trim());
-                return 4;
+    let stdin = tokio::io::stdin();
+    let mut lines = tokio::io::BufReader::new(stdin).lines();
+    let mut stdout = tokio::io::stdout();
+
+    while let Some(line) = lines.next_line().await.ok().flatten() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match http_post(port, &path, trimmed).await {
+            Ok((_status, body)) => {
+                if body.trim().is_empty() {
+                    // notification：无响应
+                    continue;
+                }
+                // 归一化成单行（NDJSON 要求每条消息一行）
+                if let Ok(v) = serde_json::from_str::<Value>(&body) {
+                    let out = v.to_string();
+                    if stdout.write_all(out.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    if stdout.write_all(b"\n").await.is_err() {
+                        break;
+                    }
+                    let _ = stdout.flush().await;
+                } else {
+                    eprintln!("[MCP] 端点返回非 JSON: {}", body.chars().take(200).collect::<String>());
+                }
+            }
+            Err(e) => {
+                eprintln!("[MCP] 转发失败: {}", e);
+                return 3;
             }
         }
-        _ => {
-            eprintln!("[MCP] 端点握手读取失败");
-            return 4;
-        }
     }
-    eprintln!("[MCP] 已连接桌面端端点 127.0.0.1:{}（共享其索引与扫描缓存）", port);
-    let mut write_half = write_half;
-
-    // 双向泵：stdin → 端点；端点 → stdout
-    let to_endpoint = tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
-        let _ = tokio::io::copy(&mut stdin, &mut write_half).await;
-        let _ = write_half.shutdown().await;
-    });
-    let mut to_host = tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
-        let _ = tokio::io::copy(&mut reader, &mut stdout).await;
-        let _ = stdout.flush().await;
-    });
-
-    tokio::select! {
-        _ = to_endpoint => {
-            // Host 关闭了 stdin（会话结束）：先把端点侧剩余响应排空再退出，
-            // 否则最后一批响应会被进程退出吞掉（实测一次性管道调用会 0 响应）。
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), &mut to_host).await;
-        }
-        _ = &mut to_host => {}
-    }
-    let _ = endpoint.take();
+    eprintln!("[MCP] stdin 关闭，桥接退出");
     0
 }
 
 /* ─── 端点/桥接自测 ───────────────────────────────────────── */
 
-/// 自测本机端点：启动端点 → 连接 → 握手 → 跑一次 tools/list 与 list_volumes
+/// 自测 HTTP 端点：启动端点 → 读端点文件 → 正常请求 / 错误 token / 方法校验
 pub async fn selftest_endpoint() -> i32 {
     let mut failures = 0usize;
     let mut check = |name: &str, ok: bool, detail: &str| {
@@ -994,88 +1232,83 @@ pub async fn selftest_endpoint() -> i32 {
         }
     };
 
-    // 后台启动端点（会写端点文件）
-    tokio::spawn(async move { serve_endpoint().await });
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-
-    let (mut stream, port, token) = match wait_endpoint(3000).await {
-        Some(v) => v,
-        None => {
-            eprintln!("  [FAIL] 端点未就绪");
+    // 用独立端口且不写端点文件，避免影响正在运行的桌面端
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move { serve_endpoint_inner(47899, false, Some(tx)).await });
+    let port = match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        Ok(Ok(p)) => p,
+        _ => {
+            eprintln!("  [FAIL] 自测端点未就绪");
             return 1;
         }
     };
-    check("端点已监听并可连接", true, &format!("port={}", port));
+    check("自测端点已监听（独立端口，不改端点文件）", port > 0, &format!("port={}", port));
 
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let hello = json!({ "token": token }).to_string();
-    let _ = stream.write_all(hello.as_bytes()).await;
-    let _ = stream.write_all(b"\n").await;
-    let _ = stream.flush().await;
+    let token = persistent_token();
+    let good = format!("/mcp?token={}", token);
 
-    let (r, mut w) = stream.into_split();
-    let mut lines = BufReader::new(r).lines();
-
-    let ack = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .flatten()
-        .unwrap_or_default();
-    check("token 握手成功", ack.contains("\"ok\":true"), &ack);
-
-    // 错误 token 必须被拒
-    if let Some((_, _bad)) = read_endpoint() {
-        if let Ok(mut s2) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-            let _ = s2.write_all(b"{\"token\":\"wrong\"}\n").await;
-            let _ = s2.flush().await;
-            let (r2, _w2) = s2.into_split();
-            let mut l2 = BufReader::new(r2).lines();
-            let resp = tokio::time::timeout(std::time::Duration::from_secs(5), l2.next_line())
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .flatten()
-                .unwrap_or_default();
-            check("错误 token 被拒绝", !resp.contains("\"ok\":true"), &resp);
+    // 1) tools/list
+    match http_post(port, &good, r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).await {
+        Ok((status, body)) => {
+            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            check(
+                "tools/list 返回工具清单",
+                status == 200 && v["result"]["tools"].as_array().map(|a| a.len() >= 6).unwrap_or(false),
+                &body.chars().take(120).collect::<String>(),
+            );
         }
+        Err(e) => check("tools/list 返回工具清单", false, &e),
     }
 
-    // 正常请求
-    for (i, (req, expect)) in [
-        (
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
-            "tools",
-        ),
-        (
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_volumes","arguments":{}}}"#,
-            "volumes",
-        ),
-    ]
-    .iter()
-    .enumerate()
+    // 2) tools/call list_volumes
+    match http_post(
+        port,
+        &good,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_volumes","arguments":{}}}"#,
+    )
+    .await
     {
-        let _ = w.write_all(req.as_bytes()).await;
-        let _ = w.write_all(b"\n").await;
-        let _ = w.flush().await;
-        let line = tokio::time::timeout(std::time::Duration::from_secs(10), lines.next_line())
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .flatten()
-            .unwrap_or_default();
-        // 正确做法：解析 JSON-RPC 响应，再解析 content[0].text 里的业务 JSON
-        let parsed: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
-        let ok = if *expect == "tools" {
-            parsed["result"]["tools"].is_array()
-        } else {
-            parsed["result"]["content"][0]["text"]
+        Ok((status, body)) => {
+            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let vols = v["result"]["content"][0]["text"]
                 .as_str()
                 .and_then(|t| serde_json::from_str::<Value>(t).ok())
-                .map(|v| v["volumes"].is_array())
-                .unwrap_or(false)
-        };
-        check(&format!("端点请求 #{} 返回正确", i + 1), ok, &line);
+                .map(|d| d["volumes"].is_array())
+                .unwrap_or(false);
+            check("tools/call list_volumes 正常", status == 200 && vols, &body.chars().take(120).collect::<String>());
+        }
+        Err(e) => check("tools/call list_volumes 正常", false, &e),
+    }
+
+    // 3) notification → 202
+    match http_post(port, &good, r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).await {
+        Ok((status, _)) => check("notification 返回 202", status == 202, &format!("status={}", status)),
+        Err(e) => check("notification 返回 202", false, &e),
+    }
+
+    // 4) 错误 token → 401
+    match http_post(port, "/mcp?token=wrong", r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#).await {
+        Ok((status, _)) => check("错误 token 返回 401", status == 401, &format!("status={}", status)),
+        Err(e) => check("错误 token 返回 401", false, &e),
+    }
+
+    // 5) 批量请求
+    match http_post(
+        port,
+        &good,
+        r#"[{"jsonrpc":"2.0","id":4,"method":"ping"},{"jsonrpc":"2.0","id":5,"method":"ping"}]"#,
+    )
+    .await
+    {
+        Ok((status, body)) => {
+            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            check(
+                "批量请求返回数组响应",
+                status == 200 && v.as_array().map(|a| a.len() == 2).unwrap_or(false),
+                &body.chars().take(120).collect::<String>(),
+            );
+        }
+        Err(e) => check("批量请求返回数组响应", false, &e),
     }
 
     if failures == 0 {
@@ -1087,60 +1320,40 @@ pub async fn selftest_endpoint() -> i32 {
     }
 }
 
-/// 自测桥接链路（需要桌面端已运行）：连端点 → 握手 → tools/call diagnostics
+/// 自测桥接链路（需桌面端已运行）：直接对端点调用 diagnostics
 pub async fn selftest_bridge() -> i32 {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let Some((mut stream, port, token)) = wait_endpoint(5000).await else {
-        eprintln!("[MCP] 未发现运行中的桌面端端点（请先启动 FlashDir）");
+    let Some(port) = ensure_endpoint().await else {
+        eprintln!("[MCP] 未发现可用端点（桌面端未运行且无法拉起）");
         return 2;
     };
-    let hello = json!({ "token": token }).to_string();
-    let _ = stream.write_all(hello.as_bytes()).await;
-    let _ = stream.write_all(b"\n").await;
-    let _ = stream.flush().await;
-    let (r, mut w) = stream.into_split();
-    let mut lines = BufReader::new(r).lines();
-    let ack = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .flatten()
-        .unwrap_or_default();
-    if !ack.contains("\"ok\":true") {
-        eprintln!("[MCP] 握手失败: {}", ack);
-        return 3;
-    }
+    let token = persistent_token();
+    let path = format!("/mcp?token={}", token);
     let req = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"diagnostics","arguments":{}}}"#;
-    let _ = w.write_all(req.as_bytes()).await;
-    let _ = w.write_all(b"\n").await;
-    let _ = w.flush().await;
-    let line = tokio::time::timeout(std::time::Duration::from_secs(20), lines.next_line())
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .flatten()
-        .unwrap_or_default();
-    let text = serde_json::from_str::<Value>(&line)
-        .ok()
-        .and_then(|v| {
-            v.get("result")
-                .and_then(|r| r.get("content"))
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("text"))
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_default();
-    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    if parsed["version"].is_string() {
-        eprintln!(
-            "[MCP] 桥接链路正常（127.0.0.1:{}）→ {}",
-            port,
-            parsed["summary"].as_str().unwrap_or("")
-        );
-        0
-    } else {
-        eprintln!("[MCP] 桥接返回异常: {}", line);
-        1
+    match http_post(port, &path, req).await {
+        Ok((status, body)) => {
+            let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let text = v["result"]["content"][0]["text"].as_str().unwrap_or("");
+            let parsed: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+            if status == 200 && parsed["version"].is_string() {
+                eprintln!(
+                    "[MCP] 桥接链路正常（127.0.0.1:{}）→ {}",
+                    port,
+                    parsed["summary"].as_str().unwrap_or("")
+                );
+                0
+            } else {
+                eprintln!("[MCP] 桥接返回异常: {}", body.chars().take(200).collect::<String>());
+                1
+            }
+        }
+        Err(e) => {
+            eprintln!("[MCP] 桥接失败: {}", e);
+            3
+        }
     }
+}
+
+/// HTTP 地址（含 token），供桌面端设置页展示
+pub fn http_url_for_display() -> String {
+    endpoint_url()
 }

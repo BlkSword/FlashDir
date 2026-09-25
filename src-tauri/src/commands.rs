@@ -483,33 +483,37 @@ pub fn get_mcp_status() -> serde_json::Value {
     flashdir::mcp::status_json()
 }
 
-/// MCP 配置片段（含桥接二进制的绝对路径），供设置页一键复制。
+/// MCP 配置片段，供设置页一键复制。
 ///
-/// 用 serde_json 生成而不是手工拼字符串：路径里的反斜杠在 JSON 中需要转义，
-/// 手工拼接极易出错（Windows 路径 + 转义 = 双重反斜杠）。
+/// 两种形态：
+/// - **HTTP（推荐）**：地址固定（`127.0.0.1:47821`）+ 持久 token → 配置跨机器一致、长期有效，
+///   适合支持 `url` 的 Host（Claude Desktop 连接器 / Cursor）。
+/// - **stdio**：命令 + 参数，兼容所有 Host；桥接会共享桌面端的索引/缓存与管理员权限。
 #[cfg(feature = "mcp")]
 #[command]
 pub fn get_mcp_config() -> serde_json::Value {
-    let bridge = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("flashdir-mcp.exe")))
+    let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "flashdir-mcp.exe".to_string());
+        .unwrap_or_else(|_| "flashdir.exe".to_string());
 
-    let cfg = serde_json::json!({
+    let http_cfg = serde_json::json!({
         "mcpServers": {
-            "flashdir": {
-                "command": bridge,
-                "args": ["--bridge"],
-            }
+            "flashdir": { "url": flashdir::mcp::http_url_for_display() }
         }
     });
-    let config_text = serde_json::to_string_pretty(&cfg).unwrap_or_default();
+    let stdio_cfg = serde_json::json!({
+        "mcpServers": {
+            "flashdir": { "command": exe, "args": ["--bridge"] }
+        }
+    });
 
     serde_json::json!({
-        "command": bridge,
+        "url": flashdir::mcp::http_url_for_display(),
+        "port": flashdir::mcp::endpoint_info().get("port").and_then(|p| p.as_u64()),
+        "command": exe,
         "args": ["--bridge"],
-        "config": config_text,
+        "configHttp": serde_json::to_string_pretty(&http_cfg).unwrap_or_default(),
+        "configStdio": serde_json::to_string_pretty(&stdio_cfg).unwrap_or_default(),
         "endpoint": flashdir::mcp::endpoint_info(),
         "status": flashdir::mcp::status_json(),
     })
