@@ -2,7 +2,7 @@
 name = "flashdir"
 version = "3.5.0"
 edition = "2021"
-description = "FlashDir - Disk observability platform for Windows"
+description = "Windows disk observability platform: NTFS MFT/USN scanning, cross-volume file search, directory analysis and snapshot diffing"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

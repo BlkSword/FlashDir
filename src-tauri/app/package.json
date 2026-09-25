@@ -22,5 +22,6 @@
     "@tauri-apps/api": "^2.9.1",
     "ant-design-vue": "^4.2.6",
     "vue": "^3.5.26"
-  }
+  },
+  "description": "FlashDir desktop frontend (Vue 3 + Vite)"
 }
