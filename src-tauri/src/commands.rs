@@ -483,6 +483,34 @@ pub fn get_mcp_status() -> serde_json::Value {
     flashdir::mcp::status_json()
 }
 
+/// 读取 MCP 设置（开关 / 端口 / 当前地址 / 运行状态）
+#[cfg(feature = "mcp")]
+#[command]
+pub fn get_mcp_settings() -> serde_json::Value {
+    flashdir::mcp::settings_json()
+}
+
+/// 修改 MCP 设置：开关与端口（写入 ~/.flashdir/mcp-settings.json，
+/// 桌面端内端点会在 ~1 秒内热生效——无需重启）
+#[cfg(feature = "mcp")]
+#[command]
+pub fn set_mcp_settings(
+    enabled: bool,
+    port: Option<u16>,
+) -> Result<serde_json::Value, String> {
+    let mut s = flashdir::mcp::load_settings();
+    s.enabled = enabled;
+    if let Some(p) = port {
+        if !(1024..=65535).contains(&p) {
+            return Err("端口需在 1024-65535 之间".to_string());
+        }
+        s.port = p;
+    }
+    flashdir::mcp::save_settings(&s)?;
+    // 立即返回最新状态；实际绑定由端点线程在 1 秒内完成
+    Ok(flashdir::mcp::settings_json())
+}
+
 /// MCP 配置片段，供设置页一键复制。
 ///
 /// 两种形态：

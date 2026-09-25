@@ -195,3 +195,21 @@ flashdir.exe（桌面端内后台线程）      ← 热索引 / 扫描缓存 / �
 
 **实测**：`--selftest-bridge` → `管理员=true · 索引=ready（433,545 项）· 缓存 7 个目录`；
 管道一次性调用（initialize + search_files）响应全部合法 JSON。
+
+## 9. P1 工具与设置（已完成）
+
+**13 个工具**（新增 7 个）：`find_large_files`、`find_duplicates`、`analyze_dev_cache`、
+`list_snapshots`、`save_snapshot`、`compare_snapshots`、`disk_usage_trend`。
+
+- 统一标注：`readOnlyHint`（仅 `save_snapshot` 为 false）、`destructiveHint: false`、`openWorldHint: false`
+- 取数：优先内存缓存（`memory-cache`）→ 未命中才扫描；响应 `source` 字段标明来源
+- 响应体积控制：列表类工具都有 `limit` 与 `truncated`，重复组每组最多 5 个路径
+
+**设置（桌面端可热改）**
+
+- `~/.flashdir/mcp-settings.json`：`{ "enabled": bool, "port": u16 }`
+- 端点线程每秒检查设置：关闭 → 停止监听并删除端点文件；改端口 → 解绑后按新端口重绑
+  （旧端口不再监听，1 秒内完成，无需重启桌面端）
+- 桌面端设置弹窗（标题栏齿轮 / 命令面板"设置"）提供开关、端口、当前地址与复制地址
+
+**实测**：关闭 → 端口拒绝连接 + 端点文件删除；改 47831 → 新端口 200 且旧端口关闭；改回 → 200。

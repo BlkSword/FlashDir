@@ -203,10 +203,23 @@ FlashDir 可作为 **MCP 服务器**被 AI 客户端调用（Claude Desktop / Cu
 桌面端未运行时会**自动拉起**并等待就绪；桌面端状态栏显示 `MCP 已连接 · 最近调用`，
 点击即可复制上面两种配置。
 
-### 工具（全部只读）
+### 工具（13 个，除 save_snapshot 外全部只读）
 
-`list_volumes` · `search_files`（Everything 语法，毫秒级，含命中总数与分页）·
-`scan_directory` · `list_directory` · `cache_stats` · `diagnostics`
+| 工具 | 用途 |
+|------|------|
+| `search_files` | 全局索引搜索（Everything 语法，毫秒级，含命中总数与分页） |
+| `scan_directory` / `list_directory` | 目录体积构成 / 分页列目录 |
+| `find_large_files` | 大于指定体积的文件（按体积降序） |
+| `find_duplicates` | 内容哈希去重，返回可回收空间与重复组 |
+| `analyze_dev_cache` | node_modules / target / 包缓存等开发类占用 |
+| `list_snapshots` / `save_snapshot` / `compare_snapshots` / `disk_usage_trend` | 快照与历史对比、体积趋势 |
+| `list_volumes` / `cache_stats` / `diagnostics` | 卷容量 / 缓存统计 / 运行诊断 |
+
+### 设置（桌面端「设置」弹窗或命令面板）
+
+- **MCP 端点开关**：关闭后不再监听任何端口（已有连接断开）
+- **端口可改**（默认 47821，被占用自动顺延），修改后约 1 秒内生效，无需重启
+- 设置保存在 `~/.flashdir/mcp-settings.json`
 
 ### 自测
 

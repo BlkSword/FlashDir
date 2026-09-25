@@ -74,7 +74,9 @@ fn set_last(method: &str, tool: &str) {
 
 /// 供前端查询的运行状态
 pub fn status_json() -> Value {
+    let enabled = load_settings().enabled;
     json!({
+        "enabled": enabled,
         "connected": STATUS.open_conns.load(Ordering::Relaxed) > 0,
         "active": STATUS.active.load(Ordering::Relaxed),
         "calls": STATUS.calls.load(Ordering::Relaxed),
@@ -198,6 +200,30 @@ async fn handle_request(method: &str, params: &Value, id: &Value) -> Value {
 /* ─── 工具定义 ─────────────────────────────────────────────── */
 
 pub fn tool_definitions() -> Vec<Value> {
+    let mut tools = base_tool_definitions();
+    // 统一补 MCP 工具标注：除 save_snapshot 外全部只读
+    for t in tools.iter_mut() {
+        let read_only = t
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(|n| n != "save_snapshot")
+            .unwrap_or(true);
+        if let Some(obj) = t.as_object_mut() {
+            obj.insert(
+                "annotations".to_string(),
+                json!({
+                    "readOnlyHint": read_only,
+                    "destructiveHint": false,
+                    "idempotentHint": true,
+                    "openWorldHint": false,
+                }),
+            );
+        }
+    }
+    tools
+}
+
+fn base_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "list_volumes",
@@ -261,6 +287,95 @@ pub fn tool_definitions() -> Vec<Value> {
             "name": "diagnostics",
             "description": "运行诊断：版本、是否管理员（决定能否走 MFT 直读）、全局索引状态与条目数、磁盘缓存统计、卷列表。回答“为什么扫描慢/搜不到”时先调用它。",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        }),
+        json!({
+            "name": "find_large_files",
+            "description": "找出目录下大于指定体积的文件（按体积降序）。适合“哪些文件占地方最大”。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "目录绝对路径" },
+                    "minSizeBytes": { "type": "integer", "minimum": 0, "description": "最小体积（字节），默认 100MB" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "返回条数（默认 50）" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "find_duplicates",
+            "description": "按内容哈希检测目录内的重复文件，返回可回收空间与重复组（只读，不会删除任何文件）。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "minSizeBytes": { "type": "integer", "minimum": 0, "description": "只检测大于该体积的文件，默认 1MB" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "返回组数（默认 20）" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "analyze_dev_cache",
+            "description": "分析开发类缓存占用（node_modules / target / 包管理器缓存 / 构建产物等），返回各类别体积与 Top 项。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "返回类别数（默认 10）" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "list_snapshots",
+            "description": "列出某目录的历史快照（时间、体积、条目数）。用于回答“这个目录最近长大了多少”。",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "save_snapshot",
+            "description": "给当前目录保存一份快照（写入 FlashDir 自己的快照库，不修改任何用户文件）。之后可用 compare_snapshots / disk_usage_trend 观察变化。",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "compare_snapshots",
+            "description": "对比两份快照（或快照与当前状态），返回净变化与新增/删除/修改的文件。不传 id 时自动对比该目录最近两次；newId 传 \"current\" 表示与当前状态对比。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "oldId": { "type": "integer", "description": "旧快照 id（省略则取最近两次中的旧者）" },
+                    "newId": { "type": ["integer", "string"], "description": "新快照 id，或 \"current\" 表示当前状态" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "每类返回条数（默认 20）" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "disk_usage_trend",
+            "description": "基于历史快照给出目录体积趋势（时间点、体积、相邻变化），用于回答“为什么变大/变小”。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 2, "maximum": 200, "description": "最多返回多少个时间点（默认 30，取最近的）" }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
         }),
     ]
 }
@@ -549,6 +664,373 @@ pub async fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
             ))
         }
 
+        "find_large_files" => {
+            let path = arg_str(args, "path").ok_or("缺少参数 path")?;
+            let min_bytes = args
+                .get("minSizeBytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100 * 1024 * 1024);
+            let limit = arg_usize(args, "limit", 50).clamp(1, 1000);
+            let (items, source, _) = items_for(&path, false).await?;
+            let mut hits: Vec<&crate::scan::Item> = items
+                .iter()
+                .filter(|i| !i.is_dir && i.size >= min_bytes as i64)
+                .collect();
+            hits.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+            let total = hits.len();
+            let page: Vec<Value> = hits.iter().take(limit).map(|i| item_json(i)).collect();
+            Ok(tool_text(
+                json!({
+                    "summary": format!(
+                        "{} 个文件大于 {}（共 {} 项扫描来源 {}）",
+                        total,
+                        crate::scan::format_size(min_bytes as i64),
+                        items.len(),
+                        source
+                    ),
+                    "path": path,
+                    "minSizeBytes": min_bytes,
+                    "total": total,
+                    "truncated": total > page.len(),
+                    "files": page,
+                })
+                .to_string(),
+            ))
+        }
+
+        "find_duplicates" => {
+            let path = arg_str(args, "path").ok_or("缺少参数 path")?;
+            let min_bytes = args
+                .get("minSizeBytes")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1024 * 1024) as i64;
+            let limit = arg_usize(args, "limit", 20).clamp(1, 200);
+            let (items, source, _) = items_for(&path, false).await?;
+            let res = crate::duplicate_finder::find_duplicates(&items, min_bytes);
+            let groups: Vec<Value> = res
+                .groups
+                .iter()
+                .take(limit)
+                .map(|g| {
+                    json!({
+                        "size": g.size,
+                        "sizeFormatted": g.size_formatted,
+                        "fileCount": g.file_count,
+                        "wasted": g.wasted_bytes,
+                        "wastedFormatted": g.wasted_formatted,
+                        // 每组最多列 5 个路径，避免响应过大
+                        "files": g.files.iter().take(5).map(|f| f.path.clone()).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            Ok(tool_text(
+                json!({
+                    "summary": format!(
+                        "重复文件 {} 组 / {} 个文件，可回收 {}（来源 {}）",
+                        res.total_groups, res.total_files, res.total_wasted_formatted, source
+                    ),
+                    "path": path,
+                    "totalGroups": res.total_groups,
+                    "totalFiles": res.total_files,
+                    "totalWastedBytes": res.total_wasted_bytes,
+                    "totalWastedFormatted": res.total_wasted_formatted,
+                    "truncated": res.total_groups > groups.len(),
+                    "groups": groups,
+                })
+                .to_string(),
+            ))
+        }
+
+        "analyze_dev_cache" => {
+            let path = arg_str(args, "path").ok_or("缺少参数 path")?;
+            let limit = arg_usize(args, "limit", 10).clamp(1, 50);
+            let (items, source, total_size) = items_for(&path, false).await?;
+            let res = crate::dev_analyzer::analyze(&items, total_size, items.len());
+            let cats: Vec<Value> = res
+                .categories
+                .iter()
+                .take(limit)
+                .map(|c| {
+                    json!({
+                        "category": c.category,
+                        "label": c.label,
+                        "description": c.description,
+                        "itemCount": c.item_count,
+                        "fileCount": c.file_count,
+                        "dirCount": c.dir_count,
+                        "totalSize": c.total_size,
+                        "totalSizeFormatted": c.total_size_formatted,
+                        "percentOfDev": c.percent_of_dev,
+                        "topItems": c.top_items.iter().take(5).map(|t| json!({
+                            "name": t.name,
+                            "size": t.size,
+                            "sizeFormatted": t.size_formatted,
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            Ok(tool_text(
+                json!({
+                    "summary": format!(
+                        "开发类占用 {}（占全部 {:.1}%，{} 项命中；来源 {}）",
+                        crate::scan::format_size(res.dev_total_size),
+                        res.dev_percent,
+                        res.dev_items,
+                        source
+                    ),
+                    "path": path,
+                    "devTotalSize": res.dev_total_size,
+                    "devPercent": res.dev_percent,
+                    "devItems": res.dev_items,
+                    "totalItems": res.total_items,
+                    "categories": cats,
+                })
+                .to_string(),
+            ))
+        }
+
+        "list_snapshots" => {
+            let path = arg_str(args, "path").ok_or("缺少参数 path")?;
+            let list = crate::disk_cache::DiskCache::instance()
+                .list_snapshots(&path)
+                .map_err(|e| format!("读取快照失败: {}", e))?;
+            let snaps: Vec<Value> = list
+                .iter()
+                .map(|s| {
+                    json!({
+                        "id": s.id,
+                        "scanTime": s.scan_time,
+                        "totalSize": s.total_size,
+                        "totalSizeFormatted": s.total_size_formatted,
+                        "itemCount": s.item_count,
+                        "fileCount": s.file_count,
+                        "dirCount": s.dir_count,
+                    })
+                })
+                .collect();
+            Ok(tool_text(
+                json!({
+                    "summary": format!("{} 共 {} 份快照", path, snaps.len()),
+                    "path": path,
+                    "count": snaps.len(),
+                    "snapshots": snaps,
+                })
+                .to_string(),
+            ))
+        }
+
+        "save_snapshot" => {
+            let path = arg_str(args, "path").ok_or("缺少参数 path")?;
+            let (items, source, total_size) = items_for(&path, false).await?;
+            let file_count = items.iter().filter(|i| !i.is_dir).count();
+            let dir_count = items.len() - file_count;
+            let id = crate::disk_cache::DiskCache::instance()
+                .insert_snapshot(
+                    &path,
+                    &items,
+                    total_size,
+                    &crate::scan::format_size(total_size),
+                    file_count,
+                    dir_count,
+                )
+                .map_err(|e| format!("保存快照失败: {}", e))?;
+            Ok(tool_text(
+                json!({
+                    "summary": format!(
+                        "已为 {} 保存快照 #{}（{} 项 / {}，来源 {}）",
+                        path, id, items.len(), crate::scan::format_size(total_size), source
+                    ),
+                    "id": id,
+                    "path": path,
+                    "itemCount": items.len(),
+                    "fileCount": file_count,
+                    "dirCount": dir_count,
+                    "totalSize": total_size,
+                    "source": source,
+                })
+                .to_string(),
+            ))
+        }
+
+        "compare_snapshots" => {
+            let path = arg_str(args, "path").ok_or("缺少参数 path")?;
+            let limit = arg_usize(args, "limit", 20).clamp(1, 200);
+            let cache = crate::disk_cache::DiskCache::instance();
+            let list = cache
+                .list_snapshots(&path)
+                .map_err(|e| format!("读取快照失败: {}", e))?;
+            if list.is_empty() {
+                return Ok(tool_text(
+                    json!({
+                        "summary": format!("{} 还没有快照，请先调用 save_snapshot 建立基准", path),
+                        "path": path,
+                        "snapshotCount": 0,
+                    })
+                    .to_string(),
+                ));
+            }
+
+            let wants_current = args
+                .get("newId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.eq_ignore_ascii_case("current"))
+                .unwrap_or(false);
+
+            // 选定对照的旧快照与"新状态"
+            let (old_id, new_label, new_items, new_total): (i64, String, Vec<crate::scan::Item>, i64) =
+                if wants_current {
+                    let old = &list[0];
+                    let (items, source, total) = items_for(&path, false).await?;
+                    (old.id, format!("当前状态（{}）", source), (*items).clone(), total)
+                } else if let Some(n) = args.get("newId").and_then(|v| v.as_i64()) {
+                    let o = args
+                        .get("oldId")
+                        .and_then(|v| v.as_i64())
+                        .or_else(|| list.iter().map(|s| s.id).find(|id| *id != n))
+                        .ok_or("需要两份不同的快照")?;
+                    let ni = cache.get_snapshot(n).ok_or_else(|| format!("快照 {} 不存在", n))?;
+                    (o, format!("#{}", n), ni.items, ni.total_size)
+                } else {
+                    if list.len() < 2 {
+                        return Ok(tool_text(
+                            json!({
+                                "summary": format!("{} 需要至少两份快照，当前 {} 份", path, list.len()),
+                                "path": path,
+                                "snapshotCount": list.len(),
+                            })
+                            .to_string(),
+                        ));
+                    }
+                    let newer = &list[0];
+                    let older = &list[1];
+                    let ni = cache
+                        .get_snapshot(newer.id)
+                        .ok_or_else(|| format!("快照 {} 不存在", newer.id))?;
+                    (older.id, format!("#{}", newer.id), ni.items, ni.total_size)
+                };
+
+            let old = cache
+                .get_snapshot(old_id)
+                .ok_or_else(|| format!("快照 {} 不存在", old_id))?;
+            let d = crate::diff_engine::diff(&old.items, &new_items, old.total_size);
+
+            let keep = |items: Vec<Value>| items.into_iter().take(limit).collect::<Vec<_>>();
+            let added = keep(
+                d.added
+                    .iter()
+                    .map(|i| json!({ "path": i.path, "size": i.size, "isDir": i.is_dir }))
+                    .collect(),
+            );
+            let removed = keep(
+                d.removed
+                    .iter()
+                    .map(|i| json!({ "path": i.path, "size": i.size, "isDir": i.is_dir }))
+                    .collect(),
+            );
+            let modified = keep(
+                d.modified
+                    .iter()
+                    .map(|i| {
+                        json!({
+                            "path": i.path,
+                            "delta": i.delta,
+                            "oldSize": i.old_size,
+                            "newSize": i.new_size,
+                        })
+                    })
+                    .collect(),
+            );
+
+            Ok(tool_text(
+                json!({
+                    "summary": format!(
+                        "#{} → {}：{} → {}，净变化 {}（新增 {} / 删除 {} / 修改 {}）",
+                        old_id, new_label, old.total_size_formatted,
+                        crate::scan::format_size(new_total),
+                        crate::scan::format_size(d.net_change),
+                        d.added.len(), d.removed.len(), d.modified.len()
+                    ),
+                    "path": path,
+                    "oldId": old_id,
+                    "newLabel": new_label,
+                    "oldTotalSize": old.total_size,
+                    "newTotalSize": new_total,
+                    "netChange": d.net_change,
+                    "addedTotalSize": d.added_total_size,
+                    "removedTotalSize": d.removed_total_size,
+                    "modifiedDelta": d.modified_delta,
+                    "addedCount": d.added.len(),
+                    "removedCount": d.removed.len(),
+                    "modifiedCount": d.modified.len(),
+                    "added": added,
+                    "removed": removed,
+                    "modified": modified,
+                })
+                .to_string(),
+            ))
+        }
+
+        "disk_usage_trend" => {
+            let path = arg_str(args, "path").ok_or("缺少参数 path")?;
+            let limit = arg_usize(args, "limit", 30).clamp(2, 200);
+            let list = crate::disk_cache::DiskCache::instance()
+                .list_snapshots(&path)
+                .map_err(|e| format!("读取快照失败: {}", e))?;
+            if list.is_empty() {
+                return Ok(tool_text(
+                    json!({
+                        "summary": format!("{} 还没有快照，先用 save_snapshot 建立基准", path),
+                        "path": path,
+                        "snapshotCount": 0,
+                        "points": [],
+                    })
+                    .to_string(),
+                ));
+            }
+            // list_snapshots 按时间倒序 → 反转取最近 limit 个点
+            let mut asc: Vec<&crate::disk_cache::SnapshotInfo> = list.iter().collect();
+            asc.reverse();
+            let skip = asc.len().saturating_sub(limit);
+            let window = &asc[skip..];
+            let mut points: Vec<Value> = Vec::new();
+            let mut prev: Option<i64> = None;
+            for s in window {
+                points.push(json!({
+                    "id": s.id,
+                    "scanTime": s.scan_time,
+                    "totalSize": s.total_size,
+                    "totalSizeFormatted": s.total_size_formatted,
+                    "itemCount": s.item_count,
+                    "delta": prev.map(|p| s.total_size - p),
+                }));
+                prev = Some(s.total_size);
+            }
+            let first = window.first().map(|s| s.total_size).unwrap_or(0);
+            let last = window.last().map(|s| s.total_size).unwrap_or(0);
+            let net = last - first;
+            let pct = if first > 0 {
+                (net as f64 / first as f64) * 100.0
+            } else {
+                0.0
+            };
+            Ok(tool_text(
+                json!({
+                    "summary": format!(
+                        "{} 共 {} 份快照（展示最近 {} 个点）：{} → {}，净变化 {}{:.1}%",
+                        path, list.len(), points.len(),
+                        crate::scan::format_size(first), crate::scan::format_size(last),
+                        if net >= 0 { "+" } else { "" }, pct
+                    ),
+                    "path": path,
+                    "snapshotCount": list.len(),
+                    "netChange": net,
+                    "netChangePercent": pct,
+                    "points": points,
+                })
+                .to_string(),
+            ))
+        }
+
         other => Err(format!("未知工具: {}", other)),
     }
 }
@@ -565,6 +1047,28 @@ async fn wait_index_ready(idx: &crate::global_search::GlobalIndex, timeout_ms: u
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+/// 取目录条目：优先内存缓存（含 USN 校验结果），否则做一次完整扫描。
+/// 返回 (条目, 来源, 文件总大小)。
+async fn items_for(
+    path: &str,
+    force: bool,
+) -> Result<(Arc<Vec<crate::scan::Item>>, String, i64), String> {
+    if !force {
+        if let Some(items) = crate::scan::get_cached_items(path) {
+            let total: i64 = items.iter().filter(|i| !i.is_dir).map(|i| i.size).sum();
+            return Ok((items, "memory-cache".to_string(), total));
+        }
+    }
+    let perf = crate::perf::PerformanceMonitor::instance();
+    let view = crate::scan::scan_directory_view(path, force, perf, None)
+        .await
+        .map_err(|e| format!("扫描失败: {}", e))?;
+    let source = view.cache_source.clone().unwrap_or_else(|| "scan".to_string());
+    let total_size = view.total_size;
+    let result = view.into_scan_result();
+    Ok((Arc::new(result.items), source, total_size))
 }
 
 fn name_from_path(path: &str) -> String {
@@ -814,7 +1318,8 @@ pub fn endpoint_url() -> String {
             return format!("http://127.0.0.1:{}/mcp?token={}", port, token);
         }
     }
-    format!("http://127.0.0.1:{}/mcp?token={}", DEFAULT_MCP_PORT, token)
+    // 端点未运行时按设置里的端口展示（用户复制的地址与启用后的实际地址一致）
+    format!("http://127.0.0.1:{}/mcp?token={}", load_settings().port, token)
 }
 
 fn write_endpoint_file(port: u16) {
@@ -831,71 +1336,164 @@ fn write_endpoint_file(port: u16) {
     }
 }
 
-/// 在 GUI 内启动 HTTP 端点（正式实例：固定端口 + 写端点文件）
-pub async fn serve_endpoint() {
-    serve_endpoint_inner(DEFAULT_MCP_PORT, true, None).await
+/// MCP 端点设置：`~/.flashdir/mcp-settings.json`
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct McpSettings {
+    /// 是否启用本机端点（关闭后彻底不监听）
+    pub enabled: bool,
+    /// 起始端口（被占用时自动顺延）
+    pub port: u16,
 }
 
-/// 端点实现：base_port 起顺延找可用端口；write_file=false 时不覆盖端点文件
-/// （自测用：否则会在桌面端运行时把真实端点文件改成自测端口）
-async fn serve_endpoint_inner(
-    base_port: u16,
-    write_file: bool,
-    ready: Option<tokio::sync::oneshot::Sender<u16>>,
-) {
-    let token = persistent_token();
-    let mut listener = None;
-    let mut port = base_port;
-    for offset in 0..PORT_FALLBACKS {
-        let p = base_port + offset;
-        match tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
-            Ok(l) => {
-                listener = Some(l);
-                port = p;
-                break;
-            }
-            Err(e) => {
-                eprintln!("[MCP] 端口 {} 不可用: {}", p, e);
+impl Default for McpSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: DEFAULT_MCP_PORT,
+        }
+    }
+}
+
+fn settings_file_path() -> Option<std::path::PathBuf> {
+    Some(flashdir_dir()?.join("mcp-settings.json"))
+}
+
+pub fn load_settings() -> McpSettings {
+    settings_file_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<McpSettings>(&t).ok())
+        .map(|s| McpSettings {
+            enabled: s.enabled,
+            port: if s.port < 1024 { DEFAULT_MCP_PORT } else { s.port },
+        })
+        .unwrap_or_default()
+}
+
+pub fn save_settings(s: &McpSettings) -> Result<(), String> {
+    let path = settings_file_path().ok_or("无法定位配置目录")?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let text = serde_json::to_string_pretty(s).map_err(|e| e.to_string())?;
+    std::fs::write(&path, text).map_err(|e| format!("写入设置失败: {}", e))
+}
+
+/// 设置 + 运行状态（桌面端设置页使用）
+pub fn settings_json() -> Value {
+    let s = load_settings();
+    json!({
+        "enabled": s.enabled,
+        "port": s.port,
+        "defaultPort": DEFAULT_MCP_PORT,
+        "url": http_url_for_display(),
+        "endpoint": endpoint_info(),
+        "status": status_json(),
+    })
+}
+
+fn remove_endpoint_file() {
+    if let Some(path) = endpoint_file_path() {
+        if let Some(info) = endpoint_info().as_object() {
+            let ours = info
+                .get("pid")
+                .and_then(|p| p.as_u64())
+                .map(|p| p == std::process::id() as u64)
+                .unwrap_or(false);
+            if ours {
+                let _ = std::fs::remove_file(path);
             }
         }
     }
-    let Some(listener) = listener else {
-        eprintln!("[MCP] 无法监听本机端口，MCP 端点未启动");
+}
+
+/// 绑定端点端口（base 起顺延 PORT_FALLBACKS 次）
+async fn bind_endpoint(base_port: u16) -> Option<(tokio::net::TcpListener, u16)> {
+    for offset in 0..PORT_FALLBACKS {
+        let p = base_port.saturating_add(offset);
+        match tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
+            Ok(l) => return Some((l, p)),
+            Err(e) => eprintln!("[MCP] 端口 {} 不可用: {}", p, e),
+        }
+    }
+    None
+}
+
+/// 连接处理循环；`watch` 为 true 时每秒检查设置，配置变化即返回（由外层重新绑定）
+async fn serve_connections(
+    listener: tokio::net::TcpListener,
+    token: String,
+    port: u16,
+    watch: bool,
+) {
+    loop {
+        if watch {
+            let s = load_settings();
+            if !s.enabled || s.port != port {
+                return;
+            }
+        }
+        match tokio::time::timeout(std::time::Duration::from_millis(1000), listener.accept()).await {
+            Ok(Ok((stream, _))) => {
+                let token = token.clone();
+                tokio::spawn(async move {
+                    conn_opened();
+                    if let Err(e) = handle_http_conn(stream, &token).await {
+                        if e != "client closed" {
+                            eprintln!("[MCP] 连接结束: {}", e);
+                        }
+                    }
+                    conn_closed();
+                });
+            }
+            Ok(Err(e)) => {
+                eprintln!("[MCP] accept 失败: {}", e);
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(_) => {} // 超时：回到循环顶部检查设置
+        }
+    }
+}
+
+/// 桌面端启动时调用：按设置绑定端点，并**热响应**开关与端口变化
+pub async fn serve_endpoint() {
+    let token = persistent_token();
+    loop {
+        let s = load_settings();
+        if !s.enabled {
+            remove_endpoint_file();
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+            continue;
+        }
+        let Some((listener, port)) = bind_endpoint(s.port).await else {
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            continue;
+        };
+        write_endpoint_file(port);
+        eprintln!(
+            "[MCP] HTTP 端点已就绪: http://127.0.0.1:{}/mcp（配置里可直接使用该地址）",
+            port
+        );
+        serve_connections(listener, token.clone(), port, true).await;
+        remove_endpoint_file();
+        eprintln!("[MCP] MCP 设置已变更，端点重新绑定…");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// 自测用端点：独立端口 + 不写端点文件 + 不接受设置热更新
+async fn serve_endpoint_inner(
+    base_port: u16,
+    ready: Option<tokio::sync::oneshot::Sender<u16>>,
+) {
+    let token = persistent_token();
+    let Some((listener, port)) = bind_endpoint(base_port).await else {
         return;
     };
-
-    if write_file {
-        write_endpoint_file(port);
-    }
     if let Some(tx) = ready {
         let _ = tx.send(port);
     }
-    eprintln!(
-        "[MCP] HTTP 端点已就绪: http://127.0.0.1:{}/mcp（配置里可直接使用该地址）",
-        port
-    );
-
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[MCP] accept 失败: {}", e);
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                continue;
-            }
-        };
-        let token = token.clone();
-        // 每个连接独立任务：桥可能重连，长连接（SSE）不能阻塞其它客户端
-        tokio::spawn(async move {
-            conn_opened();
-            if let Err(e) = handle_http_conn(stream, &token).await {
-                if e != "client closed" {
-                    eprintln!("[MCP] 连接结束: {}", e);
-                }
-            }
-            conn_closed();
-        });
-    }
+    eprintln!("[MCP] 自测端点已就绪: 127.0.0.1:{}", port);
+    serve_connections(listener, token, port, false).await;
 }
 
 fn http_reason(status: u16) -> &'static str {
@@ -1234,7 +1832,7 @@ pub async fn selftest_endpoint() -> i32 {
 
     // 用独立端口且不写端点文件，避免影响正在运行的桌面端
     let (tx, rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move { serve_endpoint_inner(47899, false, Some(tx)).await });
+    tokio::spawn(async move { serve_endpoint_inner(47899, Some(tx)).await });
     let port = match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
         Ok(Ok(p)) => p,
         _ => {

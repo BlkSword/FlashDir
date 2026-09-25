@@ -348,6 +348,10 @@ HTTP 地址（可写进支持 url 的 Host）: {}
             commands::get_mcp_status,
             #[cfg(feature = "mcp")]
             commands::get_mcp_config,
+            #[cfg(feature = "mcp")]
+            commands::get_mcp_settings,
+            #[cfg(feature = "mcp")]
+            commands::set_mcp_settings,
             commands::cancel_scan,
             commands::open_path,
             commands::is_directory,

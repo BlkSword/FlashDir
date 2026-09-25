@@ -71,6 +71,10 @@ const searchExporting = ref(false)
 /* MCP（AI 客户端接入）状态与配置 */
 const mcpStatus = ref(null)
 const mcpConfigOpen = ref(false)
+const settingsOpen = ref(false)
+const mcpSettings = ref(null)
+const mcpPortDraft = ref(47821)
+const mcpApplying = ref(false)
 const mcpConfigHttp = ref('')
 const mcpConfigStdio = ref('')
 const mcpUrl = ref('')
@@ -189,6 +193,34 @@ async function loadMcpStatus() {
     mcpStatus.value = await invoke('get_mcp_status')
   } catch (e) {
     mcpStatus.value = null // 未编译 MCP 特性时静默隐藏
+  }
+}
+
+async function openSettings() {
+  settingsOpen.value = true
+  try {
+    const st = await invoke('get_mcp_settings')
+    mcpSettings.value = st
+    mcpPortDraft.value = st.port
+  } catch (e) {
+    toasts.err('读取设置失败：' + formatError(e))
+  }
+}
+
+async function applyMcpSettings(patch = {}) {
+  mcpApplying.value = true
+  try {
+    const enabled = patch.enabled !== undefined ? patch.enabled : !!mcpSettings.value?.enabled
+    const port = patch.port !== undefined ? patch.port : Number(mcpPortDraft.value)
+    const st = await invoke('set_mcp_settings', { enabled, port })
+    mcpSettings.value = st
+    mcpPortDraft.value = st.port
+    await loadMcpStatus()
+    toasts.ok(enabled ? `MCP 端点已启用（端口 ${st.port}）` : 'MCP 端点已关闭')
+  } catch (e) {
+    toasts.err('应用设置失败：' + formatError(e))
+  } finally {
+    mcpApplying.value = false
   }
 }
 
@@ -473,6 +505,7 @@ const commands = computed(() => [
   { id: 'theme', label: '切换主题（跟随系统 / 深色 / 浅色）', icon: 'sun', keywords: 'theme dark light' },
   { id: 'diagnostics', label: '运行诊断', icon: 'info', keywords: 'diagnostics debug' },
   { id: 'mcp-config', label: 'MCP：复制 AI 客户端配置（Claude Desktop / Cursor）', icon: 'dev', keywords: 'mcp ai claude cursor config' },
+  { id: 'settings', label: '设置：MCP 端点开关与端口', icon: 'cog', keywords: 'settings mcp port enable disable' },
   { id: 'admin', label: '以管理员重启（启用 MFT / USN）', icon: 'shield', keywords: 'admin elevate mft' },
   { id: 'about', label: '关于 FlashDir', icon: 'info', keywords: 'about version' },
 ])
@@ -493,6 +526,7 @@ function runCommand(id) {
     theme: () => cycleTheme(),
     diagnostics: () => showDiagnostics(),
     'mcp-config': () => openMcpConfig(),
+    settings: () => openSettings(),
     admin: () => restartAsAdmin(),
     about: () => { aboutOpen.value = true },
   }
@@ -621,6 +655,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
       @toggle-tree="treeVisible = !treeVisible"
       @toggle-insp="inspVisible = !inspVisible"
       @toggle-dock="dockVisible = !dockVisible"
+      @settings="openSettings"
     />
 
     <Toolbar
@@ -761,7 +796,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
       :usn-verified="usnVerified"
       :filter="filter"
       :selected="selectedItem"
-      :mcp="mcpStatus"
+      :mcp="mcpStatus && mcpStatus.enabled === false ? null : mcpStatus"
       @mcp-config="openMcpConfig"
       @restart-admin="restartAsAdmin"
       @index-action="indexAction"
@@ -806,6 +841,59 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
             <kbd>Ctrl</kbd>+<kbd>1..6</kbd> 洞察标签
           </div>
         </div>
+      </div>
+    </UiModal>
+
+    <UiModal :open="settingsOpen" title="设置" width="640px" @close="settingsOpen = false">
+      <div class="insp-h" style="margin-top:0">MCP 端点（供 Claude Desktop / Cursor 等 AI 客户端接入）</div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+          <input
+            type="checkbox"
+            :checked="!!mcpSettings?.enabled"
+            :disabled="mcpApplying"
+            @change="applyMcpSettings({ enabled: $event.target.checked })"
+          />
+          启用本机端点
+        </label>
+        <span class="section-note">关闭后不再监听任何端口（已有连接会被断开）</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+        <span class="section-note">端口</span>
+        <input
+          class="mono"
+          type="number"
+          min="1024"
+          max="65535"
+          v-model.number="mcpPortDraft"
+          style="width:96px;height:24px;background:var(--bg-0);border:1px solid var(--bd-0);border-radius:3px;color:var(--tx-0);padding:0 6px"
+        />
+        <button class="btn" :disabled="mcpApplying" @click="applyMcpSettings({ port: Number(mcpPortDraft) })">
+          <span v-if="mcpApplying" class="spinner" />应用端口
+        </button>
+        <span class="section-note">1024-65535；被占用时自动顺延</span>
+      </div>
+      <dl class="kv">
+        <dt>当前地址</dt>
+        <dd :title="mcpSettings?.url">{{ mcpSettings?.url || '—' }}</dd>
+        <dt>运行状态</dt>
+        <dd>
+          <template v-if="mcpSettings?.endpoint">
+            监听中 · 127.0.0.1:{{ mcpSettings.endpoint.port }}（PID {{ mcpSettings.endpoint.pid }}）
+          </template>
+          <template v-else>未监听</template>
+        </dd>
+        <dt>客户端</dt>
+        <dd>{{ mcpSettings?.status?.client || '未连接' }} · 累计调用 {{ mcpSettings?.status?.calls ?? 0 }} 次</dd>
+      </dl>
+      <div class="chips" style="margin-top:8px">
+        <span class="chip" @click="copyText(mcpSettings?.url || '')"><Icon name="copy" />复制地址</span>
+        <span class="chip" @click="settingsOpen = false; openMcpConfig()"><Icon name="dev" />查看接入配置</span>
+        <span class="chip" @click="settingsOpen = false">关闭</span>
+      </div>
+      <div class="section-note" style="margin-top:10px">
+        修改后约 1 秒内生效，无需重启桌面端；设置保存在
+        <span class="mono">~/.flashdir/mcp-settings.json</span>。
       </div>
     </UiModal>
 

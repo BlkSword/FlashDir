@@ -1,5 +1,38 @@
 # FlashDir Release Notes
 
+## Unreleased（十四）—— MCP P1 工具 + 设置（开关 / 端口）
+
+### 新增 7 个工具（共 13 个）
+| 工具 | 说明 |
+|------|------|
+| `find_large_files` | 大于指定体积的文件（按体积降序） |
+| `find_duplicates` | 内容哈希去重：组数/文件数/可回收空间，每组列前 5 个路径 |
+| `analyze_dev_cache` | 开发类缓存占用（类别 + Top 项 + 占比） |
+| `list_snapshots` | 历史快照列表 |
+| `save_snapshot` | 保存当前快照（唯一非只读工具：只写 FlashDir 自己的快照库，不碰用户文件） |
+| `compare_snapshots` | 对比两份快照或"快照 vs 当前"（`newId: "current"`），返回净变化与增删改 Top N |
+| `disk_usage_trend` | 基于快照的体积趋势（时间点 + 相邻差值 + 净变化百分比） |
+
+- 所有工具带 MCP 标准标注（`readOnlyHint` / `destructiveHint: false` / `openWorldHint: false`）；
+  `save_snapshot` 标记为 `readOnlyHint: false`，模型可据此区分"会不会改东西"
+- 取数策略：优先内存缓存（`memory-cache`，热态毫秒级），未命中则做一次完整扫描，
+  响应里用 `source` 标明来源
+
+### 设置
+- 桌面端新增**设置弹窗**（标题栏齿轮图标 / 命令面板"设置"）：
+  - **MCP 端点开关**：关闭后彻底不监听（连接断开、端点文件删除）
+  - **端口可改**（默认 47821，占用自动顺延 47822…），1 秒内热生效，无需重启
+  - 显示当前地址、监听端口/PID、客户端与累计调用次数，可一键复制地址
+- 设置持久化在 `~/.flashdir/mcp-settings.json`；`get_mcp_settings` / `set_mcp_settings` 两个 IPC
+
+### 实测
+- 13 个工具全部通过 `tools/list` 校验，标注正确
+- 7 个新工具逐个通过 HTTP 调用：`find_large_files` 104 个文件 / 97.7KB 起；
+  `find_duplicates` 469 组 977 文件可回收 4.40MB；`analyze_dev_cache` 158MB（99.7%）；
+  快照保存 ×2 → `compare_snapshots`（最近两次 / vs 当前）与 `disk_usage_trend` 均返回正确结果
+- 设置热生效：关闭 → 47821 拒绝连接且端点文件删除；改 47831 → 新端口 200、旧端口关闭；
+  改回 47821 → 恢复 200
+
 ## Unreleased（十三）—— MCP 单一产物 + HTTP 端点（固定端口）
 
 根据反馈做了两处结构性调整：

@@ -11,7 +11,7 @@ const props = defineProps({
   inspVisible: { type: Boolean, default: true },
   dockVisible: { type: Boolean, default: true },
 })
-const emit = defineEmits(['pick-volume', 'command', 'cycle-theme', 'toggle-tree', 'toggle-insp', 'toggle-dock'])
+const emit = defineEmits(['pick-volume', 'command', 'cycle-theme', 'toggle-tree', 'toggle-insp', 'toggle-dock', 'settings'])
 
 const themeLabel = computed(() => ({ auto: '跟随系统', dark: '深色', light: '浅色' }[props.theme] || '跟随系统'))
 
@@ -50,6 +50,9 @@ const themeIcon = computed(() => (props.theme === 'light' ? 'sun' : props.theme 
       <kbd>Ctrl</kbd><kbd>K</kbd>
     </button>
 
+    <button class="theme-btn" title="设置（MCP 端点、端口）" @click="emit('settings')">
+      <Icon name="cog" :size="15" />
+    </button>
     <button class="theme-btn" :title="`主题：${themeLabel}（点击切换）`" @click="emit('cycle-theme')">
       <Icon :name="themeIcon" :size="15" />
     </button>
