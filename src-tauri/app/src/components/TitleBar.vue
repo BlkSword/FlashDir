@@ -51,7 +51,7 @@ const themeIcon = computed(() => (props.theme === 'light' ? 'sun' : props.theme 
     </button>
 
     <button class="theme-btn" title="设置（MCP 端点、端口）" @click="emit('settings')">
-      <Icon name="cog" :size="15" />
+      <Icon name="settings" :size="15" />
     </button>
     <button class="theme-btn" :title="`主题：${themeLabel}（点击切换）`" @click="emit('cycle-theme')">
       <Icon :name="themeIcon" :size="15" />

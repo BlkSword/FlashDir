@@ -505,7 +505,7 @@ const commands = computed(() => [
   { id: 'theme', label: '切换主题（跟随系统 / 深色 / 浅色）', icon: 'sun', keywords: 'theme dark light' },
   { id: 'diagnostics', label: '运行诊断', icon: 'info', keywords: 'diagnostics debug' },
   { id: 'mcp-config', label: 'MCP：复制 AI 客户端配置（Claude Desktop / Cursor）', icon: 'dev', keywords: 'mcp ai claude cursor config' },
-  { id: 'settings', label: '设置：MCP 端点开关与端口', icon: 'cog', keywords: 'settings mcp port enable disable' },
+  { id: 'settings', label: '设置：MCP 端点开关与端口', icon: 'settings', keywords: 'settings mcp port enable disable' },
   { id: 'admin', label: '以管理员重启（启用 MFT / USN）', icon: 'shield', keywords: 'admin elevate mft' },
   { id: 'about', label: '关于 FlashDir', icon: 'info', keywords: 'about version' },
 ])
@@ -621,7 +621,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
     <symbol id="i-diff" viewBox="0 0 16 16"><path d="M4 2.5v11M12 2.5v11M4 6h3M9 10h3"/></symbol>
     <symbol id="i-dupes" viewBox="0 0 16 16"><rect x="2.5" y="2.5" width="8" height="8"/><path d="M5.5 13.5h8v-8"/></symbol>
     <symbol id="i-dev" viewBox="0 0 16 16"><path d="M6 3.5L2.5 8 6 12.5M10 3.5L13.5 8 10 12.5"/></symbol>
-    <symbol id="i-cog" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v1.6M8 12.6v1.6M1.8 8h1.6M12.6 8h1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M12.4 3.6l-1.1 1.1M4.7 11.3l-1.1 1.1"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 16 16"><path d="M2 5h5M11.4 5H14M2 11h2.6M9 11h5"/><circle cx="9.2" cy="5" r="1.7"/><circle cx="6.8" cy="11" r="1.7"/></symbol>
     <symbol id="i-tray" viewBox="0 0 16 16"><path d="M8 2v7.5M5 6.5L8 9.5l3-3M2.5 13.5h11"/></symbol>
     <symbol id="i-info" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 7v4M8 5.2v.6"/></symbol>
     <symbol id="i-clock" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/></symbol>
