@@ -122,13 +122,16 @@ const browse = async () => {
       <Icon name="filter" :size="13" />
       <input
         :value="filter"
-        placeholder="过滤当前目录；回车全局搜索"
+        placeholder="过滤当前目录（不递归）；回车搜全盘"
         spellcheck="false"
         @input="onFilterInput"
         @keydown.enter.prevent="emit('search-global', filter)"
       />
       <span class="hits">
-        <template v-if="filter">{{ hits }} 命中 · <kbd>Enter</kbd> 全局</template>
+        <template v-if="filter">
+          <template v-if="hits > 0">{{ hits }} 命中（仅当前目录） · <kbd>Enter</kbd> 搜全盘</template>
+          <template v-else>当前目录无匹配 · <kbd>Enter</kbd> 搜全盘</template>
+        </template>
       </span>
     </label>
 

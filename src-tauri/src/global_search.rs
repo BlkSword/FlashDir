@@ -79,6 +79,10 @@ struct IndexMeta {
     all_drives: Vec<String>,
     /// 是否由"全盘索引构建"产生（false = 只散落了主界面扫描过的目录）
     full_build: bool,
+    /// 是否已完成历史畸形路径修复（旧版本把反斜杠形式的扫描根与已经是绝对路径的
+    /// 条目直接拼接，产生 "C:\root/C:/root/xxx" 这类损坏路径，曾占索引三成）。
+    /// 修复成功执行一次即可，之后不再重复扫描。
+    path_repair_done: bool,
 }
 
 pub struct GlobalIndex {
@@ -170,7 +174,7 @@ impl GlobalIndex {
         }
         self.set_loading();
         match crate::disk_cache::DiskCache::instance().load_global_index() {
-            Ok(entries) if !entries.is_empty() => {
+            Ok(mut entries) if !entries.is_empty() => {
                 eprintln!("[GlobalIndex] 从磁盘恢复 {} 条索引", entries.len());
                 // 恢复元数据（是否全盘构建 / 盘符列表），否则会把部分索引误判为全盘
                 let mut meta = match crate::disk_cache::DiskCache::instance().load_index_meta() {
@@ -189,6 +193,33 @@ impl GlobalIndex {
                     let drives = list_ntfs_drives();
                     meta.drive_count = meta.drive_count.max(drives.len());
                     meta.all_drives = drives.iter().map(|c| c.to_string()).collect();
+                }
+                // 历史版本拼坏的索引路径（"C:\root/C:/root/xxx"）在这里一次性修掉：
+                // 必须在载入内存索引之前执行，否则脏路径会继续污染搜索结果。
+                if !meta.path_repair_done {
+                    match crate::disk_cache::DiskCache::instance().repair_corrupt_paths() {
+                        Ok((merged, written)) => {
+                            if merged + written > 0 {
+                                eprintln!(
+                                    "[GlobalIndex] 已修复畸形索引路径 {} 条（合并 {} / 补写 {}）",
+                                    merged + written,
+                                    merged,
+                                    written
+                                );
+                            }
+                            meta.path_repair_done = true;
+                            if let Ok(json) = serde_json::to_string(&meta) {
+                                let _ = crate::disk_cache::DiskCache::instance().save_index_meta(&json);
+                            }
+                            // 修复后重新读取，保证进内存的是干净数据
+                            if let Ok(fresh) = crate::disk_cache::DiskCache::instance().load_global_index() {
+                                if !fresh.is_empty() {
+                                    entries = fresh;
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("[GlobalIndex] 畸形路径修复失败: {e}"),
+                    }
                 }
                 *self.meta.write() = meta;
                 // 一次性批量写入，避免每条一次写锁 + clone
@@ -231,6 +262,7 @@ impl GlobalIndex {
     /// 添加或替换一条索引。entries / by_path / name_index 在同一锁临界区内更新。
     /// 锁顺序：永远先 entries 再 by_path 再 name_index，避免死锁。
     fn upsert_internal(&self, entry: IndexEntry) {
+        let entry = repair_entry_path(entry);
         let first_char = bucket_char(&entry.name_lower);
         let hash = path_hash(&entry.path);
         let is_dir = entry.is_dir;
@@ -291,6 +323,7 @@ impl GlobalIndex {
         let mut name_index = self.name_index.write();
 
         for entry in batch {
+            let entry = repair_entry_path(entry);
             let first_char = bucket_char(&entry.name_lower);
             let hash = path_hash(&entry.path);
             let is_dir = entry.is_dir;
@@ -506,8 +539,11 @@ impl GlobalIndex {
 
     /// 将主界面某次扫描的结果追加到全局索引（复用已验证可用的 scan_dir 结果）。
     pub fn add_items(&self, scan_path: &str, items: &[crate::scan::Item]) {
-        let path_base = scan_path.trim_end_matches('/').trim_end_matches('\\');
-        let path_base_lower = path_base.to_lowercase();
+        // 扫描根统一成规范形式（正斜杠 / 盘符大写 / 无末尾分隔符）：
+        // 早期版本把 "C:\Users\me" 这类根直接与已经是绝对路径的条目拼接，
+        // 生成 "C:\Users\me/C:/Users/me/xxx" 脏路径（历史上一度占索引三成）。
+        let path_base =
+            normalize_index_path(scan_path.trim_end_matches(|c| c == '/' || c == '\\')).into_owned();
 
         // 先移除该路径下已有的条目，避免重复（内存 + 磁盘同步移除）
         let prefix = format!("{}/", path_base);
@@ -516,21 +552,12 @@ impl GlobalIndex {
 
         let batch: Vec<IndexEntry> = items
             .iter()
-            .map(|item| {
-                let abs_path = if item.path.as_str().to_lowercase().starts_with(&path_base_lower)
-                    || item.path.starts_with('/')
-                {
-                    item.path.to_string()
-                } else {
-                    format!("{}/{}", path_base, item.path.as_str())
-                };
-                IndexEntry {
-                    path: abs_path,
-                    name_lower: item.name.to_lowercase(),
-                    size: item.size,
-                    is_dir: item.is_dir,
-                    mtime: item.mtime,
-                }
+            .map(|item| IndexEntry {
+                path: index_path_for(&path_base, item.path.as_str()),
+                name_lower: item.name.to_lowercase(),
+                size: item.size,
+                is_dir: item.is_dir,
+                mtime: item.mtime,
             })
             .collect();
 
@@ -725,6 +752,8 @@ pub struct SearchFilter {
 #[derive(Debug, Clone)]
 pub enum SearchFilterKind {
     Text(String),
+    /// 含路径分隔符的查询：按整条路径做包含匹配（用户常直接粘贴完整路径）
+    PathText(String),
     Name(String),
     Ext(String),
     Prefix(String),
@@ -911,14 +940,15 @@ pub fn parse_search_filter(input: &str) -> Vec<SearchFilter> {
             _ => (word, false),
         };
 
+        // 先按 `key:value` 解析；只有"已知键名"才走字段过滤，未识别的
+        // （包括 `C:\x\y` 这类带盘符的路径）落到下面的纯文本分支。
         if let Some((key, value)) = word.split_once(':') {
-            let key = key.to_lowercase();
+            let key_lower = key.to_lowercase();
             let negate = negate_next || bang;
-            negate_next = false;
-            let kind = match key.as_str() {
+            let kind = match key_lower.as_str() {
                 "ext" => Some(SearchFilterKind::Ext(value.to_lowercase())),
                 "name" => Some(SearchFilterKind::Name(value.to_lowercase())),
-                "dir" => Some(SearchFilterKind::Dir(value.to_lowercase())),
+                "dir" => Some(SearchFilterKind::Dir(normalize_query_path(&value.to_lowercase()))),
                 "type" => {
                     let v = value.to_lowercase();
                     let is_dir = v == "dir" || v == "folder";
@@ -928,25 +958,31 @@ pub fn parse_search_filter(input: &str) -> Vec<SearchFilter> {
                 "mtime" => parse_mtime(value).map(|(op, seconds)| SearchFilterKind::Mtime { op, seconds }),
                 // 未识别的 `key:value` 不再被静默丢弃（丢弃会让过滤条件变空，
                 // 进而退化成"返回全量中最大的若干项"），而是按纯文本处理。
-                _ => Some(SearchFilterKind::Text(word.to_lowercase())),
+                _ => None,
             };
             if let Some(kind) = kind {
+                negate_next = false;
                 filters.push(SearchFilter { kind, negate });
+                continue;
             }
+        }
+
+        let value = word.to_lowercase();
+        let negate = negate_next || bang;
+        negate_next = false;
+        // 含路径分隔符的查询按路径匹配：Windows 文件名不允许出现 `/` 或 `\\`，
+        // 这类输入只可能是路径（把完整路径或路径片段粘进搜索框是很常见的用法）。
+        if let Some(kind) = path_query_kind(&value) {
+            filters.push(SearchFilter { kind, negate });
+        } else if let Some(kind) = parse_wildcard_filter(&value) {
+            filters.push(SearchFilter { kind, negate });
+        } else if negate {
+            filters.push(SearchFilter {
+                kind: SearchFilterKind::Text(value),
+                negate: true,
+            });
         } else {
-            let value = word.to_lowercase();
-            let negate = negate_next || bang;
-            negate_next = false;
-            if let Some(kind) = parse_wildcard_filter(&value) {
-                filters.push(SearchFilter { kind, negate });
-            } else if negate {
-                filters.push(SearchFilter {
-                    kind: SearchFilterKind::Text(value),
-                    negate: true,
-                });
-            } else {
-                text_parts.push(value);
-            }
+            text_parts.push(value);
         }
     }
 
@@ -964,6 +1000,7 @@ fn apply_filters(entry: &IndexEntry, filters: &[SearchFilter]) -> bool {
     for f in filters {
         let matched = match &f.kind {
             SearchFilterKind::Text(t) => entry.name_lower.contains(t),
+            SearchFilterKind::PathText(p) => contains_ignore_case(&entry.path, p),
             SearchFilterKind::Name(n) => entry.name_lower.contains(n),
             SearchFilterKind::Prefix(p) => entry.name_lower.starts_with(p),
             SearchFilterKind::Suffix(s) => entry.name_lower.ends_with(s),
@@ -1021,6 +1058,7 @@ pub fn item_matches_filters(
             SearchFilterKind::Text(t) => {
                 contains_ignore_case(name, t) || contains_ignore_case(path, t)
             }
+            SearchFilterKind::PathText(p) => contains_ignore_case(path, p),
             SearchFilterKind::Name(n) => contains_ignore_case(name, n),
             SearchFilterKind::Prefix(p) => starts_with_ignore_case_ci(name, p),
             SearchFilterKind::Suffix(sfx) => ends_with_ignore_case_ci(name, sfx),
@@ -1231,6 +1269,146 @@ fn is_same_or_child(base: &str, key: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(&child_prefix))
 }
 
+/// 索引路径规范化：统一正斜杠、折叠重复分隔符、盘符大写、去掉末尾分隔符。
+///
+/// 只做分隔符与盘符层面的规范化：索引里存的是展示给用户的路径，
+/// 卷内真实大小写由文件系统枚举给出，保持原样。
+/// 已经是规范形式时原样借用，避免每次写入索引都多一次分配。
+pub fn normalize_index_path(path: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = path.as_bytes();
+    let has_drive = bytes.len() >= 2 && bytes[1] == b':';
+    let clean = !bytes.contains(&b'\\')
+        && !path.contains("//")
+        && !path.ends_with('/')
+        && (!has_drive || bytes[0].is_ascii_uppercase());
+    if clean {
+        return std::borrow::Cow::Borrowed(path);
+    }
+
+    let mut out = String::with_capacity(path.len() + 4);
+    let mut prev_slash = false;
+    for (i, ch) in path.chars().enumerate() {
+        let c = if ch == '\\' { '/' } else { ch };
+        if c == '/' {
+            if prev_slash {
+                continue;
+            }
+            prev_slash = true;
+        } else {
+            prev_slash = false;
+        }
+        if i == 0 && has_drive && c.is_ascii_lowercase() {
+            out.push(c.to_ascii_uppercase());
+        } else {
+            out.push(c);
+        }
+    }
+    while out.len() > 3 && out.ends_with('/') {
+        out.pop();
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// 判断（已规范化的）路径是否为绝对路径：`C:/...` 或 `/...`。
+fn is_absolute_index_path(path: &str) -> bool {
+    let b = path.as_bytes();
+    (b.len() >= 3 && b[1] == b':' && b[2] == b'/') || b.first() == Some(&b'/')
+}
+
+/// 计算某个扫描条目在索引里的绝对路径。
+///
+/// `item.path` 在 CLI/管道场景下可能是扫描根下的相对路径，主界面扫描结果则已经
+/// 是绝对路径，因此必须按"是否绝对路径 / 是否落在扫描根下"判断，而不能靠字符串
+/// 前缀比较：扫描根写成 `C:\Users\me` 这类反斜杠形式时比较必然失败，
+/// 于是拼出 `C:\Users\me/C:/Users/me/xxx` 脏路径（既污染搜索又制造重复项）。
+pub fn index_path_for(scan_path: &str, item_path: &str) -> String {
+    let base =
+            normalize_index_path(scan_path.trim_end_matches(|c| c == '/' || c == '\\')).into_owned();
+    if item_path.is_empty() {
+        return base;
+    }
+    let rel = normalize_index_path(item_path);
+    let joined = if is_absolute_index_path(&rel) || is_same_or_child(&base, &rel) {
+        rel.into_owned()
+    } else {
+        format!("{}/{}", base, rel.trim_start_matches('/'))
+    };
+    normalize_index_path(&joined).into_owned()
+}
+
+/// 修复历史版本拼坏的索引路径（形如 `C:\root/C:/root/xxx`）。
+///
+/// Windows 文件名里不允许出现 `:`，所以第一个 `/<盘符>:/` 之后的一定是真实绝对路径。
+/// 返回修好的路径；不需要修复时返回 None。
+pub fn repair_corrupt_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    if bytes.len() < 6 {
+        return None;
+    }
+    let mut start = None;
+    for i in 0..bytes.len() - 3 {
+        if bytes[i] == b'/'
+            && bytes[i + 1].is_ascii_alphabetic()
+            && bytes[i + 2] == b':'
+            && bytes[i + 3] == b'/'
+        {
+            start = Some(i + 1);
+            break;
+        }
+    }
+    let fixed = normalize_index_path(&path[start?..]).into_owned();
+    if is_absolute_index_path(&fixed) {
+        Some(fixed)
+    } else {
+        None
+    }
+}
+
+/// 入库兜底：路径里出现反斜杠说明上游漏了规范化（历史脏数据或新增调用点）。
+/// 命中概率极低，因此只有真的含 `\` 时才走慢路径。
+fn repair_entry_path(mut entry: IndexEntry) -> IndexEntry {
+    if entry.path.as_bytes().contains(&b'\\') {
+        entry.path = normalize_index_path(&entry.path).into_owned();
+    }
+    entry
+}
+
+/// 查询里的路径片段规范化（与索引里的写法对齐：正斜杠、无重复分隔符、无末尾分隔符）。
+fn normalize_query_path(value_lower: &str) -> String {
+    let mut out = String::with_capacity(value_lower.len());
+    let mut prev_slash = false;
+    for ch in value_lower.chars() {
+        let c = if ch == '\\' { '/' } else { ch };
+        if c == '/' {
+            if prev_slash {
+                continue;
+            }
+            prev_slash = true;
+        } else {
+            prev_slash = false;
+        }
+        out.push(c);
+    }
+    while out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
+/// 含路径分隔符的查询：Windows 文件名不允许出现 `/` 与 `\`，
+/// 因此这类输入只可能是路径，按"整条路径包含"匹配（用户常直接粘贴完整路径）。
+fn path_query_kind(value_lower: &str) -> Option<SearchFilterKind> {
+    if !value_lower.contains('/') && !value_lower.contains('\\') {
+        return None;
+    }
+    // 通配符在路径查询里退化为"包含"语义（`*a/b*`、`a/b*` 都按包含处理）
+    let cleaned = normalize_query_path(value_lower).replace('*', "");
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(SearchFilterKind::PathText(cleaned))
+}
+
 static GLOBAL_INDEX: OnceLock<GlobalIndex> = OnceLock::new();
 
 pub fn instance() -> &'static GlobalIndex {
@@ -1292,6 +1470,85 @@ pub fn list_ntfs_drives() -> Vec<char> {
 
 #[cfg(test)]
 mod tests {
+    /// 回归：粘贴完整路径或路径片段必须能搜到。
+    ///
+    /// 历史缺陷：纯文本条件只与文件名比较，于是把完整路径粘进搜索框恒为 0 条结果
+    /// （Windows 文件名不允许出现 `/`、`\`，所以含分隔符的输入只能按路径匹配）。
+    #[test]
+    fn search_by_absolute_path_and_fragment() {
+        let entry = IndexEntry {
+            path: "C:/project/CTX-Audit/harness-private/EQM1-METHODOLOGY.md".to_string(),
+            name_lower: "eqm1-methodology.md".to_string(),
+            size: 59097,
+            is_dir: false,
+            mtime: 0,
+        };
+        let hit = |q: &str| apply_filters(&entry, &parse_search_filter(q));
+
+        assert!(hit("eqm1-methodology.md"), "按文件名");
+        assert!(hit("EQM1-METHODOLOGY"), "大小写不敏感");
+        assert!(hit("*methodology*"), "通配符包含");
+        assert!(hit(r"C:\project\CTX-Audit\harness-private\EQM1-METHODOLOGY.md"), "反斜杠完整路径");
+        assert!(hit("C:/project/CTX-Audit/harness-private/EQM1-METHODOLOGY.md"), "正斜杠完整路径");
+        assert!(hit("harness-private/EQM1-METHODOLOGY.md"), "路径片段");
+        assert!(hit(r"harness-private\EQM1-METHODOLOGY.md"), "反斜杠路径片段");
+        assert!(hit("harness-private/EQM1*"), "带通配符的路径片段");
+        assert!(hit(r"dir:C:\project\CTX-Audit\harness-private"), "dir: 反斜杠路径");
+        assert!(hit("dir:project"), "dir: 路径包含");
+
+        assert!(!hit("harness-private/nope.md"), "不相关路径不命中");
+        assert!(!hit("other/EQM1-METHODOLOGY.md"), "路径片段不匹配");
+        // 纯词只匹配文件名，避免 "windows" 命中 C:/Windows 下所有文件
+        assert!(!hit("project"), "纯词不匹配路径");
+    }
+
+    /// 回归：扫描根写成反斜杠形式时，不能再拼出 `C:\root/C:/root/xxx` 脏路径。
+    #[test]
+    fn index_path_never_mixes_separators() {
+        let abs = "C:/project/CTX-Audit/harness-private/EQM1-METHODOLOGY.md";
+        for root in [
+            r"C:\project\CTX-Audit\harness-private",
+            "C:/project/CTX-Audit/harness-private",
+            r"C:\project\CTX-Audit\harness-private/",
+            "c:/project//CTX-Audit/harness-private",
+        ] {
+            assert_eq!(index_path_for(root, abs), abs, "绝对路径输入，扫描根 {root:?}");
+        }
+        for root in [r"C:\project\CTX-Audit", "C:/project/CTX-Audit"] {
+            assert_eq!(
+                index_path_for(root, "harness-private/EQM1-METHODOLOGY.md"),
+                abs,
+                "相对路径输入，扫描根 {root:?}"
+            );
+            assert_eq!(index_path_for(root, r"harness-private\EQM1-METHODOLOGY.md"), abs);
+        }
+        // 相对路径拼接后也必须是规范形式
+    assert_eq!(index_path_for(r"C:\project\CTX-Audit\harness-private", "sub\\x.md"), "C:/project/CTX-Audit/harness-private/sub/x.md");
+        assert_eq!(normalize_index_path(r"C:\Windows\System32"), "C:/Windows/System32");
+        assert_eq!(normalize_index_path("c:/Windows//System32/"), "C:/Windows/System32");
+        assert!(matches!(
+            normalize_index_path("C:/Windows/System32"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// 回归：历史畸形索引路径能被还原（存量脏行里有一成没有对应的正确行，直接删会丢数据）。
+    #[test]
+    fn repair_historical_corrupt_path() {
+        assert_eq!(
+            repair_corrupt_path(r"C:\project/C:/project/CTX-Audit/harness-private/EQM1-METHODOLOGY.md")
+                .as_deref(),
+            Some("C:/project/CTX-Audit/harness-private/EQM1-METHODOLOGY.md")
+        );
+        assert_eq!(
+            repair_corrupt_path(r"C:\Users\me/C:/Users/me/Desktop/flashdir.exe").as_deref(),
+            Some("C:/Users/me/Desktop/flashdir.exe")
+        );
+        // 正常路径不该被误改
+        assert_eq!(repair_corrupt_path("C:/Windows/System32/drivers/etc/hosts"), None);
+        assert_eq!(repair_corrupt_path("C:/Users/me/Documents/a:b.txt"), None);
+    }
+
     /// 诊断：过滤表达式解析与匹配（本地过滤 / 在此目录内过滤共用）
     #[test]
     fn diag_filter_parse_and_match() {

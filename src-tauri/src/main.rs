@@ -164,6 +164,25 @@ fn clamp_window_to_work_area(_win: &tauri::WebviewWindow) {}
 
 #[tokio::main]
 async fn main() {
+    // 维护模式：修复历史版本写入的畸形索引路径后退出（不创建窗口）。
+    // 桌面端启动时也会自动做一次，这个入口给命令行/脚本用。
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--repair-index") {
+            let code = match flashdir::disk_cache::DiskCache::instance().repair_corrupt_paths() {
+                Ok((merged, written)) => {
+                    println!("索引畸形路径修复完成：合并 {merged} 条，补写 {written} 条");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("修复失败: {e}");
+                    1
+                }
+            };
+            std::process::exit(code);
+        }
+    }
+
     // MCP 模式：不创建窗口，直接以 stdio 服务或桥接到本机端点。
     // 这些模式由 MCP Host（Claude Desktop / Cursor）以子进程方式启动，
     // 因此启动路径必须尽量短，且绝不弹出窗口。

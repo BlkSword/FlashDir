@@ -815,6 +815,79 @@ impl DiskCache {
     // ─── 全局搜索索引持久化 ─────────────────────────────────
 
     /// 加载全部全局索引条目
+    /// 一次性修复历史畸形索引路径（形如 `C:\root/C:/root/xxx`）。
+    ///
+    /// 这类脏行是早期版本拼接路径时留下的，占过索引三成：既让搜索结果出现
+    /// 奇怪路径与重复项，又让"粘贴完整路径"永远搜不到东西。
+    /// 修复策略：截出其中的真实绝对路径；已有正确行就只删脏行（保留较新的元数据），
+    /// 没有就按脏行的元数据补写一条。返回（合并数, 补写数）。
+    pub fn repair_corrupt_paths(&self) -> Result<(usize, usize)> {
+        let mut guard = self.conn.lock();
+        let conn = guard.as_mut().ok_or_else(Self::disabled_err)?;
+        // 先取出候选行，避免边遍历边改
+        let rows: Vec<(String, i64, i64, i64)> = {
+            let mut stmt =
+                conn.prepare("SELECT path, size, is_dir, mtime FROM global_index WHERE path LIKE '%/%:/%'")?;
+            let mapped = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            mapped.filter_map(|r| r.ok()).collect()
+        };
+        if rows.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let tx = conn.transaction()?;
+        let mut merged = 0usize;
+        let mut written = 0usize;
+        {
+            let mut del = tx.prepare("DELETE FROM global_index WHERE path = ?1")?;
+            let mut ins = tx.prepare(
+                "INSERT OR IGNORE INTO global_index
+                 (path, name, name_lower, ext, size, is_dir, drive, mtime, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            let now = chrono::Utc::now().timestamp();
+            for (bad, size, is_dir, mtime) in &rows {
+                if let Some(fixed) = crate::global_search::repair_corrupt_path(bad) {
+                    let name = fixed.rsplit('/').next().unwrap_or(fixed.as_str());
+                    let ext = if *is_dir != 0 {
+                        String::new()
+                    } else {
+                        name.rsplit_once('.')
+                            .map(|(_, e)| e.to_lowercase())
+                            .unwrap_or_default()
+                    };
+                    let drive = Self::extract_drive(&fixed).unwrap_or('?').to_string();
+                    let changed = ins.execute(params![
+                        fixed,
+                        "",
+                        name.to_lowercase(),
+                        ext,
+                        size,
+                        is_dir,
+                        drive,
+                        mtime,
+                        now
+                    ])?;
+                    if changed > 0 {
+                        written += 1;
+                    } else {
+                        merged += 1;
+                    }
+                }
+                del.execute([bad.as_str()])?;
+            }
+        }
+        tx.commit()?;
+        Ok((merged, written))
+    }
+
     pub fn load_global_index(&self) -> Result<Vec<IndexEntry>> {
         let guard = self.conn.lock();
         let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;

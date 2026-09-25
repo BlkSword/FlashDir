@@ -96,6 +96,7 @@ FlashDir 是一个面向 Windows 的磁盘空间分析与可观测性工具。�
 | 扩展名简写 | `*.pdf`、`.pdf` | 按扩展名匹配 |
 | 通配符 | `report*`、`*2024`、`*mid*` | 前缀、后缀、包含匹配 |
 | 关键字段 | `ext:zip`、`name:report`、`dir:node_modules` | 扩展名 / 名称 / 路径包含 |
+| 路径 | `C:\project\CTX-Audit\harness-private\EQM1-METHODOLOGY.md`、`harness-private/EQM1*` | 查询含 `/` 或 `\` 时按“整条路径包含”匹配，可直接粘贴完整路径 |
 | 体积 | `size:>100MB`、`size:<1GB` | 体积比较，支持 B/KB/MB/GB/TB |
 | 时间 | `mtime:>7d`、`mtime:<1h` | 修改时间比较 |
 | 类型 | `type:file`、`type:dir` | 仅文件或仅目录 |
@@ -103,6 +104,8 @@ FlashDir 是一个面向 Windows 的磁盘空间分析与可观测性工具。�
 | 组合 | `ext:zip size:>10MB !tmp` | 多条件同时满足 |
 
 - 检索结果返回**命中总数**与分页游标，界面支持“加载更多”、滚动加载、虚拟滚动与 CSV 导出；
+- 工具栏过滤框只过滤**当前目录一层**（命中数即当前列表条数），按 `Enter` 转为全局检索；
+- 索引是构建时的快照：新建的文件需要重建索引或扫描其所在目录后才会进入索引；
 - 索引持久化于本地 SQLite，重启后按增量加载；索引内存结构为连续数组（arena）+
   路径 128 位哈希索引 + 首字符分桶，`name`、`ext` 等字段按需从路径派生，以降低常驻内存。
 
@@ -353,6 +356,7 @@ cd .. && cargo build --release --features custom-protocol
 | `flashdir.exe --selftest-endpoint` | MCP HTTP 端点与令牌自测（6 项） |
 | `flashdir.exe --selftest-bridge` | 桥接链路自测（需桌面端运行） |
 | `flashdir.exe --mcp-help` | 输出 MCP 用法与当前地址 |
+| `flashdir.exe --repair-index` | 修复历史版本写入的畸形索引路径后退出（桌面端启动时也会自动做一次） |
 | `cli.exe <路径> [选项]` | 命令行扫描 |
 
 ---
@@ -494,6 +498,7 @@ flashdir.exe --selftest-bridge     # 桥接链路（需桌面端运行）
 | 快照占用 | 快照保存在本地缓存库中并占用磁盘空间，单目录保留 50 份 / 30 天，可在“快照对比”中删除 |
 | MCP 端点 | 仅监听回环地址并依赖本机令牌；适用于本机客户端，不提供跨机访问 |
 | 首次索引 | 全卷索引构建需管理员权限；未构建时检索工具会提示索引尚未就绪 |
+| 索引新鲜度 | 全局索引是构建时的快照：之后新建的文件需要重建索引，或先扫描其所在目录；`--repair-index` 只修复历史脏路径，不改变索引范围 |
 
 ---
 

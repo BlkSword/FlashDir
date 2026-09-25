@@ -115,7 +115,8 @@ async function runGlobalSearch(q, { append = false } = {}) {
       toasts.warn('全局索引尚未就绪，正在后台构建，稍后重试')
       gs.ensureIndex().catch(() => {})
     } else if (!append && !res.results.length && res.indexSize) {
-      toasts.info('索引中有 ' + res.indexSize.toLocaleString() + ' 项，但没有匹配“' + query + '”')
+      toasts.info('索引中有 ' + res.indexSize.toLocaleString() + ' 项，但没有匹配“' + query + '”；'
+        + '索引是构建时的快照，新建的文件需重建索引或先扫描其所在目录')
     }
   } catch (e) {
     const msg = formatError(e)
