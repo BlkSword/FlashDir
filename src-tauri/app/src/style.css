@@ -502,3 +502,39 @@ kbd {
   border: 1px solid var(--bd-0); border-radius: var(--r); padding: 8px 10px;
   max-height: 300px; overflow: auto; white-space: pre-wrap; word-break: break-all;
 }
+
+
+/* 右下角索引进度 / 新鲜度提示（构建中、增量窗口失效时出现） */
+.idx-card {
+  position: fixed;
+  right: 12px;
+  bottom: calc(var(--status-h) + 10px);
+  z-index: 60;
+  min-width: 250px;
+  max-width: 380px;
+  padding: 9px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--tx-0);
+  background: var(--bg-2);
+  border: 1px solid var(--bd-0);
+  border-radius: 5px;
+  box-shadow: var(--shadow);
+}
+.idx-row { display: flex; align-items: center; gap: 6px; }
+.idx-dim { color: var(--tx-2); font-size: 11px; }
+.idx-track { height: 3px; border-radius: 2px; background: var(--bd-0); overflow: hidden; }
+.idx-track > i {
+  display: block;
+  height: 100%;
+  width: 38%;
+  background: var(--accent);
+  animation: idx-slide 1.15s ease-in-out infinite;
+}
+@keyframes idx-slide {
+  0% { margin-left: -38%; }
+  100% { margin-left: 100%; }
+}
+.idx-actions { display: flex; gap: 6px; }

@@ -7,7 +7,7 @@
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::mpsc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde::Serialize;
@@ -59,6 +59,10 @@ pub struct ReadyData {
     /// true = 仅包含"主界面扫描过的目录"，并非全盘索引。
     /// 前端据此提示"部分目录"，避免用户误以为跨盘搜索已完整。
     pub partial: bool,
+    /// 最近一次增量同步时间（Unix 秒，0 = 尚未同步）
+    pub usn_last_sync: i64,
+    /// 增量窗口失效、建议重建索引的盘
+    pub usn_stale_drives: Vec<String>,
 }
 
 /// 索引状态（前端据 kind 判断）
@@ -83,6 +87,8 @@ struct IndexMeta {
     /// 条目直接拼接，产生 "C:\root/C:/root/xxx" 这类损坏路径，曾占索引三成）。
     /// 修复成功执行一次即可，之后不再重复扫描。
     path_repair_done: bool,
+    /// USN 增量同步状态（检查点 / 需要重建的盘 / 最近同步时间）
+    usn: UsnSyncState,
 }
 
 pub struct GlobalIndex {
@@ -101,6 +107,8 @@ pub struct GlobalIndex {
     /// 增量维护的文件/目录计数，避免每次状态刷新都 O(n) 全量重数
     file_count: AtomicUsize,
     dir_count: AtomicUsize,
+    /// 索引构建中标志（进程内互斥；跨进程还有锁文件）
+    building: AtomicBool,
 }
 
 /// 路径 → 128 位哈希（双 64 位 FNV-1a 拼接，冲突概率可忽略）
@@ -162,6 +170,7 @@ impl GlobalIndex {
             meta: RwLock::new(IndexMeta::default()),
             file_count: AtomicUsize::new(0),
             dir_count: AtomicUsize::new(0),
+            building: AtomicBool::new(false),
         }
     }
 
@@ -259,6 +268,8 @@ impl GlobalIndex {
             failed_drives: meta.failed_drives.clone(),
             all_drives: meta.all_drives.clone(),
             partial: !meta.full_build,
+            usn_last_sync: meta.usn.last_sync_at,
+            usn_stale_drives: meta.usn.stale_drives.clone(),
         });
     }
 
@@ -1431,6 +1442,750 @@ fn path_query_kind(value_lower: &str) -> Option<SearchFilterKind> {
     Some(SearchFilterKind::PathText(cleaned))
 }
 
+// ─── 索引构建锁 ────────────────────────────────────────────
+
+/// NTFS 目录属性位（USN 记录里的 attributes 用同一位）
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+/// 单次同步允许"目录改名重挂子树"的最大条目数：超过就交给全量重建
+const MAX_REPATH_ENTRIES: usize = 20_000;
+/// 首次追赶时允许的历史积压上限。
+///
+/// 增量应用约 1.67ms/条（每条要随机读 MFT 解析 FRN→路径），而全盘 MFT 重建
+/// 只要 2.4-3.5s——也就是说积压超过约 2000 条时，直接让用户重建索引反而更快。
+/// 因此超过这个量就播种到当前位置并标记"建议重建"，不做无谓的追赶。
+const MAX_CATCHUP_RECORDS: i64 = 2_000;
+/// 增量同步每次读取并处理的记录条数上限。
+///
+/// 每条变更要随机读 MFT 解析 FRN→路径（跨目录约 5-8ms），200 条 ≈ 1-1.6s，
+/// 配合时间预算可以保证一次同步不会长时间占用后台线程。
+const CHUNK_RECORDS: usize = 200;
+/// 锁文件被视为残留的时限（秒）
+const BUILD_LOCK_STALE_SECS: u64 = 30 * 60;
+
+/// 每个盘的 USN 检查点与同步状态（随 IndexMeta 一起持久化）。
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct UsnSyncState {
+    /// 盘符（"C"）→ 检查点；只有全盘构建过的盘才会有
+    pub checkpoints: HashMap<String, crate::fs::UsnCheckpoint>,
+    /// 增量窗口已失效、只能靠重建索引恢复的盘
+    pub stale_drives: Vec<String>,
+    /// 最近一次同步完成时间（Unix 秒，0 = 尚未同步）
+    pub last_sync_at: i64,
+    /// 累计应用的变更条数
+    pub applied_total: u64,
+}
+
+/// 一次增量同步的结果（诊断与界面提示用）
+#[derive(Debug, Clone, Default)]
+pub struct UsnSyncReport {
+    /// 本次应用的变更条数
+    pub applied: usize,
+    /// 删除的条目数
+    pub removals: usize,
+    /// 新增/更新的条目数
+    pub upserts: usize,
+    /// 目录改名重挂的条目数
+    pub repathed: usize,
+    /// 增量窗口失效、需要重建索引的盘
+    pub stale: Vec<char>,
+    /// 本次因预算耗尽而仍有积压
+    pub backlog: bool,
+    pub elapsed_ms: u64,
+}
+
+impl UsnSyncReport {
+    pub fn summary(&self) -> String {
+        if self.applied == 0 && self.stale.is_empty() && !self.backlog {
+            return format!("索引已是最新（{}ms）", self.elapsed_ms);
+        }
+        let mut parts = vec![format!(
+            "增量同步：应用 {} 条（新增/更新 {}，删除 {}）",
+            self.applied, self.upserts, self.removals
+        )];
+        if self.repathed > 0 {
+            parts.push(format!("目录改名重挂 {} 条", self.repathed));
+        }
+        if !self.stale.is_empty() {
+            parts.push(format!("{:?} 增量窗口失效，建议重建索引", self.stale));
+        }
+        if self.backlog {
+            parts.push(String::from("仍有积压，稍后继续"));
+        }
+        parts.push(format!("{}ms", self.elapsed_ms));
+        parts.join("，")
+    }
+}
+
+/// 索引构建锁：进程内原子标志 + 跨进程锁文件。
+///
+/// 构建未完成时再次触发构建，不仅会互相覆盖结果，峰值内存还会翻倍
+/// （低内存机器上这是闪退的直接诱因），因此必须互斥。
+pub struct IndexBuildGuard<'a> {
+    index: &'a GlobalIndex,
+    lock_path: Option<std::path::PathBuf>,
+}
+
+impl std::fmt::Debug for IndexBuildGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexBuildGuard")
+            .field("lock_path", &self.lock_path)
+            .finish()
+    }
+}
+
+impl Drop for IndexBuildGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(path) = self.lock_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        self.index.building.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 锁文件路径（`FLASHDIR_BUILD_LOCK` 可覆盖，便于自测）。
+fn build_lock_path() -> std::path::PathBuf {
+    if let Ok(custom) = std::env::var("FLASHDIR_BUILD_LOCK") {
+        if !custom.trim().is_empty() {
+            return std::path::PathBuf::from(custom);
+        }
+    }
+    let mut path = std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    path.push(".flashdir");
+    path.push("index-build.lock");
+    path
+}
+
+#[cfg(target_os = "windows")]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle == 0 {
+            return false;
+        }
+        CloseHandle(handle);
+        true
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn process_alive(_pid: u32) -> bool {
+    false
+}
+
+/// 获取跨进程构建锁。成功返回锁文件路径（Drop 时删除）。
+fn acquire_build_lock_file() -> Result<Option<std::path::PathBuf>, String> {
+    use std::io::Write;
+    let path = build_lock_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    for attempt in 0..2 {
+        match std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{}", std::process::id());
+                return Ok(Some(path));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let pid = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u32>().ok());
+                let alive = pid.map(process_alive).unwrap_or(false);
+                let fresh = std::fs::metadata(&path)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|time| time.elapsed().ok())
+                    .map(|age| age.as_secs() < BUILD_LOCK_STALE_SECS)
+                    .unwrap_or(false);
+                if attempt == 0 && (!alive || !fresh) {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                return Err(match pid {
+                    Some(pid) if alive => format!(
+                        "另一个 FlashDir 实例（pid {pid}）正在构建索引，请等它完成后重试"
+                    ),
+                    _ => String::from("索引构建锁被占用（疑似残留锁文件），请稍后重试"),
+                });
+            }
+            Err(e) => return Err(format!("无法创建索引构建锁: {e}")),
+        }
+    }
+    Err(String::from("无法获取索引构建锁"))
+}
+
+// ─── USN 增量同步 ──────────────────────────────────────────
+
+/// 本次同步产生的磁盘操作（内存已经即时生效，磁盘统一在最后落库）
+#[derive(Default)]
+struct DeltaSink {
+    upserts: Vec<IndexEntry>,
+    /// 需要删除的确切路径（文件删除、目录子树的每个条目、改名前的旧路径）。
+    /// 用确切路径而不是前缀：`DELETE ... LIKE 'prefix/%'` 是整表扫描，
+    /// 几十个目录删除就能让一次同步卡二十秒。
+    removals: Vec<String>,
+    /// 目录删除/改名涉及的前缀，仅用于在内存里一次性收集命中路径
+    dir_prefixes: Vec<String>,
+}
+
+impl DeltaSink {
+    fn flush(&self) {
+        let cache = crate::disk_cache::DiskCache::instance();
+        if !self.removals.is_empty() {
+            let _ = cache.remove_global_index_by_paths(&self.removals);
+        }
+        if !self.upserts.is_empty() {
+            let _ = cache.upsert_global_index_entries(&self.upserts);
+        }
+    }
+}
+
+/// 卷内相对路径 → 索引里的绝对路径（`C:/Users/...`）
+fn full_index_path(drive: char, rel: &str) -> String {
+    let rel = rel.trim_matches('/');
+    if rel.is_empty() {
+        format!("{drive}:/")
+    } else {
+        normalize_index_path(&format!("{drive}:/{rel}")).into_owned()
+    }
+}
+
+/// 路径自身或任一上层祖先是否命中前缀集合（用于批量移除）
+fn path_has_ancestor_in(path: &str, set: &std::collections::HashSet<&str>) -> bool {
+    if set.contains(path) {
+        return true;
+    }
+    let mut end = path.len();
+    while let Some(pos) = path[..end].rfind('/') {
+        if set.contains(&path[..pos]) {
+            return true;
+        }
+        end = pos;
+    }
+    false
+}
+
+/// 拼接父目录与子项名字（索引统一用正斜杠）
+fn join_child(parent: &str, name: &str) -> String {
+    let parent = parent.trim_end_matches('/');
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+/// 首次追赶用的检查点：从 Journal 仍可读的最早位置开始；
+/// 积压过大（超过 `MAX_CATCHUP_RECORDS`）则返回 skipped=true，由调用方提示重建。
+fn catchup_checkpoint(drive: char) -> Option<(crate::fs::UsnCheckpoint, bool)> {
+    let mut fresh = crate::fs::get_checkpoint(drive)?;
+    let journal = crate::fs::UsnJournal::open(drive).ok()?;
+    let (lowest_valid_usn, next_usn) = journal.window().ok()?;
+    if next_usn - lowest_valid_usn > MAX_CATCHUP_RECORDS {
+        return Some((fresh, true));
+    }
+    fresh.next_usn = lowest_valid_usn;
+    Some((fresh, false))
+}
+
+impl GlobalIndex {
+    /// 本进程内是否正在构建索引
+    pub fn is_building(&self) -> bool {
+        self.building.load(Ordering::SeqCst)
+    }
+
+    /// 获取构建权（进程内原子 + 跨进程锁文件）。失败时不要继续构建。
+    pub fn try_begin_build(&self) -> Result<IndexBuildGuard<'_>, String> {
+        if self
+            .building
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(String::from("索引正在构建中，请等当前任务完成"));
+        }
+        match acquire_build_lock_file() {
+            Ok(lock_path) => Ok(IndexBuildGuard {
+                index: self,
+                lock_path,
+            }),
+            Err(e) => {
+                self.building.store(false, Ordering::SeqCst);
+                Err(e)
+            }
+        }
+    }
+
+    /// 构建开始前播种检查点：记住"构建开始时刻"的 Journal 位置，
+    /// 这样构建期间发生的变更也会被下一次增量同步捞回来，而不是永久漏掉。
+    pub fn seed_usn_checkpoints(&self, drives: &[char]) {
+        let mut seeded: Vec<String> = Vec::new();
+        {
+            let mut meta = self.meta.write();
+            for &drive in drives {
+                let key = drive.to_string();
+                if let Some(checkpoint) = crate::fs::get_checkpoint(drive) {
+                    meta.usn.checkpoints.insert(key.clone(), checkpoint);
+                    meta.usn.stale_drives.retain(|d| d != &key);
+                    seeded.push(key);
+                }
+            }
+        }
+        if !seeded.is_empty() {
+            crate::diag::log_line(&format!("[USN] 已播种检查点 {:?}", seeded));
+            self.persist_meta();
+        }
+    }
+
+    /// 同步状态快照（界面与诊断用）
+    pub fn usn_state(&self) -> UsnSyncState {
+        self.meta.read().usn.clone()
+    }
+
+    /// 应用 USN 增量：把"索引构建之后新建/改名/删除的文件"补进索引。
+    ///
+    /// `budget` 是本次最多处理多少条变更，`time_budget` 是总时间上限；
+    /// 任一到达就返回（剩余积压留给下一次），因此可以安全地周期性调用。
+    pub fn sync_usn(&self, budget: usize, time_budget: std::time::Duration) -> UsnSyncReport {
+        let started = std::time::Instant::now();
+        let deadline = started + time_budget;
+        let mut report = UsnSyncReport::default();
+
+        let (mut checkpoints, full_build, all_drives) = {
+            let meta = self.meta.read();
+            (
+                meta.usn.checkpoints.clone(),
+                meta.full_build,
+                meta.all_drives.clone(),
+            )
+        };
+
+        // 候选盘：已有检查点的盘；全盘索引在缺检查点时从 Journal 最早可读处追赶
+        let mut drives: Vec<char> = if checkpoints.is_empty() {
+            if full_build {
+                all_drives.iter().filter_map(|d| d.chars().next()).collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            checkpoints.keys().filter_map(|k| k.chars().next()).collect()
+        };
+        drives.sort_unstable();
+        drives.dedup();
+        if drives.is_empty() {
+            report.elapsed_ms = started.elapsed().as_millis() as u64;
+            return report;
+        }
+
+        let mut sink = DeltaSink::default();
+        let mut parent_cache: HashMap<u64, Option<String>> = HashMap::new();
+
+        for drive in drives {
+            if report.applied >= budget || std::time::Instant::now() >= deadline {
+                report.backlog = true;
+                break;
+            }
+            let key = drive.to_string();
+            let mut checkpoint = match checkpoints.get(&key).cloned() {
+                Some(cp) => cp,
+                None => match catchup_checkpoint(drive) {
+                    Some((cp, skipped)) => {
+                        if skipped {
+                            crate::diag::log_line(&format!(
+                                "[USN] {drive}: 历史积压超过 {MAX_CATCHUP_RECORDS} 条，跳过追赶"
+                            ));
+                            report.stale.push(drive);
+                        }
+                        cp
+                    }
+                    None => continue,
+                },
+            };
+
+            let mut scanner = match crate::fs::MftScanner::open(drive) {
+                Ok(s) => s,
+                Err(e) => {
+                    crate::diag::log_line(&format!("[USN] 打开 {drive} 盘 MFT 失败: {e}"));
+                    continue;
+                }
+            };
+            scanner.set_cancel_id(crate::cancel::begin());
+
+            match self.apply_drive_delta(
+                drive,
+                &mut checkpoint,
+                &mut scanner,
+                budget,
+                deadline,
+                &mut report,
+                &mut sink,
+                &mut parent_cache,
+            ) {
+                Ok(()) => {
+                    checkpoints.insert(key, checkpoint);
+                }
+                Err(()) => {
+                    // 增量窗口失效：重新播种到当前位置，并标记该盘需要重建索引
+                    report.stale.push(drive);
+                    match crate::fs::get_checkpoint(drive) {
+                        Some(fresh) => {
+                            checkpoints.insert(key, fresh);
+                        }
+                        None => {
+                            checkpoints.remove(&key);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 目录删除/改名的前缀移除在这里一次性完成（内存），随后统一落库
+        self.remove_prefixes_batch(&sink.dir_prefixes.clone(), &mut sink, &mut report);
+        sink.flush();
+
+        if report.applied > 0 || !report.stale.is_empty() || report.backlog {
+            let mut meta = self.meta.write();
+            meta.usn.checkpoints = checkpoints;
+            for drive in &report.stale {
+                let key = drive.to_string();
+                meta.usn.stale_drives.retain(|d| d != &key);
+                meta.usn.stale_drives.push(key);
+            }
+            meta.usn.last_sync_at = chrono::Utc::now().timestamp();
+            meta.usn.applied_total += report.applied as u64;
+            drop(meta);
+            self.persist_meta();
+            self.update_ready_state();
+        }
+
+        report.elapsed_ms = started.elapsed().as_millis() as u64;
+        report
+    }
+}
+impl GlobalIndex {
+    /// 消费某个盘的增量，直到追平 / 预算耗尽 / 窗口失效。
+    /// Err(()) 表示增量窗口失效（调用方负责标记 stale 并重新播种检查点）。
+    #[allow(clippy::too_many_arguments)]
+    fn apply_drive_delta(
+        &self,
+        drive: char,
+        checkpoint: &mut crate::fs::UsnCheckpoint,
+        scanner: &mut crate::fs::MftScanner,
+        budget: usize,
+        deadline: std::time::Instant,
+        report: &mut UsnSyncReport,
+        sink: &mut DeltaSink,
+        parent_cache: &mut HashMap<u64, Option<String>>,
+    ) -> Result<(), ()> {
+        // 预算按"已消费的记录数"计算，而不是"相关变更数"：
+        // Journal 里大量记录与索引无关（临时文件、系统活动），
+        // 只统计相关变更会让一次同步读取几十批记录、卡住好几秒。
+        let mut consumed = 0usize;
+        loop {
+            if consumed >= budget
+                || report.applied >= budget
+                || std::time::Instant::now() >= deadline
+            {
+                report.backlog = true;
+                return Ok(());
+            }
+            let delta =
+                match crate::fs::read_incremental_changes(drive, checkpoint, checkpoint.next_usn, CHUNK_RECORDS) {
+                    Ok(delta) => delta,
+                    Err(crate::fs::UsnReadError::WindowExpired)
+                    | Err(crate::fs::UsnReadError::JournalReset)
+                    | Err(crate::fs::UsnReadError::VolumeChanged) => return Err(()),
+                    Err(crate::fs::UsnReadError::Io(e)) => {
+                        if e.kind() == std::io::ErrorKind::InvalidData {
+                            return Err(());
+                        }
+                        crate::diag::log_line(&format!("[USN] {drive}: 读取增量失败: {e}"));
+                        return Ok(());
+                    }
+                };
+
+            // 注意：`read_changes_since` 的批量参数只决定缓冲区大小，内核一次可能
+            // 返回上千条记录。这里按条数精确截断，并把续读位置设为"第一条未处理记录"
+            // 的 USN（USN 单调递增，下次从该位置读会重新拿到这条记录），
+            // 这样单次同步的耗时才真正可控。
+            let mut changes = delta.changes;
+            let next_usn = if changes.len() > CHUNK_RECORDS {
+                let resume = changes[CHUNK_RECORDS].usn;
+                changes.truncate(CHUNK_RECORDS);
+                resume
+            } else {
+                delta.next_usn
+            };
+            consumed += changes.len();
+            let mut pending_dir_renames: HashMap<u64, String> = HashMap::new();
+            for change in &changes {
+                self.apply_one_change(
+                    drive,
+                    scanner,
+                    change,
+                    report,
+                    sink,
+                    parent_cache,
+                    &mut pending_dir_renames,
+                );
+            }
+            // 没等到 NEW_NAME 的目录改名：旧前缀下的条目已指向不存在的路径，整体移除
+            for (_, old_path) in std::mem::take(&mut pending_dir_renames) {
+                self.record_removal(&old_path, true, sink, report);
+            }
+
+            checkpoint.next_usn = next_usn;
+            if changes.is_empty() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// FRN → 当前绝对路径（带缓存：同一父目录会被反复询问）
+    fn path_of(
+        &self,
+        drive: char,
+        scanner: &mut crate::fs::MftScanner,
+        frn: u64,
+        cache: &mut HashMap<u64, Option<String>>,
+    ) -> Option<String> {
+        if let Some(hit) = cache.get(&frn) {
+            return hit.clone();
+        }
+        let resolved = match scanner.resolve_frn_path(frn) {
+            Ok(Some(rel)) => Some(full_index_path(drive, &rel)),
+            _ => None,
+        };
+        cache.insert(frn, resolved.clone());
+        resolved
+    }
+
+    /// 从索引中移除条目；目录按前缀整体移除（子树里的路径已全部失效）
+    fn record_removal(
+        &self,
+        path: &str,
+        is_dir: bool,
+        sink: &mut DeltaSink,
+        report: &mut UsnSyncReport,
+    ) {
+        let path = path.trim_end_matches('/');
+        if path.is_empty() {
+            return;
+        }
+        if is_dir {
+            // 目录（含子树）统一登记，最后用一次全量扫描批量移除：
+            // 单条 remove_prefix_internal 是 O(全量条目)，几十个目录删除就能让一次
+            // 同步卡十几秒（实测 200 条记录 22s），这里换成 O(n×深度) 的单次扫描。
+            if !sink.dir_prefixes.iter().any(|p| p == path) {
+                sink.dir_prefixes.push(path.to_string());
+            }
+        } else {
+            let before = self.entries_len();
+            self.remove_by_path(path);
+            if self.entries_len() < before {
+                report.removals += 1;
+                sink.removals.push(path.to_string());
+            }
+        }
+    }
+
+    /// 批量按前缀移除（目录删除）：一次扫描收集命中路径，再逐条 O(1) 移除。
+    fn remove_prefixes_batch(
+        &self,
+        prefixes: &[String],
+        sink: &mut DeltaSink,
+        report: &mut UsnSyncReport,
+    ) {
+        if prefixes.is_empty() {
+            return;
+        }
+        let wanted: std::collections::HashSet<&str> =
+            prefixes.iter().map(|p| p.as_str()).collect();
+        let hits: Vec<String> = {
+            let entries = self.entries.read();
+            entries
+                .iter()
+                .filter(|entry| path_has_ancestor_in(&entry.path, &wanted))
+                .map(|entry| entry.path.clone())
+                .collect()
+        };
+        report.removals += hits.len();
+        for path in &hits {
+            self.remove_path_internal(path);
+        }
+        sink.removals.extend(hits);
+    }
+
+    /// 目录改名：把旧前缀下的条目整体改挂到新前缀。
+    /// 条目过多时放弃（返回 false），交由重建索引处理。
+    fn repath_subtree(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        sink: &mut DeltaSink,
+        report: &mut UsnSyncReport,
+    ) -> bool {
+        let old_prefix = old_path.trim_end_matches('/');
+        let new_prefix = new_path.trim_end_matches('/');
+        if old_prefix.is_empty() || old_prefix == new_prefix {
+            return true;
+        }
+        // 目录本身不在索引里就没有子树要重挂（否则下面的全量扫描白跑一遍）
+        {
+            let entries = self.entries.read();
+            let by_path = self.by_path.read();
+            let known = by_path
+                .get(&path_hash(old_prefix))
+                .copied()
+                .is_some_and(|idx| {
+                    entries
+                        .get(idx as usize)
+                        .is_some_and(|entry| entry.path == old_prefix)
+                });
+            if !known {
+                return true;
+            }
+        }
+        let moved: Vec<IndexEntry> = {
+            let entries = self.entries.read();
+            entries
+                .iter()
+                .filter(|e| is_same_or_child(old_prefix, &e.path))
+                .take(MAX_REPATH_ENTRIES + 1)
+                .cloned()
+                .collect()
+        };
+        if moved.len() > MAX_REPATH_ENTRIES {
+            crate::diag::log_line(&format!(
+                "[USN] 目录改名涉及条目超过 {MAX_REPATH_ENTRIES} 条，跳过重挂: {old_prefix}"
+            ));
+            return false;
+        }
+
+        self.remove_prefix_internal(old_prefix);
+        for entry in moved {
+            let old_entry_path = entry.path.clone();
+            let Some(suffix) = entry.path.get(old_prefix.len()..) else {
+                continue;
+            };
+            let path = format!("{new_prefix}{suffix}");
+            let name = path.rsplit('/').next().unwrap_or("").to_string();
+            let rewritten = IndexEntry {
+                path,
+                name_lower: name.to_lowercase(),
+                size: entry.size,
+                is_dir: entry.is_dir,
+                mtime: entry.mtime,
+            };
+            self.upsert_internal(rewritten.clone());
+            sink.upserts.push(rewritten);
+            sink.removals.push(old_entry_path);
+            report.repathed += 1;
+        }
+        true
+    }
+}
+impl GlobalIndex {
+    /// 应用单条 USN 变更
+    #[allow(clippy::too_many_arguments)]
+    fn apply_one_change(
+        &self,
+        drive: char,
+        scanner: &mut crate::fs::MftScanner,
+        change: &crate::fs::UsnChangeRecord,
+        report: &mut UsnSyncReport,
+        sink: &mut DeltaSink,
+        parent_cache: &mut HashMap<u64, Option<String>>,
+        pending_dir_renames: &mut HashMap<u64, String>,
+    ) {
+        use crate::fs::{
+            USN_REASON_BASIC_INFO_CHANGE, USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE,
+            USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
+            USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
+        };
+
+        let reason = change.reason;
+        let interesting = reason
+            & (USN_REASON_FILE_DELETE
+                | USN_REASON_RENAME_OLD_NAME
+                | USN_REASON_RENAME_NEW_NAME
+                | USN_REASON_FILE_CREATE
+                | USN_REASON_DATA_OVERWRITE
+                | USN_REASON_DATA_EXTEND
+                | USN_REASON_DATA_TRUNCATION
+                | USN_REASON_BASIC_INFO_CHANGE);
+        if interesting == 0 {
+            return;
+        }
+        let is_dir = change.attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        report.applied += 1;
+
+        // 删除与"改名旧名"：按 父目录当前路径 + 记录里的名字 还原旧路径
+        if reason & (USN_REASON_FILE_DELETE | USN_REASON_RENAME_OLD_NAME) != 0 {
+            if let Some(old_path) = self
+                .path_of(drive, scanner, change.parent_ref, parent_cache)
+                .map(|parent| join_child(&parent, &change.name))
+            {
+                if is_dir && reason & USN_REASON_RENAME_OLD_NAME != 0 {
+                    // 目录改名：等 NEW_NAME 记录做整体重挂，先不动索引
+                    pending_dir_renames.insert(change.file_ref, old_path);
+                    return;
+                }
+                self.record_removal(&old_path, is_dir, sink, report);
+            }
+            if reason & USN_REASON_FILE_DELETE != 0 {
+                return;
+            }
+        }
+
+        // 新建 / 改名后 / 数据与基本信息变更：按 FRN 解析"当前"路径后写回
+        let Some(current) = self.path_of(drive, scanner, change.file_ref, parent_cache) else {
+            return;
+        };
+        let metadata = match std::fs::metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                // 路径已不存在（删除记录缺失或竞态）：按删除处理
+                self.record_removal(&current, is_dir, sink, report);
+                return;
+            }
+        };
+        let is_dir_now = metadata.is_dir();
+        if is_dir_now && reason & USN_REASON_RENAME_NEW_NAME != 0 {
+            if let Some(old_path) = pending_dir_renames.remove(&change.file_ref) {
+                if self.repath_subtree(&old_path, &current, sink, report) {
+                    return;
+                }
+            }
+        }
+        let name = current.rsplit('/').next().unwrap_or("").to_string();
+        let size = if is_dir_now { 0 } else { metadata.len() as i64 };
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(change.timestamp / 10_000_000);
+        let entry = IndexEntry {
+            path: current,
+            name_lower: name.to_lowercase(),
+            size,
+            is_dir: is_dir_now,
+            mtime,
+        };
+        self.upsert_internal(entry.clone());
+        sink.upserts.push(entry);
+        report.upserts += 1;
+    }
+}
 static GLOBAL_INDEX: OnceLock<GlobalIndex> = OnceLock::new();
 
 pub fn instance() -> &'static GlobalIndex {
@@ -1601,6 +2356,83 @@ mod tests {
         // 正常路径不该被误改
         assert_eq!(repair_corrupt_path("C:/Windows/System32/drivers/etc/hosts"), None);
         assert_eq!(repair_corrupt_path("C:/Users/me/Documents/a:b.txt"), None);
+    }
+
+    /// 构建锁：进程内重复获取必须失败；跨进程锁文件要区分"真的在构建"与"残留"。
+    #[test]
+    fn build_lock_guards_against_concurrent_builds() {
+        let idx = empty_instance_for_test();
+        let lock = std::env::temp_dir().join("flashdir-build-lock-test.lock");
+        let _ = std::fs::remove_file(&lock);
+        std::env::set_var("FLASHDIR_BUILD_LOCK", &lock);
+
+        // 1) 进程内互斥：构建未完成时再次获取必须失败
+        let guard = idx.try_begin_build().expect("首次获取构建权应成功");
+        assert!(idx.is_building());
+        assert!(idx.try_begin_build().is_err(), "构建未完成时不应再次获取");
+        drop(guard);
+        assert!(!idx.is_building(), "释放后标志应复位");
+        assert!(!lock.exists(), "释放时应删除锁文件");
+
+        // 2) 跨进程：锁文件里的 pid 仍存活 → 拒绝
+        std::fs::write(&lock, format!("{}", std::process::id())).unwrap();
+        let err = idx.try_begin_build().expect_err("别的进程持锁时必须拒绝");
+        assert!(err.contains("正在构建索引"), "实际: {err}");
+        assert!(!idx.is_building(), "被拒绝时不应留下本进程的构建标志");
+
+        // 3) 跨进程：pid 已不存在（残留锁）→ 接管
+        std::fs::write(&lock, "4294967294").unwrap();
+        let guard = idx.try_begin_build().expect("残留锁应被接管");
+        drop(guard);
+        assert!(!lock.exists(), "接管后释放应删除锁文件");
+        std::env::remove_var("FLASHDIR_BUILD_LOCK");
+    }
+    #[test]
+    fn usn_path_helpers_and_report() {
+        assert_eq!(full_index_path('C', "Users/me/x.txt"), "C:/Users/me/x.txt");
+        assert_eq!(full_index_path('D', ""), "D:/");
+        assert_eq!(join_child("C:/a", "b"), "C:/a/b");
+        assert_eq!(join_child("C:/", "b"), "C:/b");
+        assert_eq!(join_child("", "b"), "b");
+
+        let report = UsnSyncReport {
+            applied: 3,
+            upserts: 2,
+            removals: 1,
+            elapsed_ms: 12,
+            ..Default::default()
+        };
+        let text = report.summary();
+        assert!(text.contains("应用 3 条"), "实际: {text}");
+        assert!(text.contains("新增/更新 2"), "实际: {text}");
+        assert!(UsnSyncReport::default().summary().contains("已是最新"));
+    }
+
+    /// 检查点随元数据持久化：重启后能从上次位置继续增量同步
+    #[test]
+    fn usn_state_round_trips_in_meta() {
+        let mut meta = IndexMeta::default();
+        meta.usn.checkpoints.insert(
+            String::from("C"),
+            crate::fs::UsnCheckpoint {
+                volume_serial: 42,
+                journal_id: 7,
+                next_usn: 123_456,
+                created_at: 1_700_000_000,
+            },
+        );
+        meta.usn.stale_drives.push(String::from("D"));
+        meta.usn.last_sync_at = 1_700_000_111;
+
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: IndexMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.usn.checkpoints.get("C").map(|c| c.next_usn),
+            Some(123_456)
+        );
+        assert_eq!(back.usn.stale_drives, vec![String::from("D")]);
+        assert_eq!(back.usn.last_sync_at, 1_700_000_111);
+        assert_eq!(back.usn.applied_total, 0);
     }
 
     /// 诊断：过滤表达式解析与匹配（本地过滤 / 在此目录内过滤共用）

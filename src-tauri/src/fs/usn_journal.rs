@@ -324,6 +324,13 @@ impl UsnJournal {
     }
 
     /// 创建检查点（基于当前 USN Journal 状态）
+    /// Journal 的可读窗口与当前位置：`(lowest_valid_usn, next_usn)`。
+    /// 索引增量同步用它判断"积压多少条变更、还值不值得追赶"。
+    pub fn window(&self) -> io::Result<(i64, i64)> {
+        let data = self.query_journal()?;
+        Ok((data.lowest_valid_usn, data.next_usn))
+    }
+
     pub fn create_checkpoint(&self, volume_serial: u64) -> io::Result<UsnCheckpoint> {
         let journal = self.query_journal()?;
 
@@ -414,6 +421,7 @@ pub fn read_incremental_changes(
     drive_letter: char,
     checkpoint: &UsnCheckpoint,
     start_usn: i64,
+    max_records: usize,
 ) -> Result<UsnDelta, UsnReadError> {
     let journal = UsnJournal::open(drive_letter).map_err(UsnReadError::Io)?;
 
@@ -439,11 +447,14 @@ pub fn read_incremental_changes(
     let mut changes: Vec<UsnChangeRecord> = Vec::new();
     let mut start = start_usn;
     let mut next_usn = start_usn;
-    const BATCH_RECORDS: usize = 1024;
+    // 批量大小与总量上限都跟随调用方：全局索引增量同步用小批量（每条变更要随机读
+    // MFT 解析 FRN→路径，跨目录时约 5-8ms/条），目录缓存沿用 MAX_USN_CHANGES。
+    let batch_records = max_records.clamp(64, 1024);
+    let total_cap = max_records.max(1);
 
     loop {
         let (mut records, resume) = journal
-            .read_changes_since(start, current.usn_journal_id, BATCH_RECORDS)
+            .read_changes_since(start, current.usn_journal_id, batch_records)
             .map_err(UsnReadError::Io)?;
 
         if resume <= start {
@@ -455,7 +466,7 @@ pub fn read_incremental_changes(
         start = resume;
         changes.append(&mut records);
 
-        if changes.len() > MAX_USN_CHANGES {
+        if changes.len() >= total_cap {
             break;
         }
         if start >= current.next_usn {

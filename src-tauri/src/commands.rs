@@ -726,6 +726,21 @@ pub fn delete_snapshot(id: i64) -> Result<(), String> {
 // ─── 全局文件搜索 ──────────────────────────────────────────
 
 /// 查询全局索引状态
+/// 立即执行一次 USN 增量同步（界面"立即同步"按钮 / 诊断用）。
+/// 返回一句可展示的结果摘要；预算内没追平的话下次继续。
+#[command]
+pub async fn global_search_sync_now() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let report = flashdir::global_search::instance()
+            .sync_usn(5_000, std::time::Duration::from_millis(4_000));
+        let summary = report.summary();
+        flashdir::diag::log_line(&format!("[USN] 手动同步：{summary}"));
+        summary
+    })
+    .await
+    .map_err(|e| format!("任务执行失败: {}", e))
+}
+
 #[command]
 pub fn global_search_status() -> flashdir::global_search::IndexState {
     flashdir::global_search::instance().state()
@@ -734,6 +749,15 @@ pub fn global_search_status() -> flashdir::global_search::IndexState {
 /// 构建全盘索引：逐盘调 scan_directory（与主界面相同的已验证路径，确保文件名正确）
 #[command]
 pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), String> {
+    let idx = flashdir::global_search::instance();
+    if idx.is_building() {
+        // 已有构建在跑：幂等返回，前端正在展示进度
+        return Ok(());
+    }
+    let _build_guard = idx.try_begin_build()?;
+    // 播种 USN 检查点：构建期间发生的变更会被后续增量同步补上
+    idx.seed_usn_checkpoints(&flashdir::global_search::list_ntfs_drives());
+
     {
         let idx = flashdir::global_search::instance();
         match idx.state() {
@@ -915,6 +939,10 @@ pub async fn global_search_add_scan_from_cache(path: String) -> Result<(), Strin
 /// 刷新索引（全量重建，走 scan_directory 保证文件名正确）
 #[command]
 pub async fn global_search_refresh(app: tauri::AppHandle) -> Result<(), String> {
+    let idx = flashdir::global_search::instance();
+    let _build_guard = idx.try_begin_build()?;
+    idx.seed_usn_checkpoints(&flashdir::global_search::list_ntfs_drives());
+
     let idx = flashdir::global_search::instance();
     idx.set_loading();
 

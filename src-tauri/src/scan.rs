@@ -1468,7 +1468,12 @@ fn try_usn_incremental_update(
         }
     };
 
-    let delta = match crate::fs::read_incremental_changes(drive, &checkpoint, verified_usn) {
+    let delta = match crate::fs::read_incremental_changes(
+        drive,
+        &checkpoint,
+        verified_usn,
+        crate::fs::MAX_USN_CHANGES,
+    ) {
         Ok(delta) => delta,
         Err(crate::fs::UsnReadError::JournalReset)
         | Err(crate::fs::UsnReadError::VolumeChanged)

@@ -274,6 +274,32 @@ HTTP 地址（可写进支持 url 的 Host）: {}
 
     let _ = flashdir::disk_cache::DiskCache::instance();
 
+// USN 增量同步线程：索引是"构建那一刻"的快照，靠这里把之后新建/改名/删除的
+// 文件补进来（否则新建文件搜不到，只能手动重建索引）。
+// 间隔可用 FLASHDIR_USN_SYNC_SECS 覆盖（默认 300s，最小 5s），便于自测与调优。
+{
+    let interval = std::env::var("FLASHDIR_USN_SYNC_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(300)
+        .max(5);
+    std::thread::spawn(move || {
+        // 等索引从磁盘载入完成（载入 75 万条约 2s）
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        loop {
+            let idx = flashdir::global_search::instance();
+            let ready = matches!(idx.state(), flashdir::global_search::IndexState::Ready(..));
+            if ready && !idx.is_building() {
+                let report = idx.sync_usn(2000, std::time::Duration::from_millis(2500));
+                if report.applied > 0 || !report.stale.is_empty() {
+                    flashdir::diag::log_line(&format!("[USN] {}", report.summary()));
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(interval));
+        }
+    });
+}
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -433,6 +459,7 @@ HTTP 地址（可写进支持 url 的 Host）: {}
             commands::global_search_ensure_index,
             commands::global_search,
             commands::global_search_refresh,
+            commands::global_search_sync_now,
             commands::global_search_add_scan_from_cache,
         ])
         .run(tauri::generate_context!())

@@ -480,12 +480,41 @@ async function restartAsAdmin() {
   }
 }
 async function indexAction() {
+  if (gs.loading.value) {
+    toasts.warn('索引正在构建中，请等当前任务完成')
+    return
+  }
   try {
     if (gs.ready.value) await gs.refreshIndex()
     else await gs.ensureIndex()
     toasts.ok('已触发索引构建/刷新')
   } catch (e) {
     toasts.err('索引操作失败：' + formatError(e))
+  }
+}
+
+/** 右下角进度卡：构建/载入中显示进度；就绪后若某盘增量窗口失效则提示重建 */
+const indexBusy = computed(() => gs.loading.value)
+const indexStaleDrives = computed(() => gs.usnStaleDrives.value || [])
+const indexProgressText = computed(() => {
+  if (!gs.loading.value) return ''
+  const progress = gs.state.progress
+  if (progress?.phase === 'loading-persisted') return '正在载入索引缓存…'
+  const drive = progress?.drive || gs.state.index?.data?.drive || ''
+  const scanned = progress?.scanned || gs.state.index?.data?.scanned || 0
+  return '正在扫描 ' + drive + ' · ' + scanned.toLocaleString() + ' 项'
+})
+
+async function syncIndexNow() {
+  if (gs.loading.value) {
+    toasts.warn('索引正在构建中，请等当前任务完成')
+    return
+  }
+  try {
+    const summary = await gs.syncNow()
+    if (summary) toasts.ok(summary)
+  } catch (e) {
+    toasts.err('增量同步失败：' + formatError(e))
   }
 }
 
@@ -498,6 +527,7 @@ const commands = computed(() => [
   { id: 'up', label: '上一级目录', icon: 'up', keywords: 'up parent', shortcut: 'Backspace' },
   { id: 'index', label: gs.ready.value ? '刷新全局索引' : '建立全局索引', icon: 'search', keywords: 'index global' },
   { id: 'search-global', label: '用当前关键字做全局搜索', icon: 'search', keywords: 'search global find', shortcut: 'Enter' },
+    { id: 'index-sync', label: '增量同步索引（USN）', icon: 'refresh', keywords: 'usn sync 同步 索引', shortcut: '' },
   { id: 'snapshot', label: '保存当前目录快照', icon: 'clock', keywords: 'snapshot save' },
   { id: 'dupes', label: '重复文件检测', icon: 'dupes', keywords: 'duplicate same' },
   { id: 'dev', label: '开发缓存分析', icon: 'dev', keywords: 'node_modules target cache' },
@@ -519,6 +549,7 @@ function runCommand(id) {
     up: () => goUp(),
     index: () => indexAction(),
     'search-global': () => runGlobalSearch(filter.value),
+        'index-sync': () => syncIndexNow(),
     snapshot: () => saveSnapshot(currentPath.value),
     dupes: () => { dockTab.value = 'dupes'; dockVisible.value = true },
     dev: () => { dockTab.value = 'dev'; dockVisible.value = true },
@@ -929,6 +960,30 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
       </div>
     </UiModal>
 
+        <!-- 右下角索引进度：构建/载入中显示进度，增量窗口失效时提示重建 -->
+        <div v-if="indexBusy || indexStaleDrives.length" class="idx-card">
+          <template v-if="indexBusy">
+            <div class="idx-row">
+              <span class="dot warn" />
+              <b>索引构建中</b>
+              <span class="idx-dim">{{ indexProgressText }}</span>
+            </div>
+            <div class="idx-track"><i /></div>
+            <div class="idx-dim">构建期间搜索仍可用（结果为已索引部分）</div>
+        <div class="idx-dim">重建约需数秒；完成后索引会持续增量跟随</div>
+          </template>
+          <template v-else>
+            <div class="idx-row">
+              <span class="dot warn" />
+              <b>索引可能不完整</b>
+              <span class="idx-dim">{{ indexStaleDrives.join("、") }} 盘有未纳入索引的历史变更</span>
+            </div>
+            <div class="idx-actions">
+              <button class="btn" @click="indexAction">重建索引</button>
+              <button class="btn ghost" @click="syncIndexNow">立即同步</button>
+            </div>
+          </template>
+        </div>
     <Toasts />
   </div>
 </template>

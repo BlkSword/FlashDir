@@ -4,7 +4,7 @@
 // 各自 listen('global-search-progress')，两份状态可能不一致。
 // 现在事件监听与状态在此模块内单例维护，所有消费者读取同一份。
 
-import { reactive, computed } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { invoke } from '@tauri-apps/api/core'
 
@@ -116,6 +116,24 @@ export function useGlobalSearch() {
     return ''
   })
 
+    // USN 增量同步状态（就绪后可见）：最近同步时间与"增量窗口已失效"的盘
+    const usnLastSync = computed(() => (ready.value ? state.index.data?.usnLastSync || 0 : 0))
+    const usnStaleDrives = computed(() => (ready.value ? state.index.data?.usnStaleDrives || [] : []))
+    const syncing = ref(false)
+
+    /** 手动触发一次 USN 增量同步；后端有预算，未追平会留到下次继续 */
+    const syncNow = async () => {
+      if (syncing.value) return null
+      syncing.value = true
+      try {
+        const summary = await invoke('global_search_sync_now')
+        await fetchStatus()
+        return summary
+      } finally {
+        syncing.value = false
+      }
+    }
+
   const search = async (query, limit) => {
     return await invoke('global_search', { query, limit })
   }
@@ -148,6 +166,10 @@ export function useGlobalSearch() {
     fetchStatus,
     ensureIndex,
     refreshIndex,
+        syncNow,
+        syncing,
+        usnLastSync,
+        usnStaleDrives,
     restartAsAdmin,
   }
 }
