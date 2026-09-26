@@ -169,6 +169,20 @@ pub struct MftScanResult {
 }
 
 
+/// 流式 MFT 扫描的结果统计（不含文件列表）。
+pub struct MftScanSummary {
+    /// 扫描的文件总数
+    pub file_count: usize,
+    /// 扫描的目录总数
+    pub dir_count: usize,
+    /// 读取的 MFT 数据总字节数
+    pub data_read: u64,
+    /// 读取 + 解析 MFT 记录耗时（秒）
+    pub read_secs: f64,
+    /// 构建完整路径耗时（秒）
+    pub path_secs: f64,
+}
+
 /// 单个文件的 MFT 信息
 #[derive(Debug, Clone)]
 pub struct MftFileInfo {
@@ -283,7 +297,17 @@ impl MftScanner {
     }
 
     /// 执行 MFT 扫描，返回所有文件的元数据
-    pub fn scan(&self) -> io::Result<MftScanResult> {
+    /// 流式扫描：每积累 `batch` 条就交给 `on_batch`，回调返回后立刻释放。
+    ///
+    /// 全盘索引构建用它替代 `scan()`：不再需要一次性持有全盘文件列表
+    /// （百万级条目约 170MB），峰值内存明显更友好；`scan()` 自身也复用这里，
+    /// 保证两条路径的解析逻辑完全一致。
+    pub fn scan_streaming<F>(&self, batch: usize, mut on_batch: F) -> io::Result<MftScanSummary>
+    where
+        F: FnMut(Vec<MftFileInfo>),
+    {
+        const ROOT_FRN: usize = 5;
+
         // 第一步：顺序读取 $MFT 并解析记录（rayon 并行解析）
         let read_start = std::time::Instant::now();
         let index = self.read_all_records()?;
@@ -302,16 +326,57 @@ impl MftScanner {
 
         // 第二步：用"父链 + 记忆化"构建完整路径（无 children_map / DFS clone）
         let path_start = std::time::Instant::now();
-        let files = Self::build_path_hierarchy(&index);
+        let mut paths = Self::resolve_paths(&index);
+        let batch = batch.max(1024);
+        let mut buffer: Vec<MftFileInfo> = Vec::with_capacity(batch.min(16384));
+        for (i, entry) in index.iter().enumerate() {
+            if i == ROOT_FRN {
+                continue;
+            }
+            let (Some(entry), Some(path)) = (entry.as_ref(), paths[i].take()) else {
+                continue;
+            };
+            buffer.push(MftFileInfo {
+                path,
+                name: entry.name.clone(),
+                size: entry.real_size,
+                is_dir: entry.is_dir,
+                mtime: entry.mtime,
+                atime: entry.atime,
+            });
+            if buffer.len() >= batch {
+                let ready = std::mem::replace(&mut buffer, Vec::with_capacity(batch.min(16384)));
+                on_batch(ready);
+            }
+        }
+        if !buffer.is_empty() {
+            on_batch(buffer);
+        }
+        // 未消费的路径引用在这里整体释放（正常路径下早已全被 take 走）
+        drop(paths);
         let path_secs = path_start.elapsed().as_secs_f64();
 
-        Ok(MftScanResult {
-            files,
+        Ok(MftScanSummary {
             file_count,
             dir_count,
             data_read: self.mft_valid_size,
             read_secs,
             path_secs,
+        })
+    }
+
+    /// 与 `scan_streaming` 等价的非流式入口：保留给需要完整列表的调用方
+    /// （如单目录的 MFT 直读扫描），内部复用同一套解析逻辑。
+    pub fn scan(&self) -> io::Result<MftScanResult> {
+        let mut files: Vec<MftFileInfo> = Vec::new();
+        let summary = self.scan_streaming(usize::MAX, |batch| files.extend(batch))?;
+        Ok(MftScanResult {
+            files,
+            file_count: summary.file_count,
+            dir_count: summary.dir_count,
+            data_read: summary.data_read,
+            read_secs: summary.read_secs,
+            path_secs: summary.path_secs,
         })
     }
 
@@ -516,7 +581,11 @@ impl MftScanner {
     /// 旧实现：children_map（FRN→Vec<FRN>）+ 从根 DFS，每个子节点都会 clone 父路径。
     /// 新实现：对每条记录沿父链向上走，遇到"已解析"就复用其路径；
     /// 环/断链的父链标记为不可达。产生的路径同样是 volume-relative。
-    fn build_path_hierarchy(index: &MftIndex) -> Vec<MftFileInfo> {
+    /// 构建"FRN 索引 → 完整路径"的映射（记忆化父链，环与断链标记为不可达）。
+    ///
+    /// 与 `build_path_hierarchy` 分开是为了支持流式消费：先算出全部路径，
+    /// 再按批次取走并释放，避免同时持有路径数组与文件列表两份数据。
+    fn resolve_paths(index: &MftIndex) -> Vec<Option<String>> {
         const ROOT_FRN: usize = 5;
         let n = index.len();
         // 0=未处理 1=处理中（可检测环） 2=已解析 3=不可达
@@ -592,26 +661,7 @@ impl MftScanner {
             }
         }
 
-        // 取出结果（路径 String 直接 move，不额外 clone）
-        let mut files = Vec::with_capacity(n);
-        for (i, entry) in index.iter().enumerate() {
-            if i == ROOT_FRN {
-                continue;
-            }
-            if let Some(entry) = entry {
-                if let Some(path) = paths[i].take() {
-                    files.push(MftFileInfo {
-                        path,
-                        name: entry.name.clone(),
-                        size: entry.real_size,
-                        is_dir: entry.is_dir,
-                        mtime: entry.mtime,
-                        atime: entry.atime,
-                    });
-                }
-            }
-        }
-        files
+        paths
     }
 }
 
@@ -1324,6 +1374,57 @@ pub fn try_mft_scan_with_cancel(root_path: &str, cancel_id: u64) -> Option<MftSc
 
 /// 从路径中提取盘符，如 "C:\Users" → 'C'
 /// 从路径中提取盘符，如 "C:\\Users" -> 'C'，支持 canonicalize 产生的 \\?\ 前缀。
+/// 流式 MFT 扫描：每批最多 `batch` 条交给 `on_batch`，回调返回后即可释放。
+///
+/// 全盘索引构建走这条路径，避免一次性持有全盘文件列表。
+pub fn try_mft_scan_streaming<F>(root_path: &str, batch: usize, on_batch: F) -> Option<MftScanSummary>
+where
+    F: FnMut(Vec<MftFileInfo>),
+{
+    let scan_id = crate::cancel::begin();
+    try_mft_scan_streaming_with_cancel(root_path, scan_id, batch, on_batch)
+}
+
+/// 与 `try_mft_scan_streaming` 相同，但复用调用方已有的取消代号。
+pub fn try_mft_scan_streaming_with_cancel<F>(
+    root_path: &str,
+    cancel_id: u64,
+    batch: usize,
+    mut on_batch: F,
+) -> Option<MftScanSummary>
+where
+    F: FnMut(Vec<MftFileInfo>),
+{
+    let drive_letter = extract_drive_letter(root_path)?;
+
+    let mut scanner = match MftScanner::open(drive_letter) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[MFT] 无法打开卷 {}: {}", drive_letter, e);
+            return None;
+        }
+    };
+    scanner.set_cancel_id(cancel_id);
+
+    match scanner.scan_streaming(batch, |files| on_batch(files)) {
+        Ok(summary) => {
+            eprintln!(
+                "[MFT] 流式扫描完成: {} 文件, {} 目录, {:.1}MB MFT 数据 (读取+解析 {:.2}s, 建路径 {:.2}s)",
+                summary.file_count,
+                summary.dir_count,
+                summary.data_read as f64 / 1024.0 / 1024.0,
+                summary.read_secs,
+                summary.path_secs
+            );
+            Some(summary)
+        }
+        Err(e) => {
+            eprintln!("[MFT] 扫描失败: {}", e);
+            None
+        }
+    }
+}
+
 pub(crate) fn extract_drive_letter(path: &str) -> Option<char> {
     let path = path.trim();
     let normalized = path.replace('\\', "/");
@@ -1351,4 +1452,32 @@ pub(crate) fn extract_drive_letter(path: &str) -> Option<char> {
         }
     }
     None
+}
+
+
+/// 基准（手动运行）：流式 MFT 扫描的耗时与条目数。
+/// 需要管理员权限读取 $MFT。
+#[cfg(test)]
+mod streaming_bench {
+    /// cargo test --release --lib -- --ignored --nocapture bench_mft_streaming
+    #[test]
+    #[ignore]
+    fn bench_mft_streaming() {
+        let root = "C:/";
+        let mut count = 0usize;
+        let start = std::time::Instant::now();
+        match crate::fs::try_mft_scan_streaming(root, 50_000, |batch| {
+            count += batch.len();
+        }) {
+            Some(summary) => eprintln!(
+                "[bench] 流式扫描 {} 条（回调累计 {}），读取+解析 {:.2}s，建路径 {:.2}s，总耗时 {:.2}s",
+                summary.file_count + summary.dir_count,
+                count,
+                summary.read_secs,
+                summary.path_secs,
+                start.elapsed().as_secs_f64()
+            ),
+            None => eprintln!("[bench] 需要管理员权限读取 $MFT"),
+        }
+    }
 }

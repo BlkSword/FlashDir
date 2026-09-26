@@ -3,8 +3,43 @@
     windows_subsystem = "windows"
 )]
 
+/// 分配器包装：release 使用 panic=abort，分配失败默认表现为"进程直接消失"。
+/// 这里在拿到空指针时先写一条不含分配的崩溃日志（见 diag），再交给标准库
+/// 终止流程，用户下次能直接从 `~/.flashdir/diag.log` 看到失败原因。
+struct LoggingAlloc;
+
+unsafe impl std::alloc::GlobalAlloc for LoggingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let ptr = mimalloc::MiMalloc.alloc(layout);
+        if ptr.is_null() {
+            flashdir::diag::alloc_failed(layout);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        mimalloc::MiMalloc.dealloc(ptr, layout)
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let ptr = mimalloc::MiMalloc.alloc_zeroed(layout);
+        if ptr.is_null() {
+            flashdir::diag::alloc_failed(layout);
+        }
+        ptr
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let out = mimalloc::MiMalloc.realloc(ptr, layout, new_size);
+        if out.is_null() {
+            flashdir::diag::alloc_failed(layout);
+        }
+        out
+    }
+}
+
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: LoggingAlloc = LoggingAlloc;
 
 use std::collections::VecDeque;
 use parking_lot::Mutex;
@@ -164,6 +199,18 @@ fn clamp_window_to_work_area(_win: &tauri::WebviewWindow) {}
 
 #[tokio::main]
 async fn main() {
+    // 崩溃 / 分配失败日志：必须在任何重活之前安装。
+    // release 是 panic=abort，没有它崩溃就是"窗口突然消失"，无法定位。
+    flashdir::diag::install_crash_handler();
+    // 崩溃日志自测：故意 panic，验证 diag.log 链路（进程按设计终止）。
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--selftest-crash") {
+            flashdir::diag::breadcrumb("崩溃日志自测：即将故意 panic");
+            panic!("崩溃日志自测：这是一条预期内的 panic，用于验证 diag.log 链路");
+        }
+    }
+
     // 维护模式：修复历史版本写入的畸形索引路径后退出（不创建窗口）。
     // 桌面端启动时也会自动做一次，这个入口给命令行/脚本用。
     {

@@ -6,6 +6,8 @@
 // - disk_cache: SQLite 磁盘缓存
 // - fs: 平台文件系统抽象（Windows 快速遍历器 / MFT 读取 / USN Journal）
 
+pub mod diag;
+
 pub mod cancel;
 pub mod scan;
 pub mod volumes;

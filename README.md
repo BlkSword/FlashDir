@@ -358,6 +358,7 @@ cd .. && cargo build --release --features custom-protocol
 | `flashdir.exe --selftest-bridge` | 桥接链路自测（需桌面端运行） |
 | `flashdir.exe --mcp-help` | 输出 MCP 用法与当前地址 |
 | `flashdir.exe --repair-index` | 修复历史版本写入的畸形索引路径后退出（桌面端启动时也会自动做一次） |
+| `flashdir.exe --selftest-crash` | 故意 panic，验证崩溃日志链路（进程按设计终止，随后查看 `~/.flashdir/diag.log`） |
 | `cli.exe <路径> [选项]` | 命令行扫描 |
 
 ---
@@ -500,6 +501,8 @@ flashdir.exe --selftest-bridge     # 桥接链路（需桌面端运行）
 | MCP 端点 | 仅监听回环地址并依赖本机令牌；适用于本机客户端，不提供跨机访问 |
 | 首次索引 | 全卷索引构建需管理员权限；未构建时检索工具会提示索引尚未就绪 |
 | 索引新鲜度 | 全局索引是构建时的快照：之后新建的文件需要重建索引，或先扫描其所在目录；`--repair-index` 只修复历史脏路径，不改变索引范围 |
+| 内存水位 | 全盘索引重建前会先释放内存扫描缓存并检查可用物理内存，低于 500MB 时直接提示取消（而不是让进程因分配失败消失）；索引载入低于 300MB 时跳过载入 |
+| 崩溃日志 | panic 与分配失败会写入 `~/.flashdir/diag.log`（含最近的重活记录与回溯）；可用环境变量 `FLASHDIR_DIAG_LOG` 重定向 |
 
 ---
 

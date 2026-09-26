@@ -539,6 +539,17 @@ fn scan_cache() -> &'static ScanCache {
     SCAN_CACHE.get_or_init(|| ScanCache::new(30, 200))
 }
 
+/// 释放内存扫描缓存，返回释放的目录数。
+///
+/// 全盘索引重建这类重活前调用：缓存（上限 200MB）与重活叠加很容易把低内存
+/// 机器打满，而缓存随时可以用磁盘缓存/重扫重建，不值得为它冒闪退的风险。
+pub fn clear_memory_cache() -> usize {
+    let mut cache = scan_cache().cache.lock();
+    let count = cache.len();
+    cache.clear();
+    count
+}
+
 /// 磁盘缓存后台写入任务
 enum CacheWriteJob {
     Write {

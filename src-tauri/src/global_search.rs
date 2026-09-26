@@ -173,9 +173,20 @@ impl GlobalIndex {
             return;
         }
         self.set_loading();
+        // 低内存机器上直接跳过载入：宁可索引显示"未就绪"，也不要启动即闪退
+        if crate::diag::available_physical_mb().is_some_and(|mb| mb < 300) {
+            *self.state.write() = IndexState::NotLoaded;
+            crate::diag::log_line("[GlobalIndex] 可用内存低于 300MB，跳过载入持久化索引");
+            return;
+        }
         match crate::disk_cache::DiskCache::instance().load_global_index() {
             Ok(mut entries) if !entries.is_empty() => {
                 eprintln!("[GlobalIndex] 从磁盘恢复 {} 条索引", entries.len());
+                crate::diag::breadcrumb(&format!(
+                    "索引载入完成：{} 条，可用内存 {}",
+                    entries.len(),
+                    crate::diag::memory_text()
+                ));
                 // 恢复元数据（是否全盘构建 / 盘符列表），否则会把部分索引误判为全盘
                 let mut meta = match crate::disk_cache::DiskCache::instance().load_index_meta() {
                     Some(json) => serde_json::from_str::<IndexMeta>(&json).unwrap_or_default(),
@@ -511,6 +522,11 @@ impl GlobalIndex {
         self.persist_meta();
         self.update_ready_state();
 
+        crate::diag::breadcrumb(&format!(
+            "索引持久化：开始写出 {} 条（可用内存 {}）",
+            self.entries_len(),
+            crate::diag::memory_text()
+        ));
         // 流式持久化：后台 SQLite 写入，前台分批发送，避免整表 clone
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {

@@ -746,6 +746,16 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
     let idx = flashdir::global_search::instance();
     idx.set_loading();
 
+    // 重活前的两个动作：先把内存扫描缓存降下来，再检查可用内存。
+    // 内存不足时返回错误交给界面提示，而不是让分配失败把进程干掉
+    // （release 是 panic=abort，分配失败时窗口会毫无征兆地消失）。
+    let freed = flashdir::scan::clear_memory_cache();
+    flashdir::diag::breadcrumb(&format!(
+        "索引构建：开始（已释放 {freed} 个目录的内存缓存，可用内存 {}）",
+        flashdir::diag::memory_text()
+    ));
+    flashdir::diag::ensure_memory_available(500, "构建全盘索引")?;
+
     let drives = flashdir::global_search::list_ntfs_drives();
     if drives.is_empty() {
         // 不能调 finish_building(&[])：那会把状态置为 Ready(0 项)，
@@ -771,10 +781,12 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
                         let count = cached.len();
                         flashdir::global_search::instance().append_scan(drive, &cached);
                         (drive, Some(count))
-                    } else if let Some(mft_result) = flashdir::fs::try_mft_scan(&root) {
-                        let count = mft_result.files.len();
-                        flashdir::global_search::instance().append_mft_files(drive, &mft_result.files);
-                        (drive, Some(count))
+} else if let Some(summary) = flashdir::fs::try_mft_scan_streaming(
+    &root,
+    50_000,
+    |batch| flashdir::global_search::instance().append_mft_files(drive, &batch),
+) {
+    (drive, Some(summary.file_count + summary.dir_count - 1 /* 去掉未被写入的根目录 */))
                     } else {
                         (drive, None)
                     }
@@ -906,6 +918,16 @@ pub async fn global_search_refresh(app: tauri::AppHandle) -> Result<(), String> 
     let idx = flashdir::global_search::instance();
     idx.set_loading();
 
+    // 重活前的两个动作：先把内存扫描缓存降下来，再检查可用内存。
+    // 内存不足时返回错误交给界面提示，而不是让分配失败把进程干掉
+    // （release 是 panic=abort，分配失败时窗口会毫无征兆地消失）。
+    let freed = flashdir::scan::clear_memory_cache();
+    flashdir::diag::breadcrumb(&format!(
+        "索引构建：开始（已释放 {freed} 个目录的内存缓存，可用内存 {}）",
+        flashdir::diag::memory_text()
+    ));
+    flashdir::diag::ensure_memory_available(500, "构建全盘索引")?;
+
     let drives = flashdir::global_search::list_ntfs_drives();
     let perf = flashdir::perf::PerformanceMonitor::instance();
     let mut ok_drives: Vec<char> = Vec::new();
@@ -920,10 +942,11 @@ pub async fn global_search_refresh(app: tauri::AppHandle) -> Result<(), String> 
             idx.append_scan(drive, &cached);
             count = cached.len();
             ok = true;
-        } else if let Some(mft_result) = flashdir::fs::try_mft_scan(&root) {
-            idx.append_mft_files(drive, &mft_result.files);
-            count = mft_result.files.len();
-            ok = true;
+} else if let Some(summary) = flashdir::fs::try_mft_scan_streaming(&root, 50_000, |batch| {
+    idx.append_mft_files(drive, &batch);
+}) {
+    count = summary.file_count + summary.dir_count - 1 /* 去掉未被写入的根目录 */;
+    ok = true;
         } else if let Ok(result) = flashdir::scan::scan_directory(
             &root, false, std::sync::Arc::clone(&perf), Some(app.clone()),
         )
