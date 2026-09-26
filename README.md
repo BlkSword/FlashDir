@@ -97,6 +97,7 @@ FlashDir 是一个面向 Windows 的磁盘空间分析与可观测性工具。�
 | 通配符 | `report*`、`*2024`、`*mid*` | 前缀、后缀、包含匹配 |
 | 关键字段 | `ext:zip`、`name:report`、`dir:node_modules` | 扩展名 / 名称 / 路径包含 |
 | 路径 | `C:\project\CTX-Audit\harness-private\EQM1-METHODOLOGY.md`、`harness-private/EQM1*` | 查询含 `/` 或 `\` 时按“整条路径包含”匹配，可直接粘贴完整路径 |
+| 名称 | `methodology`、`qm1-method` | 按文件名包含匹配（不区分大小写、任意位置）；带 `*` 才按前缀/后缀/通配符处理 |
 | 体积 | `size:>100MB`、`size:<1GB` | 体积比较，支持 B/KB/MB/GB/TB |
 | 时间 | `mtime:>7d`、`mtime:<1h` | 修改时间比较 |
 | 类型 | `type:file`、`type:dir` | 仅文件或仅目录 |

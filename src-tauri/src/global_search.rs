@@ -675,41 +675,34 @@ impl GlobalIndex {
             return (Vec::new(), 0);
         }
 
-        // 只把"正向文本条件"用于首字符分桶。
-        // 早期实现会取到 `NOT foo` 里的 foo，导致结果被限制在 f 桶内。
-        let text = filters.iter().find_map(|f| match &f.kind {
-            SearchFilterKind::Text(t) if !f.negate => Some(t.as_str()),
+        // 文本条件用于相关性排序：取第一个正向文本条件。
+        let q_lower = filters
+            .iter()
+            .find_map(|f| match &f.kind {
+                SearchFilterKind::Text(t) if !f.negate => Some(t.to_lowercase()),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        // 首字符分桶只在前缀语义下成立：`contains` 命中的名字，首字符可以是任意字符。
+        // 历史 bug：3 个字符以上的查询被限制在"查询首字符"桶内，于是搜
+        // `qm1-methodology` 永远找不到 `EQM1-METHODOLOGY.md`（E != Q）。
+        // 现在只有 `前缀*`（Prefix）能提供首字符约束，其余一律全量并行过滤
+        // （75 万条目实测 10-30ms，不值得为了这点开销去换漏结果）。
+        let bucket = filters.iter().find_map(|f| match &f.kind {
+            SearchFilterKind::Prefix(p) if !f.negate && !p.is_empty() => p.chars().next(),
             _ => None,
         });
-        let q_lower = text.map(|t| t.to_lowercase()).unwrap_or_default();
-        let has_text = !q_lower.is_empty();
 
         let entries = self.entries.read();
 
-        let matches = |e: &IndexEntry| -> bool {
-            (!has_text || e.name_lower.contains(&q_lower)) && apply_filters(e, &filters)
-        };
+        let matches = |e: &IndexEntry| -> bool { apply_filters(e, &filters) };
 
         // 每线程维护一个大小为 limit 的 top-K 堆，最后归并；
         // 只会 clone 最终 ≤limit 条，而不是克隆全部命中。
-        let topk = if !has_text || q_lower.chars().count() <= 2 {
-            // 无文本条件（*.pdf / size:>1GB 等）或短查询：全量并行过滤
-            let values: Vec<&IndexEntry> = entries.iter().collect();
-            values
-                .par_iter()
-                .fold(
-                    || TopK::new(limit),
-                    |mut acc, e| {
-                        if matches(e) {
-                            acc.push(e, relevance_score(e, &q_lower));
-                        }
-                        acc
-                    },
-                )
-                .reduce(|| TopK::new(limit), TopK::merge)
-        } else if let Some(first_char) = q_lower.chars().next() {
-            // 长文本：只扫首字符桶。
-            // 注意这里收集的是 &String 引用（几百 KB），不再 clone 每个候选路径。
+        let topk = if let Some(first_char) = bucket {
+            // 前缀条件提供首字符约束：候选只可能落在该桶内。
+            // 收集的是 &IndexEntry 引用（几百 KB），不 clone 候选路径。
             let name_index = self.name_index.read();
             let bucket_topk = match name_index.get(&first_char) {
                 Some(bucket) => bucket
@@ -731,7 +724,20 @@ impl GlobalIndex {
             drop(name_index);
             bucket_topk
         } else {
-            TopK::new(limit)
+            // 无首字符约束（包含匹配 / 扩展名 / 体积 / 时间等）：全量并行过滤
+            let values: Vec<&IndexEntry> = entries.iter().collect();
+            values
+                .par_iter()
+                .fold(
+                    || TopK::new(limit),
+                    |mut acc, e| {
+                        if matches(e) {
+                            acc.push(e, relevance_score(e, &q_lower));
+                        }
+                        acc
+                    },
+                )
+                .reduce(|| TopK::new(limit), TopK::merge)
         };
 
         let total = topk.total();
@@ -1500,6 +1506,38 @@ mod tests {
         assert!(!hit("other/EQM1-METHODOLOGY.md"), "路径片段不匹配");
         // 纯词只匹配文件名，避免 "windows" 命中 C:/Windows 下所有文件
         assert!(!hit("project"), "纯词不匹配路径");
+    }
+
+    /// 回归：包含匹配不能被"首字符分桶"截断。
+    ///
+    /// 用户输入 `qm1-methodology.md` 想找 `EQM1-METHODOLOGY.md`：名字首字符是 E，
+    /// 查询首字符是 Q，旧实现（>2 字符只扫查询首字符桶）必然 0 条。
+    /// 现在只有 `前缀*` 条件才会走分桶快路径。
+    #[test]
+    fn search_matches_substring_anywhere_in_name() {
+        let idx = empty_instance_for_test();
+        idx.upsert(IndexEntry {
+            path: "C:/project/CTX-Audit/harness-private/EQM1-METHODOLOGY.md".to_string(),
+            name_lower: "eqm1-methodology.md".to_string(),
+            size: 59097,
+            is_dir: false,
+            mtime: 0,
+        });
+        for q in [
+            "qm1-methodology",
+            "qm1-methodology.md",
+            "methodology",
+            "-methodology",
+            "1-method",
+            "*methodology*",
+            "eqm1-method",
+            "eqm1-method*",
+            "*.md",
+        ] {
+            assert_eq!(idx.search_with_filter(q, 10).len(), 1, "查询 {q:?} 应命中 1 条");
+        }
+        assert_eq!(idx.search_with_filter("qm2-methodology", 10).len(), 0, "无关查询不该命中");
+        assert_eq!(idx.search_with_filter("not-here*", 10).len(), 0, "前缀不匹配时不命中");
     }
 
     /// 回归：扫描根写成反斜杠形式时，不能再拼出 `C:\root/C:/root/xxx` 脏路径。
