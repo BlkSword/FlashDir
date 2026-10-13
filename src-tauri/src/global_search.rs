@@ -409,7 +409,20 @@ impl GlobalIndex {
 
         let removed_is_dir = entries[idx as usize].is_dir;
         let removed_char = bucket_char(&entries[idx as usize].name_lower);
-        by_path.remove(&hash);
+        if by_path.get(&hash).copied() == Some(idx) {
+            by_path.remove(&hash);
+        }
+
+        // 先从"被删条目"自己的桶里摘掉它那**一个**槽位，再处理 swap_remove 搬来的末位条目。
+        // 顺序与"只摘一个"都是必需的：被删条目与末位条目可能首字符同桶，若先改写 moved 的
+        // 槽位（last → idx）再按值 retain，两个槽位都会等于 idx，于是被一起摘掉 —— moved
+        // 条目仍留在 entries/by_path 中，却永久失去桶槽位，之后所有 `前缀*` 快路径查询都
+        // 搜不到它（直到该路径被重新 upsert 或重建索引）。USN 删除走的正是这条路径。
+        if let Some(bucket) = name_index.get_mut(&removed_char) {
+            if let Some(pos) = bucket.iter().position(|&i| i == idx) {
+                bucket.swap_remove(pos);
+            }
+        }
 
         let last = entries.len() - 1;
         if idx as usize != last {
@@ -430,9 +443,6 @@ impl GlobalIndex {
             entries.pop();
         }
 
-        if let Some(bucket) = name_index.get_mut(&removed_char) {
-            bucket.retain(|&i| i != idx);
-        }
         self.bump_count(removed_is_dir, -1);
     }
 
@@ -723,7 +733,9 @@ impl GlobalIndex {
 
         let entries = self.entries.read();
 
-        let matches = |e: &IndexEntry| -> bool { apply_filters(e, &filters) };
+        // mtime 条件的"现在"只取一次（见 apply_filters_at 的说明）
+        let now = chrono::Utc::now().timestamp();
+        let matches = |e: &IndexEntry| -> bool { apply_filters_at(e, &filters, now) };
 
         // 每线程维护一个大小为 limit 的 top-K 堆，最后归并；
         // 只会 clone 最终 ≤limit 条，而不是克隆全部命中。
@@ -751,9 +763,10 @@ impl GlobalIndex {
             drop(name_index);
             bucket_topk
         } else {
-            // 无首字符约束（包含匹配 / 扩展名 / 体积 / 时间等）：全量并行过滤
-            let values: Vec<&IndexEntry> = entries.iter().collect();
-            values
+            // 无首字符约束（包含匹配 / 扩展名 / 体积 / 时间等）：全量并行过滤。
+            // 直接在 entries 上并行遍历，不再先收集 Vec<&IndexEntry>：旧实现每次查询
+            // 都要分配一个与索引等长的指针数组（百万级约 8–9 MB / 次查询）。
+            entries
                 .par_iter()
                 .fold(
                     || TopK::new(limit),
@@ -984,8 +997,17 @@ pub fn parse_search_filter(input: &str) -> Vec<SearchFilter> {
                 "dir" => Some(SearchFilterKind::Dir(normalize_query_path(&value.to_lowercase()))),
                 "type" => {
                     let v = value.to_lowercase();
-                    let is_dir = v == "dir" || v == "folder";
-                    Some(SearchFilterKind::Type { is_dir })
+                    match v.as_str() {
+                        "dir" | "directory" | "folder" => {
+                            Some(SearchFilterKind::Type { is_dir: true })
+                        }
+                        "file" | "files" => Some(SearchFilterKind::Type { is_dir: false }),
+                        // 未识别的 type 值**不能**默认成"只看文件"：旧实现下 `type:xyz`
+                        // 会静默变成"仅文件"过滤，用户以为条件生效了却拿到被偷偷过滤的
+                        // 结果。这里直接忽略该条件（不加约束）。README 只承诺
+                        // type:file / type:dir，两个别名集已覆盖其全部写法。
+                        _ => continue,
+                    }
                 }
                 "size" => parse_size(value).map(|(op, bytes)| SearchFilterKind::Size { op, bytes }),
                 "mtime" => parse_mtime(value).map(|(op, seconds)| SearchFilterKind::Mtime { op, seconds }),
@@ -1020,16 +1042,30 @@ pub fn parse_search_filter(input: &str) -> Vec<SearchFilter> {
     }
 
     if !text_parts.is_empty() {
-        filters.insert(0, SearchFilter {
-            kind: SearchFilterKind::Text(text_parts.join(" ")),
-            negate: false,
-        });
+        // 每个裸词各自成为一个 Text 条件（AND 语义），而不是拼成一个含空格的短语。
+        // 旧实现把多个裸词 join(" ") 成**单个**短语，于是 `report 2024` 要求文件名里
+        // 出现字面量 "report 2024"，几乎必然 0 结果 —— 与 README「组合：多条件同时满足」
+        // 不符。需要短语匹配时加引号即可：`"report 2024"` 在分词阶段就是一个 token，
+        // 行为与旧实现完全一致。
+        // 仍然插到最前面，保持"最便宜、命中率最高的文本条件先求值"的顺序。
+        let text_filters: Vec<SearchFilter> = text_parts
+            .into_iter()
+            .map(|part| SearchFilter {
+                kind: SearchFilterKind::Text(part),
+                negate: false,
+            })
+            .collect();
+        filters.splice(0..0, text_filters);
     }
 
     filters
 }
 
-fn apply_filters(entry: &IndexEntry, filters: &[SearchFilter]) -> bool {
+/// 在给定"现在"下求值全部条件。
+///
+/// `now` 由调用方传入：搜索热路径对百万级索引逐条目判定，旧实现在 Mtime 条件里
+/// 每条目都调一次 `chrono::Utc::now()`，带 `mtime:` 的查询会做上百万次时钟读取。
+fn apply_filters_at(entry: &IndexEntry, filters: &[SearchFilter], now: i64) -> bool {
     for f in filters {
         let matched = match &f.kind {
             SearchFilterKind::Text(t) => entry.name_lower.contains(t),
@@ -1051,7 +1087,6 @@ fn apply_filters(entry: &IndexEntry, filters: &[SearchFilter]) -> bool {
             SearchFilterKind::Type { is_dir } => entry.is_dir == *is_dir,
             SearchFilterKind::Size { op, bytes } => compare_op(entry.size, *op, *bytes),
             SearchFilterKind::Mtime { op, seconds } => {
-                let now = chrono::Utc::now().timestamp();
                 let age = now - entry.mtime;
                 compare_op(age, *op, *seconds)
             }
@@ -1061,6 +1096,12 @@ fn apply_filters(entry: &IndexEntry, filters: &[SearchFilter]) -> bool {
         }
     }
     true
+}
+
+/// 便捷入口：自行取一次当前时间（测试与非热路径使用）。
+#[cfg(test)]
+fn apply_filters(entry: &IndexEntry, filters: &[SearchFilter]) -> bool {
+    apply_filters_at(entry, filters, chrono::Utc::now().timestamp())
 }
 
 fn compare_op(a: i64, op: FilterOp, b: i64) -> bool {
@@ -1086,6 +1127,30 @@ pub fn item_matches_filters(
     mtime: i64,
     filters: &[SearchFilter],
 ) -> bool {
+    item_matches_filters_at(
+        name,
+        path,
+        size,
+        is_dir,
+        mtime,
+        filters,
+        chrono::Utc::now().timestamp(),
+    )
+}
+
+/// 同 `item_matches_filters`，但"现在"由调用方传入。
+///
+/// 本地过滤是**逐条目**调用的，旧实现每次都在 Mtime 条件里读一次时钟；
+/// 上层循环取一次时间传入即可（见 `commands::scan_directory_paged`）。
+pub fn item_matches_filters_at(
+    name: &str,
+    path: &str,
+    size: i64,
+    is_dir: bool,
+    mtime: i64,
+    filters: &[SearchFilter],
+    now: i64,
+) -> bool {
     for f in filters {
         let matched = match &f.kind {
             SearchFilterKind::Text(t) => {
@@ -1099,10 +1164,7 @@ pub fn item_matches_filters(
             SearchFilterKind::Dir(d) => contains_ignore_case(path, d),
             SearchFilterKind::Type { is_dir: want_dir } => is_dir == *want_dir,
             SearchFilterKind::Size { op, bytes } => compare_op(size, *op, *bytes),
-            SearchFilterKind::Mtime { op, seconds } => {
-                let now = chrono::Utc::now().timestamp();
-                compare_op(now - mtime, *op, *seconds)
-            }
+            SearchFilterKind::Mtime { op, seconds } => compare_op(now - mtime, *op, *seconds),
         };
         if matched == f.negate {
             return false;
@@ -1640,11 +1702,22 @@ struct DeltaSink {
 impl DeltaSink {
     fn flush(&self) {
         let cache = crate::disk_cache::DiskCache::instance();
+        // 旧实现用 `let _ = ...` 静默吞掉错误：内存索引已经更新而磁盘索引没有，
+        // 两者会长期分叉且没有任何线索。这里至少各留一条日志，便于诊断"重启后
+        // 搜索与界面不一致"这类问题。
         if !self.removals.is_empty() {
-            let _ = cache.remove_global_index_by_paths(&self.removals);
+            if let Err(e) = cache.remove_global_index_by_paths(&self.removals) {
+                crate::diag::log_line(&format!(
+                    "[USN] 磁盘索引批量删除失败: {e}（内存与磁盘可能不一致，建议重建索引）"
+                ));
+            }
         }
         if !self.upserts.is_empty() {
-            let _ = cache.upsert_global_index_entries(&self.upserts);
+            if let Err(e) = cache.upsert_global_index_entries(&self.upserts) {
+                crate::diag::log_line(&format!(
+                    "[USN] 磁盘索引批量写入失败: {e}（内存与磁盘可能不一致，建议重建索引）"
+                ));
+            }
         }
     }
 }
@@ -1889,12 +1962,21 @@ impl GlobalIndex {
         // Journal 里大量记录与索引无关（临时文件、系统活动），
         // 只统计相关变更会让一次同步读取几十批记录、卡住好几秒。
         let mut consumed = 0usize;
+        // 跨批次保留"已改名旧名、等待配对 NEW_NAME"的目录。
+        // RENAME_OLD_NAME 与 NEW_NAME 可能被批次边界或续读位置（next_usn）切开；
+        // 旧实现在每个批次里重建这张表，于是被切开的目录改名会把旧前缀当"目录删除"
+        // 整体移除，而下一批的 NEW_NAME 找不到待重挂的旧前缀，子树不会再重建
+        // （直到用户重建索引）。现在这张表在整个 apply_drive_delta 期间有效。
+        let mut pending_dir_renames: HashMap<u64, String> = HashMap::new();
         loop {
             if consumed >= budget
                 || report.applied >= budget
                 || std::time::Instant::now() >= deadline
             {
                 report.backlog = true;
+                // 预算/时限用尽而停止：未配对的改名按"旧前缀已失效"清理，避免留下
+                // 指向不存在路径的条目。
+                self.flush_pending_dir_renames(&mut pending_dir_renames, sink, report);
                 return Ok(());
             }
             let delta =
@@ -1902,12 +1984,17 @@ impl GlobalIndex {
                     Ok(delta) => delta,
                     Err(crate::fs::UsnReadError::WindowExpired)
                     | Err(crate::fs::UsnReadError::JournalReset)
-                    | Err(crate::fs::UsnReadError::VolumeChanged) => return Err(()),
+                    | Err(crate::fs::UsnReadError::VolumeChanged) => {
+                        self.flush_pending_dir_renames(&mut pending_dir_renames, sink, report);
+                        return Err(());
+                    }
                     Err(crate::fs::UsnReadError::Io(e)) => {
                         if e.kind() == std::io::ErrorKind::InvalidData {
+                            self.flush_pending_dir_renames(&mut pending_dir_renames, sink, report);
                             return Err(());
                         }
                         crate::diag::log_line(&format!("[USN] {drive}: 读取增量失败: {e}"));
+                        self.flush_pending_dir_renames(&mut pending_dir_renames, sink, report);
                         return Ok(());
                     }
                 };
@@ -1925,7 +2012,6 @@ impl GlobalIndex {
                 delta.next_usn
             };
             consumed += changes.len();
-            let mut pending_dir_renames: HashMap<u64, String> = HashMap::new();
             for change in &changes {
                 self.apply_one_change(
                     drive,
@@ -1937,13 +2023,12 @@ impl GlobalIndex {
                     &mut pending_dir_renames,
                 );
             }
-            // 没等到 NEW_NAME 的目录改名：旧前缀下的条目已指向不存在的路径，整体移除
-            for (_, old_path) in std::mem::take(&mut pending_dir_renames) {
-                self.record_removal(&old_path, true, sink, report);
-            }
 
             checkpoint.next_usn = next_usn;
             if changes.is_empty() {
+                // 本盘已追平：此时仍未等到 NEW_NAME 的目录改名才是真的"没有配对"，
+                // 旧前缀下的条目已指向不存在的路径，整体移除。
+                self.flush_pending_dir_renames(&mut pending_dir_renames, sink, report);
                 return Ok(());
             }
         }
@@ -2026,8 +2111,21 @@ impl GlobalIndex {
 
     /// 目录改名：把旧前缀下的条目整体改挂到新前缀。
     /// 条目过多时放弃（返回 false），交由重建索引处理。
+    /// 处理"还在等配对 NEW_NAME"的目录改名：旧前缀下的条目已指向不存在的路径，整体移除。
+    fn flush_pending_dir_renames(
+        &self,
+        pending: &mut HashMap<u64, String>,
+        sink: &mut DeltaSink,
+        report: &mut UsnSyncReport,
+    ) {
+        for (_, old_path) in std::mem::take(pending) {
+            self.record_removal(&old_path, true, sink, report);
+        }
+    }
+
     fn repath_subtree(
         &self,
+        drive: char,
         old_path: &str,
         new_path: &str,
         sink: &mut DeltaSink,
@@ -2067,6 +2165,11 @@ impl GlobalIndex {
             crate::diag::log_line(&format!(
                 "[USN] 目录改名涉及条目超过 {MAX_REPATH_ENTRIES} 条，跳过重挂: {old_prefix}"
             ));
+            // 旧实现只写日志就返回 false：调用方随后只补上目录本身，子树永远不重建，
+            // 而界面没有任何提示（索引与实际长期不一致）。这里把该盘标为"建议重建索引"。
+            if !report.stale.contains(&drive) {
+                report.stale.push(drive);
+            }
             return false;
         }
 
@@ -2074,6 +2177,15 @@ impl GlobalIndex {
         for entry in moved {
             let old_entry_path = entry.path.clone();
             let Some(suffix) = entry.path.get(old_prefix.len()..) else {
+                // 极少见：字节索引不在字符边界上（前缀含多字节字符且大小写折叠改变了
+                // 长度）。旧实现直接 continue —— 但该条目刚被 remove_prefix_internal
+                // 从索引里删掉，于是永久消失。这里退化为"保持原路径不变"：宁可少重挂，
+                // 也不能丢数据。
+                crate::diag::log_line(&format!(
+                    "[USN] 重挂时无法切出后缀，保留原路径: {}",
+                    entry.path
+                ));
+                self.upsert_internal(entry);
                 continue;
             };
             let path = format!("{new_prefix}{suffix}");
@@ -2161,7 +2273,7 @@ impl GlobalIndex {
         let is_dir_now = metadata.is_dir();
         if is_dir_now && reason & USN_REASON_RENAME_NEW_NAME != 0 {
             if let Some(old_path) = pending_dir_renames.remove(&change.file_ref) {
-                if self.repath_subtree(&old_path, &current, sink, report) {
+                if self.repath_subtree(drive, &old_path, &current, sink, report) {
                     return;
                 }
             }
@@ -2202,7 +2314,15 @@ pub fn empty_instance_for_test() -> GlobalIndex {
 
 #[cfg(target_os = "windows")]
 pub fn list_ntfs_drives() -> Vec<char> {
-    use windows_sys::Win32::Storage::FileSystem::{GetLogicalDrives, GetVolumeInformationW};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    };
+
+    // DRIVE_REMOTE == 4。网络映射盘可能自报文件系统为 NTFS，但 MFT 直读与 USN Journal
+    // 在远程卷上不可用：这类盘一旦进入构建列表，只会以 failed_drives 收尾并让索引构建
+    // 白等一轮。这里与 volumes.rs 的 `is_ntfs`（语义为"MFT/USN 可用"）保持一致。
+    // 用自备常量而不是 windows_sys 的 DRIVE_REMOTE，避免为此扩充依赖 feature。
+    const DRIVE_REMOTE_TYPE: u32 = 4;
 
     let mut drives = Vec::new();
     let mask = unsafe { GetLogicalDrives() };
@@ -2216,6 +2336,9 @@ pub fn list_ntfs_drives() -> Vec<char> {
         let letter = (b'A' + i as u8) as char;
         let root = format!("{}:\\", letter);
         let root_wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+        if unsafe { GetDriveTypeW(root_wide.as_ptr()) } == DRIVE_REMOTE_TYPE {
+            continue;
+        }
         let mut fs_name = [0u16; 16];
         let ok = unsafe {
             GetVolumeInformationW(

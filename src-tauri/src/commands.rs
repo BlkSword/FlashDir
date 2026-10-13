@@ -196,6 +196,8 @@ pub async fn scan_directory_paged(
     };
 
     // 只收集引用，避免为过滤/排序克隆整份条目
+    // "现在"只取一次：本地过滤是逐条目调用的，Mtime 条件不应每条目读一次时钟。
+    let filter_now = chrono::Utc::now().timestamp();
     let mut filtered: Vec<&flashdir::scan::Item> = Vec::new();
     for item in view.items() {
         // MFT 解析失败的占位记录不应展示给用户
@@ -208,13 +210,14 @@ pub async fn scan_directory_paged(
             .strip_prefix(root_prefix.as_str())
             .unwrap_or(item.path.as_str());
         if use_filter
-            && !flashdir::global_search::item_matches_filters(
+            && !flashdir::global_search::item_matches_filters_at(
                 item.name.as_str(),
                 match_path,
                 item.size,
                 item.is_dir,
                 item.mtime,
                 &filters,
+                filter_now,
             )
         {
             continue;
@@ -239,7 +242,15 @@ pub async fn scan_directory_paged(
         item.size_formatted = flashdir::scan::format_size(item.size);
     }
 
-    if sort_column != "size" || sort_direction != "desc" {
+    // "已按体积降序"是扫描侧的隐式不变量（MFT / USN / 目录遍历三条路径都输出已按 size
+    // 降序的结果），这里跳过排序以省掉 30 万条的重复排序。用 debug_assert 把该依赖显式化：
+    // 一旦上游不再保证有序，调试构建会立刻暴露，而不是静默返回错误顺序。
+    if sort_column == "size" && sort_direction == "desc" {
+        debug_assert!(
+            filtered.windows(2).all(|w| w[0].size >= w[1].size),
+            "扫描结果未保持 size 降序不变量，跳过排序的分页路径会返回错误顺序"
+        );
+    } else {
         filtered.sort_unstable_by(|a, b| {
             let ord = match sort_column.as_str() {
                 "atime" => a.atime.cmp(&b.atime),
@@ -292,8 +303,26 @@ pub async fn scan_directory_paged(
     })
 }
 
-/// 大小写不敏感的名称比较（不分配字符串，避免每次排序比较都 to_lowercase）
+/// 大小写不敏感的名称比较（不分配字符串，避免每次排序比较都 to_lowercase）。
+///
+/// 旧实现对**每一次比较**都构造两个 `chars().flat_map(to_lowercase)` 迭代器，并对每个
+/// 字符调用 `to_lowercase()`；30 万条目录按名称排序意味着数百万次比较。路径以 ASCII
+/// 为主，这里先走零分配字节快路径，只有任一侧含非 ASCII 时才回退到 Unicode 小写展开
+/// （语义与旧实现完全一致）。
 fn compare_ignore_case(a: &str, b: &str) -> std::cmp::Ordering {
+    if a.is_ascii() && b.is_ascii() {
+        let (ab, bb) = (a.as_bytes(), b.as_bytes());
+        let n = ab.len().min(bb.len());
+        for i in 0..n {
+            let x = ab[i].to_ascii_lowercase();
+            let y = bb[i].to_ascii_lowercase();
+            if x != y {
+                return x.cmp(&y);
+            }
+        }
+        return ab.len().cmp(&bb.len());
+    }
+
     let mut ai = a.chars().flat_map(|c| c.to_lowercase());
     let mut bi = b.chars().flat_map(|c| c.to_lowercase());
     loop {
@@ -444,6 +473,12 @@ pub fn get_diagnostics(state: State<'_, AppState>) -> DiagnosticsInfo {
 }
 
 /// 使用系统默认程序打开文件或目录
+///
+/// `tauri_plugin_shell::Shell::open` 已被上游标记为 deprecated（建议迁移到
+/// tauri-plugin-opener）。迁移需要新增依赖 + capabilities + 插件初始化，属于独立改动；
+/// 这里先显式标注，避免用警告噪音掩盖真正的新问题。
+/// TODO: 迁移到 tauri-plugin-opener 后移除本 attribute。
+#[allow(deprecated)]
 #[command]
 pub async fn open_path(app: tauri::AppHandle, path: String) -> Result<(), String> {
     use tauri_plugin_shell::ShellExt;
@@ -590,8 +625,13 @@ pub async fn analyze_dev_disk(path: String) -> Option<flashdir::dev_analyzer::De
         ))
     })
     .await
-    .ok()
-    .flatten()
+    .unwrap_or_else(|e| {
+        // JoinError（任务 panic / 被取消）与"内存缓存里没有该目录"此前都变成 null，
+        // 前端一律显示空态，真实故障被静默吞掉。返回类型保持 Option 不变（前端契约），
+        // 但至少留下可诊断的记录。
+        flashdir::diag::log_line(&format!("[DEV] analyze_dev_disk 任务失败: {e}"));
+        None
+    })
 }
 
 /// 重复文件检测：从内存缓存读取当前扫描结果，按大小 + 内容哈希找出重复文件。
@@ -755,9 +795,11 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
         return Ok(());
     }
     let _build_guard = idx.try_begin_build()?;
-    // 播种 USN 检查点：构建期间发生的变更会被后续增量同步补上
-    idx.seed_usn_checkpoints(&flashdir::global_search::list_ntfs_drives());
 
+    // 先判断是否真的需要构建（已就绪 / 正在构建 → 幂等返回）。
+    // 顺序很关键：旧实现把这个判断放在**播种检查点之后**，于是"索引已就绪时点一次
+    // 重建"也会按 usn_checkpoint_<盘>.json 重播每盘检查点并持久化，使检查点可能倒退、
+    // 已应用的变更被重复回放。
     {
         let idx = flashdir::global_search::instance();
         match idx.state() {
@@ -778,7 +820,20 @@ pub async fn global_search_ensure_index(app: tauri::AppHandle) -> Result<(), Str
         "索引构建：开始（已释放 {freed} 个目录的内存缓存，可用内存 {}）",
         flashdir::diag::memory_text()
     ));
-    flashdir::diag::ensure_memory_available(500, "构建全盘索引")?;
+    if let Err(e) = flashdir::diag::ensure_memory_available(500, "构建全盘索引") {
+        // 必须显式落到 Failed：set_loading() 已经清空了内存索引，若这里只返回 Err，
+        // 状态会永远停在 Loading（界面显示"构建中 / 0 项"且不再自动重试）。
+        idx.set_failed(e.clone());
+        return Err(e);
+    }
+
+    // 播种 USN 检查点：把每卷检查点记进内存 meta，构建期间发生的变更才能被后续
+    // 增量同步捞回来。
+    // 必须在 set_loading() **之后**：set_loading 会重置整个 meta（含 usn 检查点），
+    // 旧实现先播种再 set_loading，播种结果被直接清掉、注释里的承诺并不成立。
+    // 取的是 usn_checkpoint_<盘>.json 的值（永远不晚于"构建开始时刻"），因此后续
+    // 增量只会重放一个超集，不会漏变更。
+    idx.seed_usn_checkpoints(&flashdir::global_search::list_ntfs_drives());
 
     let drives = flashdir::global_search::list_ntfs_drives();
     if drives.is_empty() {
@@ -884,7 +939,10 @@ pub async fn global_search(
 ) -> flashdir::global_search::GlobalSearchResponse {
     // 上限 20 万条：既够"查看更多"，又不至于把 IPC 打爆
     let limit = limit.unwrap_or(500).clamp(1, 200_000);
-    let offset = offset.unwrap_or(0);
+    // offset 也要限幅：分页实现是"重跑 top-K + clone(limit+offset) 再丢弃前 offset 条"，
+    // 未限幅的 offset 会让堆与克隆量线性膨胀（前端不会这样传，但 IPC 是公开边界）。
+    const MAX_SEARCH_OFFSET: usize = 1_000_000;
+    let offset = offset.unwrap_or(0).min(MAX_SEARCH_OFFSET);
     tauri::async_runtime::spawn_blocking(move || {
         let idx = flashdir::global_search::instance();
         let state = idx.state();
@@ -910,9 +968,14 @@ pub async fn global_search(
         }
     })
     .await
-    .unwrap_or_else(|_| GlobalSearchResponse {
+    .unwrap_or_else(|e| GlobalSearchResponse {
         ready: false,
-        state: flashdir::global_search::IndexState::NotLoaded,
+        // 用 Failed 而不是 NotLoaded：spawn_blocking 的 JoinError 是真实故障（任务
+        // panic 或被取消）。伪装成"索引未就绪"会让界面提示"请先建索引"，把真正的
+        // 错误掩盖掉。
+        state: flashdir::global_search::IndexState::Failed {
+            reason: format!("检索任务执行失败：{e}"),
+        },
         results: Vec::new(),
         total: 0,
         truncated: false,
@@ -941,7 +1004,6 @@ pub async fn global_search_add_scan_from_cache(path: String) -> Result<(), Strin
 pub async fn global_search_refresh(app: tauri::AppHandle) -> Result<(), String> {
     let idx = flashdir::global_search::instance();
     let _build_guard = idx.try_begin_build()?;
-    idx.seed_usn_checkpoints(&flashdir::global_search::list_ntfs_drives());
 
     let idx = flashdir::global_search::instance();
     idx.set_loading();
@@ -954,7 +1016,16 @@ pub async fn global_search_refresh(app: tauri::AppHandle) -> Result<(), String> 
         "索引构建：开始（已释放 {freed} 个目录的内存缓存，可用内存 {}）",
         flashdir::diag::memory_text()
     ));
-    flashdir::diag::ensure_memory_available(500, "构建全盘索引")?;
+    if let Err(e) = flashdir::diag::ensure_memory_available(500, "构建全盘索引") {
+        // 同 ensure_index：内存索引已被 set_loading 清空，必须显式落到 Failed，
+        // 否则界面会永远停在"构建中 / 0 项"。
+        idx.set_failed(e.clone());
+        return Err(e);
+    }
+
+    // 播种必须在 set_loading() 之后：set_loading 会重置整个 meta（含 usn 检查点），
+    // 旧实现先播种再 set_loading，播种结果被直接清掉。
+    idx.seed_usn_checkpoints(&flashdir::global_search::list_ntfs_drives());
 
     let drives = flashdir::global_search::list_ntfs_drives();
     let perf = flashdir::perf::PerformanceMonitor::instance();

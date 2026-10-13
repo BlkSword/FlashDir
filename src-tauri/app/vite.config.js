@@ -1,6 +1,5 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
-import { resolve } from 'path'
 import { visualizer } from 'rollup-plugin-visualizer'
 
 // https://vitejs.dev/config/
@@ -42,9 +41,7 @@ export default defineConfig(({ mode }) => {
       })
     ].filter(Boolean),
     resolve: {
-      alias: {
-        '@': resolve(__dirname, './src'),
-      },
+      // 删除了 '@' -> ./src 别名：全仓没有任何 '@/xxx' 形式的导入，属死配置
       // 使用更高效的模块解析策略
       mainFields: ['module', 'jsnext:main', 'jsnext'],
     },
@@ -89,25 +86,8 @@ export default defineConfig(({ mode }) => {
       // 压缩：使用 Vite 默认的 esbuild（terser 的激进压缩此前导致生产构建渲染期
       // 出现 "Cannot read properties of undefined" 且被 drop_console 吞掉，难以排查）
       minify: 'esbuild',
-      terserOptions: {
-        compress: {
-          // 删除 console 和 debugger
-          drop_console: isProduction,
-          drop_debugger: isProduction,
-          // 启用更积极的压缩
-          passes: 2,
-          // 移除未使用的代码
-          pure_funcs: ['console.log', 'console.info', 'console.debug'],
-        },
-        mangle: {
-          // 混淆属性名
-          properties: false,
-        },
-        format: {
-          // 删除注释
-          comments: false,
-        },
-      },
+      // 删除了整块 terserOptions：minify 已是 esbuild，Vite 会忽略 terser 配置块，
+      // 这里的 drop_console/passes/pure_funcs 全部没有生效过。
       // 设置块大小警告阈值（单位：KB）
       chunkSizeWarningLimit: 500,
       // 启用 brotli 压缩
@@ -132,11 +112,9 @@ export default defineConfig(({ mode }) => {
     },
     // 优化依赖预构建
     optimizeDeps: {
-      // 预构建这些依赖
+      // 预构建这些依赖（ant-design-vue / @ant-design/icons-vue 已从依赖中移除且全仓零引用）
       include: [
         'vue',
-        'ant-design-vue',
-        '@ant-design/icons-vue',
         '@tauri-apps/api'
       ],
       // 排除某些依赖的预构建

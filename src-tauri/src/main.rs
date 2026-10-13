@@ -268,6 +268,10 @@ HTTP 地址（可写进支持 url 的 Host）: {}
                 flashdir::mcp::serve_stdio().await;
                 0
             };
+            // 磁盘缓存写入是排给后台线程的（见 scan::flush_disk_cache_writes）：
+            // 旧实现这里直接 std::process::exit，排队的写入会随进程一起丢掉。
+            // cli.rs 已在退出前同样 flush，这里对齐（对 stdio/selftest/bridge 均无害）。
+            flashdir::scan::flush_disk_cache_writes();
             std::process::exit(code);
         }
     }
@@ -384,13 +388,25 @@ HTTP 地址（可写进支持 url 的 Host）: {}
 
                 let mut ok_drives: Vec<char> = Vec::new();
                 let mut failed_drives: Vec<char> = Vec::new();
+                // 每批交给 append_mft_files 的条目数：与 commands.rs 的
+                // global_search_ensure_index / global_search_refresh 取同一值。
+                const MFT_BATCH: usize = 50_000;
                 for &drive in &drives {
                     let root = format!("{}:\\", drive);
                     let app_h = app_handle.clone();
+                    // 旧实现用非流式 try_mft_scan：整卷 MftScanResult.files
+                    // （百万级 MftFileInfo，含 path/name 两个 String）会一次性常驻内存，
+                    // 与 commands.rs 的流式路径不一致，启动峰值内存被显著抬高。
+                    // 改成 try_mft_scan_streaming + 分批 append_mft_files：
+                    // 每批回调返回后即可释放，峰值只与 MFT_BATCH 相关。
                     let result = tokio::task::spawn_blocking(move || {
-                        flashdir::fs::try_mft_scan(&root).map(|mft_result| {
-                            let count = mft_result.files.len();
-                            global_search::instance().append_mft_files(drive, &mft_result.files);
+                        // summary.file_count/dir_count 含未写入索引的卷根目录，
+                        // 故 -1 与 commands.rs 的计数口径保持一致
+                        flashdir::fs::try_mft_scan_streaming(&root, MFT_BATCH, |batch| {
+                            global_search::instance().append_mft_files(drive, &batch);
+                        })
+                        .map(|summary| {
+                            let count = summary.file_count + summary.dir_count - 1;
                             (drive, count)
                         })
                     })

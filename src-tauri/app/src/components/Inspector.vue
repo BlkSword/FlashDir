@@ -13,7 +13,8 @@ const props = defineProps({
   mftAvailable: { type: Boolean, default: false },
   snapshotCount: { type: Number, default: 0 },
 })
-const emit = defineEmits(['open', 'copy', 'search-here', 'duplicates', 'snapshot', 'navigate'])
+// 删除了从未 emit 过的 'navigate'：本组件只负责展示与回调，跳转由父级处理
+const emit = defineEmits(['open', 'copy', 'search-here', 'duplicates', 'snapshot'])
 
 const sourceLabel = computed(() => ({
   memory: '内存缓存命中',

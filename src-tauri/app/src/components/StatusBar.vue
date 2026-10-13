@@ -13,7 +13,6 @@ const props = defineProps({
   cacheSource: { type: String, default: '' },
   mftAvailable: { type: Boolean, default: false },
   isAdmin: { type: Boolean, default: false },
-  indexState: { type: String, default: '' },
   indexCount: { type: Number, default: 0 },
   indexPartial: { type: Boolean, default: false },
   usnVerified: { type: Boolean, default: false },

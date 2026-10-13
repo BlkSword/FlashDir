@@ -12,22 +12,38 @@ const emit = defineEmits(['navigate'])
 const box = ref(null)
 const size = ref({ w: 800, h: 200 })
 let ro = null
+let rafId = 0
+
+function readSize() {
+  const el = box.value
+  if (el) size.value = { w: el.clientWidth || 800, h: el.clientHeight || 200 }
+}
+
+/** ResizeObserver / window.resize 一帧内可能触发多次，
+ *  旧实现每次回调都同步写 size 触发重算整个 treemap；合并到一帧一次。 */
+function measure() {
+  if (rafId) return
+  rafId = requestAnimationFrame(() => {
+    rafId = 0
+    readSize()
+  })
+}
 
 onMounted(() => {
-  const measure = () => {
-    const el = box.value
-    if (el) size.value = { w: el.clientWidth || 800, h: el.clientHeight || 200 }
-  }
-  measure()
+  readSize() // 首帧同步测量，避免先闪一下默认尺寸
   if (typeof ResizeObserver !== 'undefined') {
     ro = new ResizeObserver(measure)
     if (box.value) ro.observe(box.value)
   }
   window.addEventListener('resize', measure)
-  onUnmounted(() => {
-    window.removeEventListener('resize', measure)
-    ro?.disconnect()
-  })
+})
+
+// onUnmounted 必须注册在 setup 顶层作用域：旧实现写在 onMounted 回调内部，
+// 依赖"挂载回调本身只跑一次"才成立，属于非常规写法。
+onUnmounted(() => {
+  window.removeEventListener('resize', measure)
+  if (rafId) cancelAnimationFrame(rafId)
+  ro?.disconnect()
 })
 
 /** 参与布局的条目：前 max 项 + "其他" */

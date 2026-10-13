@@ -17,6 +17,8 @@ const props = defineProps({
   pageSize: { type: Number, default: 100 },
   filter: { type: String, default: '' },
   selectedPath: { type: String, default: '' },
+  // 空态文案要按实际扫描方式分支，旧实现不读这个值就硬提"MFT 直读"
+  mftAvailable: { type: Boolean, default: false },
 })
 const emit = defineEmits([
   'sort', 'select', 'open', 'context', 'page-change', 'page-size-change', 'up',
@@ -128,7 +130,9 @@ const changePage = (p) => {
             或检查 <span class="mono">ext:</span> 拼写。语法：<span class="mono">ext:zip size:&gt;1GB dir:node_modules !tmp type:file mtime:&gt;7d</span>
           </template>
           <template v-else>
-            在工具栏输入路径后按 Enter 扫描；管理员模式下走 MFT 直读（秒级），否则回退目录遍历。
+            在工具栏输入路径后按 Enter 扫描；
+            <template v-if="mftAvailable">当前可走 MFT 直读（秒级）。</template>
+            <template v-else>当前未启用 MFT 直读，将回退目录遍历；以管理员身份重启可启用。</template>
           </template>
         </span>
       </div>

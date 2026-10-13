@@ -98,6 +98,32 @@ fn cleanup_orphan_blobs(conn: &Connection) {
     }
 }
 
+/// 迁移：为旧库补上 `last_access` 列并回填（幂等）。
+///
+/// 列已存在时 `ALTER TABLE` 报错，忽略即可（沿用文件里既有的 `let _ = ...` 迁移风格）；
+/// 回填用 `created_at`，`WHERE last_access = 0` 保证重复执行不会覆盖真实访问时间。
+fn migrate_last_access(conn: &Connection) {
+    let _ = conn.execute(
+        "ALTER TABLE scan_meta ADD COLUMN last_access INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = conn.execute(
+        "UPDATE scan_meta SET last_access = created_at WHERE last_access = 0",
+        [],
+    );
+}
+
+/// 记录一次"读取命中"：只刷新 `last_access`。
+///
+/// 旧实现在这里改写 `created_at`，使"写入时间"与"最后访问时间"混为一谈，
+/// 直接破坏了 `get_derived` 按 `created_at` 判断父缓存新鲜度的语义。
+fn mark_accessed(conn: &Connection, path: &str) {
+    let _ = conn.execute(
+        "UPDATE scan_meta SET last_access = ?1 WHERE scan_path = ?2",
+        params![chrono::Utc::now().timestamp(), path],
+    );
+}
+
 /// 磁盘缓存管理器
 ///
 /// 初始化失败（HOME 不可写、DB 文件被占用、杀软干扰等）时降级为
@@ -161,6 +187,7 @@ impl DiskCache {
                 scan_path TEXT PRIMARY KEY,
                 dir_mtime INTEGER NOT NULL,
                 created_at INTEGER NOT NULL,
+                last_access INTEGER NOT NULL DEFAULT 0,
                 size INTEGER NOT NULL,
                 mft_available INTEGER NOT NULL,
                 item_count INTEGER NOT NULL,
@@ -176,6 +203,12 @@ impl DiskCache {
             [],
         );
         let _ = conn.execute("ALTER TABLE scan_meta ADD COLUMN blob_file TEXT", []);
+        // created_at 早期一列兼两职：写入时间 + "最后访问时间"（load_scan 每次读取都
+        // UPDATE created_at = now）。这让 get_derived 的"父缓存是否够新"判断失效——
+        // 任何一次读取（含它自己的 load_scan）都会把 created_at 刷成当前时间，
+        // 于是父 blob 数据可能停留在很久以前的写入时刻却被判为"足够新"。
+        // 这里拆成两列：created_at 只表示写入时间，last_access 表示最后访问时间。
+        migrate_last_access(&conn);
         // 旧库把 blob 内嵌在 data 列：迁移为外部文件成本高，直接丢弃这些行（缓存可重建），
         // 并 DROP 列以释放空间
         let _ = conn.execute("DELETE FROM scan_meta WHERE data IS NOT NULL", []);
@@ -333,10 +366,9 @@ impl DiskCache {
         };
         let payload = decode_blob(path, &raw)?;
 
-        let _ = conn.execute(
-            "UPDATE scan_meta SET created_at = ?1 WHERE scan_path = ?2",
-            params![chrono::Utc::now().timestamp(), path],
-        );
+        // 读取只刷新"最后访问时间"：created_at 保持写入时间，
+        // 否则 get_derived 用 created_at 判父缓存新鲜度会被这次读取污染。
+        mark_accessed(conn, path);
 
         let mut items: Vec<Item> = bincode::deserialize(payload).ok()?;
         // SQLite ORDER BY 需 temp b-tree（30 万行 ~0.7s），内存排序只要 ~15ms
@@ -416,14 +448,17 @@ impl DiskCache {
         let mut guard = self.conn.lock();
         let conn = guard.as_mut().ok_or_else(Self::disabled_err)?;
         let tx = conn.transaction()?;
+        let now = chrono::Utc::now().timestamp();
         tx.execute(
             "INSERT OR REPLACE INTO scan_meta
-             (scan_path, dir_mtime, created_at, size, mft_available, item_count, verified_usn, blob_file)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (scan_path, dir_mtime, created_at, last_access, size, mft_available, item_count, verified_usn, blob_file)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 path,
                 dir_mtime,
-                chrono::Utc::now().timestamp(),
+                // 新写入的行：写入时间与最后访问时间同为当前时间
+                now,
+                now,
                 data_len as i64,
                 mft_available as i64,
                 items.len() as i64,
@@ -441,9 +476,10 @@ impl DiskCache {
     pub fn touch_meta(&self, path: &str, dir_mtime: i64, verified_usn: i64) -> Result<()> {
         let guard = self.conn.lock();
         let conn = guard.as_ref().ok_or_else(Self::disabled_err)?;
+        // 只更新 mtime / USN 与"最后访问时间"；created_at 是写入时间，不再被 touch 改写
         conn.execute(
             "UPDATE scan_meta
-             SET dir_mtime = ?1, verified_usn = MAX(verified_usn, ?2), created_at = ?3
+             SET dir_mtime = ?1, verified_usn = MAX(verified_usn, ?2), last_access = ?3
              WHERE scan_path = ?4",
             params![dir_mtime, verified_usn, chrono::Utc::now().timestamp(), path],
         )?;
@@ -478,7 +514,9 @@ impl DiskCache {
         }
 
         let (scan_path, mft_available, created_at, verified_usn) = best?;
-        // 父缓存写入时间早于子目录 mtime：可能已过期，不用推导
+        // 父缓存**写入时间**早于子目录 mtime：可能已过期，不用推导。
+        // created_at 现在真的是写入时间（读取只刷 last_access），
+        // 早期它被每次读取刷新，这里的判断几乎永远为假 → 会返回陈旧派生结果。
         if created_at < dir_mtime {
             return None;
         }
@@ -531,6 +569,7 @@ impl DiskCache {
     }
 
     fn cleanup_old_entries(&self) -> Result<()> {
+        // README 语义："7 天未访问" —— 按 last_access 而不是写入时间判定
         let cutoff = chrono::Utc::now() - chrono::Duration::days(7);
 
         let guard = self.conn.lock();
@@ -539,13 +578,13 @@ impl DiskCache {
         };
         let expired: Vec<String> = {
             let mut stmt = conn.prepare(
-                "SELECT blob_file FROM scan_meta WHERE created_at < ?1 AND blob_file IS NOT NULL",
+                "SELECT blob_file FROM scan_meta WHERE last_access < ?1 AND blob_file IS NOT NULL",
             )?;
             let rows = stmt.query_map(params![cutoff.timestamp()], |row| row.get::<_, String>(0))?;
             rows.flatten().collect()
         };
         conn.execute(
-            "DELETE FROM scan_meta WHERE created_at < ?1",
+            "DELETE FROM scan_meta WHERE last_access < ?1",
             params![cutoff.timestamp()],
         )?;
         for blob in expired {
@@ -589,8 +628,10 @@ impl DiskCache {
 
         let tx = conn.transaction()?;
         let victims = {
+            // README 语义"按最久未访问整份淘汰"：LRU 依据是 last_access，
+            // 早期误用 created_at，而 created_at 又会被每次读取刷新 → 淘汰顺序失真
             let mut stmt = tx.prepare(
-                "SELECT scan_path, size, blob_file FROM scan_meta ORDER BY created_at ASC",
+                "SELECT scan_path, size, blob_file FROM scan_meta ORDER BY last_access ASC",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -665,6 +706,7 @@ impl DiskCache {
             )
             .unwrap_or((0, 0));
 
+        // 最早写入的缓存条目时间（字段名与序列化保持不变，供前端/MCP 显示）
         let oldest_entry: Option<i64> = conn
             .query_row(
                 "SELECT MIN(created_at) FROM scan_meta",
@@ -1117,5 +1159,92 @@ mod tests {
     fn test_escape_like() {
         assert_eq!(escape_like(r"C:\Users"), r"C:\\Users");
         assert_eq!(escape_like("100%_done"), r"100\%\_done");
+    }
+
+    /// 建一张旧库结构的 scan_meta（没有 last_access 列）并插一行。
+    fn legacy_conn_with_row(created_at: i64) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE scan_meta (
+                scan_path TEXT PRIMARY KEY,
+                dir_mtime INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                mft_available INTEGER NOT NULL,
+                item_count INTEGER NOT NULL,
+                verified_usn INTEGER NOT NULL DEFAULT 0,
+                blob_file TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_meta
+             (scan_path, dir_mtime, created_at, size, mft_available, item_count, verified_usn, blob_file)
+             VALUES ('C:/a', 1, ?1, 10, 0, 1, 0, 'x.bin')",
+            params![created_at],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// 缺陷 9：旧库迁移必须补列并用 created_at 回填，且重复执行幂等。
+    #[test]
+    fn last_access_migration_is_idempotent() {
+        let conn = legacy_conn_with_row(111);
+        migrate_last_access(&conn);
+        let last: i64 = conn
+            .query_row("SELECT last_access FROM scan_meta WHERE scan_path = 'C:/a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(last, 111, "旧行的 last_access 必须用 created_at 回填");
+
+        // 已有真实访问时间：重复迁移不得覆盖
+        conn.execute("UPDATE scan_meta SET last_access = 222", []).unwrap();
+        migrate_last_access(&conn);
+        let last: i64 = conn
+            .query_row("SELECT last_access FROM scan_meta WHERE scan_path = 'C:/a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(last, 222, "重复迁移不得覆盖既有 last_access");
+
+        // 已带该列的新库也能直接跑（列存在时 ALTER 失败被忽略）
+        let fresh = Connection::open_in_memory().unwrap();
+        fresh
+            .execute(
+                "CREATE TABLE scan_meta (
+                    scan_path TEXT PRIMARY KEY,
+                    created_at INTEGER NOT NULL,
+                    last_access INTEGER NOT NULL DEFAULT 0
+                )",
+                [],
+            )
+            .unwrap();
+        migrate_last_access(&fresh);
+    }
+
+    /// 缺陷 9 的核心：读取命中只允许刷新 last_access，
+    /// created_at（写入时间）必须保持原值，供 get_derived 判断新鲜度。
+    #[test]
+    fn read_hit_does_not_rewrite_created_at() {
+        let conn = legacy_conn_with_row(111);
+        migrate_last_access(&conn);
+        // 回填后 last_access == created_at == 111
+        mark_accessed(&conn, "C:/a");
+
+        let (created_at, last_access): (i64, i64) = conn
+            .query_row(
+                "SELECT created_at, last_access FROM scan_meta WHERE scan_path = 'C:/a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(created_at, 111, "读取命中不得改写 created_at（写入时间）");
+        assert!(
+            last_access >= 111,
+            "读取命中必须刷新 last_access: {last_access}"
+        );
     }
 }

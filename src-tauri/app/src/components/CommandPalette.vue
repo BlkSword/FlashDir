@@ -101,6 +101,9 @@ watch(q, () => {
 watch(() => props.open, async (v) => {
   if (!v) return
   q.value = props.seed || ''
+  // 赋值 q 会触发上面的 watch 排一个 160ms 防抖任务；下面会立刻同步搜索一次，
+  // 所以必须取消该防抖任务，否则每次打开面板都会白跑一次 IPC 搜索。
+  clearTimeout(timer)
   results.value = []
   searchNote.value = ''
   active.value = 0
@@ -127,13 +130,16 @@ const choose = (idx = active.value) => {
 const onKey = (e) => {
   if (e.key === 'ArrowDown') { e.preventDefault(); move(1) }
   else if (e.key === 'ArrowUp') { e.preventDefault(); move(-1) }
-  else if (e.key === 'Enter') { e.preventDefault(); choose() }
-  else if (e.key === 'Escape') { e.preventDefault(); emit('close') }
+  // Ctrl/⌘+Enter 必须排在裸 Enter 之前：否则永远匹配不到（旧实现里该分支不可达，
+  // "查看全部结果" 因此完全失效）。
   else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
     e.preventDefault()
     emit('open-full', q.value.trim())
     emit('close')
-  } else if (e.key === 'Tab') {
+  }
+  else if (e.key === 'Enter') { e.preventDefault(); choose() }
+  else if (e.key === 'Escape') { e.preventDefault(); emit('close') }
+  else if (e.key === 'Tab') {
     // Tab 在"文件搜索 / 命令"之间来回切换（早期只能单向进入命令模式，用户会以为搜索坏了）
     e.preventDefault()
     q.value = isCommandMode.value ? q.value.replace(/^>\s*/, '') : '> ' + q.value.trim()

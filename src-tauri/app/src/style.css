@@ -14,10 +14,12 @@
   --status-h: 24px;
   --dock-h: 196px;
   --transition: 120ms ease;
-}
 
-/* 深色（默认） */
-html[data-theme="dark"] {
+  /* 深色令牌（默认值）必须挂在 :root，而不是只挂 html[data-theme="dark"]。
+     主题默认是 auto，而 auto 只在 @media (prefers-color-scheme: light) 里有
+     覆盖分支；深色若只挂在显式 dark 选择器上，"auto + 系统深色" 就无任何规则
+     命中，颜色令牌（--bg-0、--tx-0、--accent、--shadow 等）全部未定义，界面掉色。
+     放在 :root 后，四个分支（auto+深色 / auto+浅色 / light / dark）都至少有底色。 */
   --bg-0: #17181a; --bg-1: #1e1f22; --bg-2: #26282c; --bg-3: #2f3237; --bg-4: #3a3e44;
   --bd-0: #303338; --bd-1: #3d4147;
   --tx-0: #e8eaed; --tx-1: #b9bdc4; --tx-2: #8b9098; --tx-3: #63686f;
@@ -155,14 +157,7 @@ kbd {
 }
 .cmd-trigger:hover { border-color: var(--bd-1); color: var(--tx-1); }
 .cmd-trigger .sp { flex: 1; }
-.winbtns { display: flex; align-self: stretch; margin-left: 6px; }
-.winbtns button {
-  width: 44px; background: none; border: 0; color: var(--tx-2); cursor: pointer;
-  display: flex; align-items: center; justify-content: center;
-}
-.winbtns button:hover { background: var(--bg-3); color: var(--tx-0); }
-.winbtns button.close:hover { background: #c0392b; color: #fff; }
-.winbtns svg { width: 11px; height: 11px; }
+/* 已删除 .winbtns / .winbtns button / .winbtns svg：全仓无 class="winbtns"（标题栏用原生装饰） */
 .theme-btn { background: none; border: 0; color: var(--tx-2); cursor: pointer; padding: 3px; border-radius: var(--r); }
 .theme-btn:hover { background: var(--bg-3); color: var(--tx-0); }
 .theme-btn svg { width: 15px; height: 15px; }
@@ -243,7 +238,7 @@ kbd {
 }
 .tnode > * { position: relative; }
 .tree-sec { padding: 8px 8px 2px; color: var(--tx-3); font-size: 10.5px; letter-spacing: .6px; text-transform: uppercase; }
-.tree-empty { padding: 10px; color: var(--tx-3); font-size: 11.5px; }
+/* 已删除 .tree-empty：全仓无该 class（目录树空态走 .section-note） */
 
 /* ── 文件表 ──────────────────────────────────────────────── */
 .table-wrap { flex: 1; display: flex; flex-direction: column; min-height: 0; background: var(--bg-2); }
@@ -269,7 +264,7 @@ kbd {
 .trow .nm { display: flex; align-items: center; gap: 7px; color: var(--tx-0); }
 .trow .nm svg { color: var(--tx-3); flex: 0 0 auto; width: 13px; height: 13px; }
 .trow .nm .ext { color: var(--tx-3); font-size: 10.5px; font-family: var(--font-mono); }
-.trow .tag { border: 1px solid var(--bd-1); border-radius: 2px; color: var(--tx-2); font-size: 9.5px; padding: 0 3px; font-family: var(--font-mono); }
+/* 已删除 .trow .tag：全仓无该 class（.tagline 是另一个类名，选择器不匹配） */
 .pct { display: flex; align-items: center; gap: 6px; }
 .pct .track { flex: 1; height: 6px; background: var(--bg-4); border-radius: 2px; overflow: hidden; }
 .pct .track i { display: block; height: 100%; }
@@ -285,8 +280,14 @@ kbd {
   border-radius: var(--r); color: var(--tx-1); cursor: pointer; font: 11px var(--font-mono);
 }
 .tfoot .pager button[disabled] { opacity: .4; cursor: not-allowed; }
+/* .empty-state{flex:1} 只在父级是 flex 容器时生效，而它在文件表/搜索结果里的父级
+   .tbody 是普通块级滚动容器（只作为 .table-wrap 的 flex 子项），所以空态既不填充
+   也不垂直居中。补一条 min-height:100%，父级高度确定时百分比可解析，两种父级都居中。
+   （.empty-state 在 FileTable.vue / SearchResults.vue 中都是 .tbody 的直接子元素，
+     且仅在无数据时渲染，不会撑出多余滚动条。） */
 .empty-state {
-  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  flex: 1; min-height: 100%;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 8px; color: var(--tx-2); padding: 30px;
 }
 .empty-state svg { width: 26px; height: 26px; color: var(--tx-3); }
@@ -318,10 +319,7 @@ kbd {
 .chip:hover { background: var(--bg-3); color: var(--tx-0); }
 .chip svg { width: 13px; height: 13px; }
 .chip[disabled] { opacity: .45; cursor: not-allowed; }
-.spark { display: flex; align-items: flex-end; gap: 2px; height: 44px; margin: 4px 0 6px; }
-.spark i { flex: 1; background: var(--heat-1); border-radius: 1px 1px 0 0; min-height: 2px; }
-.spark i.h { background: var(--warn); }
-.spark i.hh { background: var(--bad); }
+/* 已删除 .spark / .spark i / .spark i.h / .spark i.hh：全仓无 class="spark" */
 
 .dock {
   position: relative;
@@ -413,7 +411,7 @@ kbd {
 .palette-item .main .p { color: var(--tx-3); font-family: var(--font-mono); font-size: 11px; }
 .palette-item .right { color: var(--tx-3); font: 11px var(--font-mono); }
 .palette-item.on { background: var(--sel); color: var(--tx-0); }
-.palette-item .grp { color: var(--tx-3); font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px; }
+/* 已删除 .palette-item .grp：全仓无 class="grp" */
 .palette-foot {
   display: flex; align-items: center; gap: 12px; padding: 6px 11px; border-top: 1px solid var(--bd-0);
   color: var(--tx-3); font-size: 11px; background: var(--bg-1);
@@ -452,18 +450,7 @@ kbd {
 .toast.err { border-left-color: var(--bad); }
 .toast.warn { border-left-color: var(--warn); }
 .toast .msg { flex: 1; }
-.tooltip {
-  position: fixed; z-index: 60; padding: 5px 8px; background: var(--bg-4); color: var(--tx-0);
-  border: 1px solid var(--bd-1); border-radius: var(--r); font-size: 11px; max-width: 340px;
-  box-shadow: var(--shadow); pointer-events: none;
-}
-
-/* ── 热图（CSS 网格 treemap） ─────────────────────────────── */
-.tm { display: grid; gap: 2px; height: 132px; }
-.tm .cell { border-radius: 2px; padding: 4px 6px; overflow: hidden; color: var(--tx-0); cursor: pointer; }
-.tm .cell:hover { outline: 1px solid var(--accent); }
-.tm .cell b { display: block; font: 10px var(--font-mono); opacity: .85; font-weight: 400; }
-.tm .cell .n { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 已删除 .tooltip：全仓无 class="tooltip"（Rust 侧 .tooltip() 与本样式无关） */
 
 /* ── 列表型洞察（Top 增长 / 清理建议 / 重复） ─────────────── */
 .rows { display: flex; flex-direction: column; gap: 3px; }

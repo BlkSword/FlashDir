@@ -14,7 +14,6 @@ const props = defineProps({
   canBack: { type: Boolean, default: false },
   canForward: { type: Boolean, default: false },
   canUp: { type: Boolean, default: false },
-  forceBusy: { type: Boolean, default: false },
 })
 const emit = defineEmits([
   'scan', 'force-scan', 'cancel-scan', 'refresh', 'navigate',

@@ -349,12 +349,13 @@ async fn main() {
     }
 
     let total_items = items.len();
+    // 纯文件数量必须在截断**之前**统计：旧实现先 truncate 再 count，于是 `--top 5`
+    // 且前 5 项恰好都是目录时会输出"0 个文件"，而同一行的 total_size 是全量口径，
+    // 两者自相矛盾（误导脚本消费 cli --json 的 file_count）。
+    let file_count = items.iter().filter(|i| !i.is_dir).count();
     if args.top > 0 && args.top < items.len() {
         items.truncate(args.top);
     }
-
-    // 统计纯文件数量
-    let file_count = items.iter().filter(|i| !i.is_dir).count();
 
     if args.json {
         print_json(&items, result.total_size, elapsed, file_count);

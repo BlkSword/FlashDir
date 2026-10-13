@@ -2,6 +2,10 @@
 target/
 **/target/
 
+# Tauri 构建期生成的 schema（tauri-build 每次构建都会重新生成，
+# 提交它只会让工作树在每次构建后变脏）
+src-tauri/gen/schemas/
+
 # Node.js dependencies and builds
 node_modules/
 **/node_modules/

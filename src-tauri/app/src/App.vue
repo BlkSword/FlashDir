@@ -21,7 +21,7 @@ import Icon from './components/Icon.vue'
 import { useTheme } from './composables/useTheme.js'
 import { useToasts } from './composables/useToasts.js'
 import { useGlobalSearch } from './composables/useGlobalSearch.js'
-import { formatSize, formatDateTime, formatError, getParentPath, normalizePath } from './utils/format.js'
+import { formatSize, formatDateTime, formatError, getParentPath, normalizePath, accessTimeReliable } from './utils/format.js'
 import { searchGlobal } from './utils/globalSearchApi.js'
 
 /* ── 状态 ───────────────────────────────────────────────── */
@@ -155,10 +155,13 @@ async function exportSearchCsv() {
     const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' })
 
     const a = document.createElement('a')
-    a.href = URL.createObjectURL(blob)
+    const url = URL.createObjectURL(blob)
+    a.href = url
     a.download = `flashdir-search-${Date.now()}.csv`
     a.click()
-    URL.revokeObjectURL(a.href)
+    // 旧实现在 a.click() 后立刻 revokeObjectURL：下载线程可能还没把 blob 读完，
+    // 大文件会被截断。延迟释放（且释放 createObjectURL 的原始 url，而非 a.href 的规范化结果）。
+    setTimeout(() => URL.revokeObjectURL(url), 60_000)
     toasts.ok(
       '已导出 ' + rows.length.toLocaleString() + ' 条' +
       (res.total > rows.length ? '（共 ' + res.total.toLocaleString() + ' 条，已达上限 ' + SEARCH_EXPORT_MAX.toLocaleString() + '）' : '')
@@ -188,6 +191,9 @@ const usnVerified = computed(() =>
 )
 const parentTotal = computed(() => totalSize.value)
 const scopeLabel = computed(() => (currentDrive.value ? currentDrive.value + ': ' : ''))
+// 访问时间是否可信：与 FileTable 用同一个判定函数，避免两个组件对同一份数据
+// 给出矛盾结论（此前这里硬编码 true，检查器永远显示 atime，而文件表会标注"(未启用)"）。
+const accessReliable = computed(() => accessTimeReliable(items.value))
 
 async function loadMcpStatus() {
   try {
@@ -377,6 +383,24 @@ function searchHere(path) {
   loadPage()
 }
 
+/** 右键"在此目录内过滤"：目标是该条目所在目录。
+ *  文件表里条目都是 currentPath 的直接子项，父目录即 currentPath，行为与原来一致；
+ *  搜索视图下 currentPath 还停在搜索前的浏览目录，必须以命中项的父目录为准，
+ *  并切回文件表视图，否则过滤结果不可见。 */
+function searchHereInDir(path) {
+  const p = normalizePath(path || '')
+  const name = p.split('/').filter(Boolean).pop()
+  if (!name) return
+  const parent = getParentPath(p)
+  filter.value = `dir:${name}`
+  view.value = 'list'
+  if (parent && parent !== currentPath.value) scanPath(parent)
+  else {
+    page.value = 1
+    loadPage()
+  }
+}
+
 /* ── 条目操作（只读：跳转 / 复制 / 打开） ─────────────────── */
 async function openItem(item) {
   try {
@@ -408,10 +432,12 @@ function exportCsv() {
   }
   const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' })
   const a = document.createElement('a')
-  a.href = URL.createObjectURL(blob)
+  const url = URL.createObjectURL(blob)
+  a.href = url
   a.download = `flashdir-${(currentPath.value.split('/').pop() || 'export')}-p${page.value}.csv`
   a.click()
-  URL.revokeObjectURL(a.href)
+  // 同上：立即 revoke 可能截断下载，改为延迟释放并释放原始 url
+  setTimeout(() => URL.revokeObjectURL(url), 60_000)
   toasts.ok(`已导出当前页 ${items.value.length} 行`)
 }
 
@@ -439,10 +465,17 @@ function onContextPick(id) {
   if (id === 'open') openItem(item)
   else if (id === 'copy') copyText(item.path)
   else if (id === 'copyName') copyText(item.name)
-  else if (id === 'searchHere') searchHere(item.path)
+  else if (id === 'searchHere') searchHereInDir(item.path)
   else if (id === 'globalSearch') { paletteSeed.value = item.name; paletteOpen.value = true }
   else if (id === 'dupes') { dockTab.value = 'dupes'; dockVisible.value = true }
   else if (id === 'snapshot') saveSnapshot(currentPath.value)
+}
+
+/** 关闭命令面板并清空预填词。paletteSeed 只应由右键「全局搜索同名文件」写入，
+ *  用完必须清掉，否则之后每次 Ctrl+K 都会带着上次的文件名并自动发起搜索。 */
+function closePalette() {
+  paletteOpen.value = false
+  paletteSeed.value = ''
 }
 
 /* ── 快照 / 诊断 / 管理员 ───────────────────────────────── */
@@ -467,7 +500,17 @@ async function showDiagnostics() {
   diagnosticsOpen.value = true
   diagnosticsText.value = '正在获取诊断信息…'
   try {
-    diagnosticsText.value = JSON.stringify(await invoke('get_diagnostics'), null, 2)
+    const backend = await invoke('get_diagnostics')
+    // 把 main.js 收集到的界面级错误也带进诊断：生产构建 esbuild.drop 会移除
+    // console.*，这些错误只能在页面里收集，不读出来就永远看不到。
+    const uiErrors = Array.isArray(window.__FLASHDIR_UI_ERRORS__) ? window.__FLASHDIR_UI_ERRORS__ : []
+    let payload = backend
+    if (uiErrors.length) {
+      payload = (backend && typeof backend === 'object' && !Array.isArray(backend))
+        ? { ...backend, uiErrors }
+        : { backend, uiErrors }
+    }
+    diagnosticsText.value = JSON.stringify(payload, null, 2)
   } catch (e) {
     diagnosticsText.value = '获取失败：' + formatError(e)
   }
@@ -573,10 +616,14 @@ function onKeydown(e) {
 
   if (mod && (e.key === 'k' || e.key === 'K')) { e.preventDefault(); paletteOpen.value = true; return }
   if (e.key === 'Escape') {
-    if (paletteOpen.value) { paletteOpen.value = false; return }
+    // 浮层关闭优先级最高，保持原有顺序不变
+    if (paletteOpen.value) { closePalette(); return }
     if (diagnosticsOpen.value) { diagnosticsOpen.value = false; return }
     if (aboutOpen.value) { aboutOpen.value = false; return }
     if (ctx.open) { ctx.open = false; return }
+    // 旧实现把 inInput 判断放在整个 Escape 分支之后：在过滤框/路径输入框里按 Esc
+    // 会直接落到下面的 cancelScan()，误取消正在进行的扫描。输入态下只让输入框失焦。
+    if (inInput) { document.activeElement?.blur(); return }
     if (loading.value) { cancelScan(); return }
     return
   }
@@ -606,6 +653,28 @@ async function loadHistory() {
   try { history.value = (await invoke('get_history_summary')) || [] } catch (e) { history.value = [] }
 }
 
+/** MCP 状态轮询：旧实现无条件每 3 秒 invoke 一次，窗口切到后台也照跑，
+ *  等于常驻后台 IPC。这里隐藏时停表，恢复可见立即补一次。 */
+function startMcpPolling() {
+  if (mcpTimer) return
+  if (document.visibilityState === 'hidden') return
+  mcpTimer = setInterval(loadMcpStatus, 3000)
+}
+function stopMcpPolling() {
+  if (mcpTimer) {
+    clearInterval(mcpTimer)
+    mcpTimer = null
+  }
+}
+function onVisibilityChange() {
+  if (document.visibilityState === 'visible') {
+    loadMcpStatus()
+    startMcpPolling()
+  } else {
+    stopMcpPolling()
+  }
+}
+
 onMounted(async () => {
   document.addEventListener('keydown', onKeydown)
   try {
@@ -619,12 +688,14 @@ onMounted(async () => {
   refreshVolumes()
   loadHistory()
   loadMcpStatus()
-  mcpTimer = setInterval(loadMcpStatus, 3000)
+  startMcpPolling()
+  document.addEventListener('visibilitychange', onVisibilityChange)
   try { isAdmin.value = await invoke('is_admin') } catch (e) { isAdmin.value = false }
 })
 
 onUnmounted(() => {
-  if (mcpTimer) clearInterval(mcpTimer)
+  stopMcpPolling()
+  document.removeEventListener('visibilitychange', onVisibilityChange)
   document.removeEventListener('keydown', onKeydown)
   if (unlistenPhase) unlistenPhase()
 })
@@ -752,7 +823,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
         @navigate="navigate"
         @back="view = 'list'"
         @retry="runGlobalSearch(searchQuery)"
-        @copy="copyText"
+        @context="openContext"
         @more="loadMoreSearch"
         @export-all="exportSearchCsv"
       />
@@ -764,6 +835,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
         :parent-total="parentTotal"
         :total-items="totalItems"
         :loading="loading"
+        :mft-available="mftAvailable"
         :sort-config="sortConfig"
         :page="page"
         :page-size="pageSize"
@@ -788,7 +860,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
         :parent-path="currentPath"
         :parent-total="parentTotal"
         :top-files="topFiles"
-        :access-reliable="true"
+        :access-reliable="accessReliable"
         :cache-source="cacheSource"
         :mft-available="mftAvailable"
         :snapshot-count="snapshotCount"
@@ -808,7 +880,6 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
       :total-size="totalSize"
       :current-path="currentPath"
       @update:tab="dockTab = $event"
-      @navigate="navigate"
       @open="openItem"
       @refresh="loadPage"
     />
@@ -842,7 +913,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
       :index-count="gs.indexMeta.value ? (gs.indexMeta.value.fileCount || 0) + (gs.indexMeta.value.dirCount || 0) : 0"
       :index-partial="!!gs.indexMeta.value?.partial"
       :scope="scopeLabel"
-      @close="paletteOpen = false"
+      @close="closePalette"
       @run="runCommand"
       @open-full="runGlobalSearch($event)"
       @open-path="(p) => invoke('open_path', { path: p }).catch((e) => toasts.err('打开失败：' + formatError(e)))"
@@ -870,7 +941,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
             <kbd>F5</kbd> 增量刷新 ·
             <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd> 强制全量 ·
             <kbd>Ctrl</kbd>+<kbd>B</kbd>/<kbd>J</kbd>/<kbd>I</kbd> 面板开关 ·
-            <kbd>Ctrl</kbd>+<kbd>1..6</kbd> 洞察标签
+            <kbd>Ctrl</kbd>+<kbd>1..5</kbd> 洞察标签
           </div>
         </div>
       </div>
@@ -951,7 +1022,10 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
       </div>
 
       <div class="section-note" style="margin-top:10px">
-        工具：list_volumes · search_files · scan_directory · list_directory · cache_stats · diagnostics（全部只读）
+        13 个工具：list_volumes · search_files · scan_directory · list_directory ·
+        find_large_files · find_duplicates · analyze_dev_cache · list_snapshots ·
+        compare_snapshots · disk_usage_trend · cache_stats · diagnostics（以上只读）·
+        save_snapshot（写入本应用快照库，不修改用户文件）
         <template v-if="mcpStatus && mcpStatus.endpoint">
           <br />当前端点：<span class="mono">127.0.0.1:{{ mcpStatus.endpoint.port }}</span>
           （PID {{ mcpStatus.endpoint.pid }}）· 客户端：{{ mcpStatus.client || '未连接' }}

@@ -213,7 +213,6 @@ async function openPath(p) {
   display: flex; align-items: flex-end; gap: 8px; height: 92px;
   padding: 0 2px 2px; border-bottom: 1px solid var(--bd-0); margin-bottom: 4px;
 }
-.bar-
 .bar-wrap { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; min-width: 0; }
 .bar { width: 100%; max-width: 46px; background: var(--heat-1); border-radius: 2px 2px 0 0; }
 .bar-wrap:hover .bar { background: var(--accent); }

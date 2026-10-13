@@ -17,6 +17,7 @@ const state = reactive({
 
 let listenStarted = false
 let pollTimer = null
+let visibilityBound = false
 
 function stopPolling() {
   if (pollTimer) {
@@ -25,9 +26,34 @@ function stopPolling() {
   }
 }
 
+/** 页面是否处于前台；后台标签页不该继续空转 IPC */
+function isVisible() {
+  return typeof document === 'undefined' || document.visibilityState !== 'hidden'
+}
+
+/** 可见性变化：隐藏时立刻停表，恢复前台时立即补一次查询（避免等到下一个 tick） */
+function onVisibilityChange() {
+  if (isVisible()) {
+    fetchStatus()
+  } else {
+    stopPolling()
+  }
+}
+
+function bindVisibility() {
+  if (visibilityBound || typeof document === 'undefined') return
+  visibilityBound = true
+  document.addEventListener('visibilitychange', onVisibilityChange)
+}
+
 function startPolling() {
   if (pollTimer) return
+  // 旧实现无条件 setInterval：窗口最小化/被切走后仍每秒 invoke 一次，
+  // 进程常驻期间持续产生后台 IPC。隐藏时不启动。
+  if (!isVisible()) return
+  bindVisibility()
   pollTimer = setInterval(() => {
+    if (!isVisible()) return
     fetchStatus()
   }, 1000)
 }
@@ -79,6 +105,7 @@ function ensureListener() {
 
 // 模块加载即启动监听（原 App.vue onMounted 行为），并拉取一次当前状态
 ensureListener()
+bindVisibility()
 fetchStatus()
 
 export function useGlobalSearch() {
@@ -134,10 +161,8 @@ export function useGlobalSearch() {
       }
     }
 
-  const search = async (query, limit) => {
-    return await invoke('global_search', { query, limit })
-  }
-
+  // 已删除未被任何调用方使用的 search(query, limit) 导出：
+  // 搜索统一走 utils/globalSearchApi.js 的 searchGlobal()，此处保留只会造成两套入口
   const ensureIndex = async () => {
     await invoke('global_search_ensure_index')
     await fetchStatus()
@@ -162,7 +187,6 @@ export function useGlobalSearch() {
     failedReason,
     indexMeta,
     statusText,
-    search,
     fetchStatus,
     ensureIndex,
     refreshIndex,

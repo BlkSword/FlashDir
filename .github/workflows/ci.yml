@@ -24,11 +24,52 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # 生产嵌入路径需要前端产物：tauri v2 的 generate_context! 在
+      # custom-protocol（生产）分支下会读取 frontendDist，目录不存在即编译失败。
+      # 因此必须在下面任何"会编译 flashdir 二进制"的步骤之前先构建前端。
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: src-tauri/app/package-lock.json
+
+      - name: Build frontend (for embedded production build)
+        working-directory: src-tauri/app
+        run: |
+          npm ci
+          npm run build
+
       - name: Clippy
         run: cargo clippy --all-targets
 
       - name: Library tests
         run: cargo test --lib
+
+      # TODO（需要一次独立的格式化提交后再启用）：
+      # 当前仓库不是 rustfmt-clean（本地 `cargo fmt --check` 实测 211 处差异，
+      # 分布在 cli.rs / scan.rs / mcp.rs / global_search.rs / disk_cache.rs /
+      # mft_scanner.rs 等 18 个文件）。此处不能直接开启该检查，否则 CI 会立刻失败；
+      # 而全仓 `cargo fmt` 会产生跨文件大 diff，需与其它并行修改协调后单独提交。
+      #
+      # - name: Format check
+      #   run: cargo fmt --check
+
+      # 生产嵌入路径（此前 CI 完全未覆盖）：custom-protocol 下前端资源被内嵌，
+      # 若 app/dist 缺失，generate_context! 会直接编译失败/panic。
+      - name: Production build (embedded frontend)
+        run: cargo build --release --features custom-protocol
+
+      # MCP 自测：使用上面构建出的 release exe，二者都必须以退出码 0 结束。
+      - name: MCP selftest (stdio protocol & tools)
+        run: |
+          .\target\release\flashdir.exe --selftest
+          if ($LASTEXITCODE -ne 0) { throw "flashdir.exe --selftest 退出码非 0" }
+
+      - name: MCP selftest (local HTTP endpoint & token)
+        run: |
+          .\target\release\flashdir.exe --selftest-endpoint
+          if ($LASTEXITCODE -ne 0) { throw "flashdir.exe --selftest-endpoint 退出码非 0" }
 
   frontend:
     name: Frontend build

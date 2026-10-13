@@ -51,14 +51,14 @@ FlashDir 是一个面向 Windows 的磁盘空间分析与可观测性工具。�
 |------|----------|
 | **只读** | 不提供删除、移动、重命名等改动用户数据的操作；清理类能力仅提供定位与建议 |
 | **可解释** | 状态栏固定显示本次结果的来源（内存命中 / 磁盘缓存 / USN 增量 / MFT 直读 / 上层推导）、USN 校验状态、索引规模与权限状态 |
-| **高效** | 键盘优先；路径、体积、时间等信息使用等宽字体对齐；列表支持虚拟滚动与分页 |
+| **高效** | 键盘优先；路径、体积、时间等信息使用等宽字体对齐；文件表整页渲染并按页翻页（上一页 / 下一页），虚拟滚动只用于搜索结果视图（该视图同时支持“加载更多”） |
 | **低干扰** | 缓存与索引在后台构建；窗口尺寸自适应工作区；主题跟随系统 |
 
 ### 1.2 系统要求
 
 | 项目 | 要求 |
 |------|------|
-| 操作系统 | Windows 10 1809 及以上 / Windows 11（x64） |
+| 操作系统 | **仅支持 Windows**（Windows 10 1809 及以上 / Windows 11，x64）。工程按 Windows 专用实现：`fs/mod.rs` 把 MFT/USN/快速遍历模块门控在 `#[cfg(target_os = "windows")]` 下，而 `scan.rs`、`global_search.rs` 等处未加 `#[cfg]` 地引用这些符号，因此非 Windows 目标无法编译；`lib.rs` 顶部为此显式写了 `compile_error!` 给出可读错误。CI 也只在 `windows-latest` 上跑 Rust 检查 |
 | 文件系统 | NTFS（MFT 直读、USN 增量、全局索引均依赖 NTFS） |
 | 权限 | 管理员权限可获得完整能力（MFT 直读、USN 增量、全卷索引）；非管理员自动回退目录遍历 |
 | 依赖 | 无外部运行时依赖（不依赖 Node.js / Python / .NET 自装组件） |
@@ -70,14 +70,20 @@ FlashDir 是一个面向 Windows 的磁盘空间分析与可观测性工具。�
 ### 2.1 扫描与缓存
 
 目录扫描按以下顺序逐级尝试，任一级命中即返回；结果均标注来源，便于判断数据新鲜度。
+第 0 级是 **USN 增量**：只要该目录缓存记录了“已校验 USN”，就先做增量校验——
+目录 mtime 只在直接增删子项时变化，无法反映文件内容修改，只有 USN 能捕捉这类变更。
 
 | 级别 | 机制 | 生效条件 | 典型耗时 |
 |------|------|----------|----------|
+| 0 | **USN 增量** | 该目录已记录“已校验 USN”，且增量窗口有效、变更条数低于阈值（默认 1200）；校验通过则直接复用缓存条目 | 通常 < 300 ms |
 | 1 | **内存缓存** | 同一进程内近期扫描过该目录，条目以 `Arc` 共享（零拷贝），LRU 上限 30 个目录 / 200 MB | 近似 0 ms |
-| 2 | **磁盘缓存** | 该目录的缓存行未过期（目录 mtime 未前进），条目为单行 bincode 数据块 | 数百毫秒（含反序列化与排序） |
-| 3 | **上层目录推导** | 已缓存父目录，且父缓存写入时间不早于子目录 mtime | 近似 0 ms |
-| 4 | **USN 增量** | 该目录已记录“已校验 USN”，且增量窗口有效、变更条数低于阈值（默认 1200） | 通常 < 300 ms |
+| 2 | **内存上层推导** | 已缓存父目录，且父缓存写入时间不早于子目录 mtime | 近似 0 ms |
+| 3 | **磁盘上层推导** | 同上，但父结果只在磁盘缓存中（条目级 SQL 前缀查询，不反序列化整个父目录） | 数毫秒 |
+| 4 | **磁盘缓存** | 该目录的缓存行未过期（目录 mtime 未前进），条目为单行 bincode 数据块 | 数百毫秒（含反序列化与排序） |
 | 5 | **全量扫描** | 管理员模式直接读取 $MFT；否则回退目录遍历 | 见[第 5 章](#5-性能) |
+
+对应实现见 `scan.rs` 的 `scan_directory_view`（USN 为第 0 级，其后依次为
+内存缓存 → 内存推导 → 磁盘推导 → 磁盘缓存 → 全量扫描）。
 
 补充说明：
 
@@ -85,7 +91,11 @@ FlashDir 是一个面向 Windows 的磁盘空间分析与可观测性工具。�
   并对目录改名、子树重挂、防幽灵条目等情况做处理。
 - **增量阈值**：实测增量应用约 1.67 ms/条（每条需随机读取 MFT 记录并整块重写缓存），
   全量 MFT 扫描约 2.4–3.5 s，约 2000 条时两者持平；阈值取 1200 以保证增量始终更快。
-- **取消**：扫描过程可取消，取消请求按代次编号隔离，不影响其它路径的扫描。
+- **增量窗口失效**：Journal 回滚、卷变更等导致增量窗口失效时，直接转为全量扫描，
+  不再回退到 mtime 缓存，避免返回陈旧数据。
+- **取消（全局）**：取消请求**不是按路径隔离的**。`cancel::request()` 会记录“取消到当前代次为止”，
+  从而停掉**当前所有在飞扫描**（含分页加载、目录树展开、索引与 USN 相关扫描）；
+  取消之后再新发起的扫描不受影响。因此并发扫描时，一次取消会互相影响。
 
 ### 2.2 全局文件索引与查询
 
@@ -98,16 +108,22 @@ FlashDir 是一个面向 Windows 的磁盘空间分析与可观测性工具。�
 | 关键字段 | `ext:zip`、`name:report`、`dir:node_modules` | 扩展名 / 名称 / 路径包含 |
 | 路径 | `C:\project\CTX-Audit\harness-private\EQM1-METHODOLOGY.md`、`harness-private/EQM1*` | 查询含 `/` 或 `\` 时按“整条路径包含”匹配，可直接粘贴完整路径 |
 | 名称 | `methodology`、`qm1-method` | 按文件名包含匹配（不区分大小写、任意位置）；带 `*` 才按前缀/后缀/通配符处理 |
-| 体积 | `size:>100MB`、`size:<1GB` | 体积比较，支持 B/KB/MB/GB/TB |
-| 时间 | `mtime:>7d`、`mtime:<1h` | 修改时间比较 |
-| 类型 | `type:file`、`type:dir` | 仅文件或仅目录 |
+| 多个词 | `report 2024` | **每个裸词各自成为一个条件**（AND）：匹配名称同时包含 `report` 与 `2024` 的文件 |
+| 短语 | `"report 2024"` | 加引号才是**短语**匹配（要求出现字面量 `report 2024`） |
+| 体积 | `size:>100MB`、`size:<1GB` | 体积比较，支持 B/KB/MB/GB/TB；缺省比较符为 `>=` |
+| 时间 | `mtime:>7d`、`mtime:<1h` | 修改时间比较，支持 s/m/h/d/w/mo/y；缺省比较符为 `<=` |
+| 类型 | `type:file`、`type:dir` | 仅文件或仅目录（接受 `dir`/`directory`/`folder`、`file`/`files`；**其它取值视为无效条件并被忽略**，不会静默变成"只看文件"） |
 | 否定 | `!tmp`、`NOT tmp` | 排除匹配项（两种写法等价） |
-| 组合 | `ext:zip size:>10MB !tmp` | 多条件同时满足 |
+| 组合 | `ext:zip size:>10MB !tmp` | 多条件同时满足（AND）；**不支持 OR** |
 
-- 检索结果返回**命中总数**与分页游标，界面支持“加载更多”、滚动加载、虚拟滚动与 CSV 导出；
-- 工具栏过滤框只过滤**当前目录一层**（命中数即当前列表条数），按 `Enter` 转为全局检索；
+- 检索结果返回**命中总数**与当前页条目，分页为 **offset/limit**（没有游标）：`search_with_filter_paged`
+  取前 `limit + offset` 条再丢弃前 `offset` 条，因此每次翻页都会重跑一次 top-K 收集；界面支持“加载更多”、
+  滚动加载、虚拟滚动与 CSV 导出；
+- 工具栏过滤框过滤的是**本次扫描结果的整棵子树**（命中数即子树内的命中总数，而不是当前页或当前一层），
+  匹配时把条目路径裁成相对扫描根的路径，因此扫描 `C:/Windows` 时输入 `windows` 不会全量命中；按 `Enter` 转为全局检索；
 - 构建完成后按 USN Journal 增量同步：新建、改名、删除、体积变化都会自动跟随（默认 5 分钟一次，间隔可用环境变量 `FLASHDIR_USN_SYNC_SECS` 调整，最小 5 秒）；
-- 索引持久化于本地 SQLite，重启后按增量加载；索引内存结构为连续数组（arena）+
+- 索引持久化于本地 SQLite，重启后由 `load_persisted` 用**全表 `SELECT` 一次性载入**（会先做一次畸形路径修复），
+  之后才进入 USN 增量跟随；索引内存结构为连续数组（arena）+
   路径 128 位哈希索引 + 首字符分桶，`name`、`ext` 等字段按需从路径派生，以降低常驻内存。
 
 ### 2.3 目录分析
@@ -134,9 +150,11 @@ MCP 能力由桌面端本体提供，不产生额外可执行文件：
 - **HTTP 端点**（推荐）：`http://127.0.0.1:<端口>/mcp?token=<本机令牌>`，端口固定（默认 47821，
   被占用时顺延），令牌持久保存，配置长期有效；
 - **stdio 桥接**：`flashdir.exe --bridge`，供仅支持命令式启动的客户端使用；桌面端未运行时会自动启动并等待；
-- 端点与桌面端共享同一份索引与扫描缓存，并继承桌面端的管理员权限；
+- **独立 stdio**：`flashdir.exe --mcp`，不依赖桌面端；其内存索引与扫描缓存为该进程私有，只与桌面端共享同一份 SQLite 缓存库；
+- HTTP 端点与桥接共享桌面端的索引与扫描缓存，并继承桌面端的管理员权限；
 - 提供 13 个工具，除 `save_snapshot` 外均为只读；工具均带 MCP 标准标注
-  （`readOnlyHint` / `destructiveHint` / `openWorldHint`），便于客户端与模型判断副作用。
+  （`readOnlyHint` / `destructiveHint` / `openWorldHint` / `idempotentHint`，其中 `save_snapshot`
+  的只读与幂等标注为 `false`），便于客户端与模型判断副作用。
 
 详见[第 8 章](#8-mcp-参考)。
 
@@ -187,7 +205,7 @@ cli.exe <PATH> [OPTIONS]
 | `F5` | 刷新（优先 USN 增量） |
 | `Ctrl+Shift+R` | 忽略缓存强制全量重扫 |
 | `Esc` | 取消扫描 / 关闭浮层 |
-| `↑ ↓` `Enter` `Space` `Backspace` | 选择 / 打开 / 预览 / 返回上一级 |
+| `↑ ↓` `Enter` `Space` `Backspace` | 选择 / 打开 / 选中并显示到检查器 / 返回上一级 |
 | `Alt+1..6` | 按对应列排序 |
 | `Ctrl+B` / `Ctrl+J` / `Ctrl+I` | 目录树 / 洞察坞 / 检查器显示开关 |
 | `Ctrl+1..5` | 切换洞察坞标签 |
@@ -196,7 +214,8 @@ cli.exe <PATH> [OPTIONS]
 
 ### 3.3 操作约定
 
-- 搜索框输入即过滤当前目录（匹配名称与相对路径），按 `Enter` 使用全局索引检索整个磁盘；
+- 搜索框输入即过滤本次扫描结果（**整棵子树**，按相对扫描根的路径匹配名称与路径，命中数为子树内命中数），
+  按 `Enter` 使用全局索引检索整个磁盘；
 - 文件表双击打开所在位置（目录则进入并扫描）；右键提供打开位置、复制路径、在此过滤、
   检测重复、保存快照等操作；
 - 所有操作均为只读，不包含删除入口。
@@ -221,7 +240,7 @@ cli.exe <PATH> [OPTIONS]
         │
         ▼
 scan_directory_view(路径)
-        │  ① 内存缓存 → ② 磁盘缓存 → ③ 上层推导 → ④ USN 增量 → ⑤ 全量扫描
+        │  ⓪ USN 增量 → ① 内存缓存 → ② 内存上层推导 → ③ 磁盘上层推导 → ④ 磁盘缓存 → ⑤ 全量扫描
         ▼
 ScanView（共享 Arc<Vec<Item>>，零拷贝）
         ├─ 分页 / 排序 / 过滤（IPC 层只返回当前页）
@@ -351,10 +370,10 @@ cd .. && cargo build --release --features custom-protocol
 | 命令 | 说明 |
 |------|------|
 | `flashdir.exe` | 启动图形界面，并在后台开启 MCP 端点 |
-| `flashdir.exe --mcp` | 以 stdio 方式运行 MCP 服务器（独立进程，不创建窗口） |
+| `flashdir.exe --mcp` | 以 stdio 方式运行 MCP 服务器（独立进程，不创建窗口；内存索引/扫描缓存为该进程私有） |
 | `flashdir.exe --bridge` | 桥接到运行中的桌面端端点（必要时自动启动桌面端） |
-| `flashdir.exe --selftest` | MCP 协议与工具自测（11 项） |
-| `flashdir.exe --selftest-endpoint` | MCP HTTP 端点与令牌自测（6 项） |
+| `flashdir.exe --selftest` | MCP 协议与工具自测（断言数量以命令输出为准） |
+| `flashdir.exe --selftest-endpoint` | MCP HTTP 端点与令牌自测（断言数量以命令输出为准） |
 | `flashdir.exe --selftest-bridge` | 桥接链路自测（需桌面端运行） |
 | `flashdir.exe --mcp-help` | 输出 MCP 用法与当前地址 |
 | `flashdir.exe --repair-index` | 修复历史版本写入的畸形索引路径后退出（桌面端启动时也会自动做一次） |
@@ -376,8 +395,8 @@ cd .. && cargo build --release --features custom-protocol
 | `history.json` | 最近扫描历史 |
 | `usn_checkpoint_<盘符>.json` | 各卷 USN 检查点 |
 | `mcp-settings.json` | MCP 设置：`{ "enabled": bool, "port": u16 }` |
-| `mcp-token` | MCP 端点访问令牌（仅当前用户可读） |
-| `mcp-endpoint.json` | 当前端点信息：`{ port, pid, url }` |
+| `mcp-token` | MCP 端点访问令牌（32 个十六进制字符，由 CSPRNG 生成）。代码**没有单独设置 ACL**，其可见范围就是 `%USERPROFILE%\.flashdir\` 目录本身的继承权限（默认仅当前用户与其管理员可读） |
+| `mcp-endpoint.json` | 当前端点信息：`{ port, pid, url }`（**不含令牌**） |
 
 ### 7.2 容量与有效期
 
@@ -392,7 +411,7 @@ cd .. && cargo build --release --features custom-protocol
 
 | 项 | 默认值 | 说明 |
 |----|--------|------|
-| `enabled` | `true` | 关闭后端点不监听任何端口，已有连接断开 |
+| `enabled` | `true` | 关闭后端点**只停止 accept**（不再接受新连接）并删除端点文件；**已建立的连接不会被主动断开**——每个连接是独立的 tokio 任务，其中 SSE 流最长可保持 1 小时 |
 | `port` | `47821` | 起始端口，被占用时按 47822–47825 顺延；修改后约 1 秒内生效，无需重启 |
 
 设置入口：范围条的“设置”按钮，或命令面板中的“设置”命令。
@@ -408,8 +427,12 @@ cd .. && cargo build --release --features custom-protocol
 | HTTP | `http://127.0.0.1:<端口>/mcp?token=<令牌>` | 支持以 URL 方式添加 MCP 服务器的客户端；端口固定、配置长期有效 |
 | stdio | `flashdir.exe --bridge` | 仅支持以命令启动子进程的客户端；桌面端未运行时会自动启动 |
 
-两种方式均可复用桌面端的索引与扫描缓存，并继承其权限级别。
-HTTP 端点仅监听回环地址，未携带有效令牌的请求返回 401。
+HTTP 端点与 `--bridge` 均复用桌面端的索引与扫描缓存，并继承其权限级别；
+`flashdir.exe --mcp` 是独立进程，其内存索引与扫描缓存为该进程私有，只通过同一份 SQLite 缓存库间接共享。
+
+HTTP 端点仅监听回环地址，未携带有效令牌的请求一律返回 401——**对 `GET` / `POST` / `OPTIONS` / `DELETE`
+一致校验**（早期实现的 `OPTIONS` / `DELETE` 不校验令牌，现已修正）；令牌比较走常量时间实现。
+请求体上限 4 MiB（超限 413），单个请求头 8 KiB、最多 100 个头（超限 431）。
 
 ### 8.2 客户端配置
 
@@ -455,23 +478,42 @@ stdio 方式：
 | `compare_snapshots` | 是 | 对比两份快照或“快照与当前状态”，返回净变化与增删改条目 |
 | `disk_usage_trend` | 是 | 基于快照的体积趋势 |
 | `list_volumes` | 是 | 卷容量、文件系统、可用空间 |
-| `cache_stats` | 是 | 磁盘缓存统计 |
+| `cache_stats` | 是 | 磁盘缓存统计（条目数/占用/上限/最早条目；不含内存缓存） |
 | `diagnostics` | 是 | 运行诊断：权限、索引状态、缓存统计、卷列表 |
 
 约定：
 
-- 列表类工具均提供 `limit`（默认 50，上限 1000）与 `truncated` 字段；
+- 列表类工具的 `limit` **各工具不同**（实现侧对越界值一律 clamp 而不是报错）：
+
+  | 工具 | 默认 | 下限 | 上限 |
+  |------|-----:|-----:|-----:|
+  | `search_files` | 50 | 1 | 1000（另有 `offset`，默认 0、上限 1000000） |
+  | `scan_directory` | 50 | 1 | 1000 |
+  | `list_directory` | 50 | 1 | 1000 |
+  | `find_large_files` | 50 | 1 | 1000 |
+  | `find_duplicates` | 20 | 1 | 200 |
+  | `analyze_dev_cache` | 10 | 1 | 50 |
+  | `compare_snapshots` | 20 | 1 | 200（每类条目） |
+  | `disk_usage_trend` | 30 | 2 | 200（时间点个数） |
+
+  `list_volumes`、`cache_stats`、`diagnostics`、`list_snapshots`、`save_snapshot` 不接受 `limit`。
+- `search_files`、`scan_directory`、`list_directory`、`find_large_files`、`find_duplicates`
+  的响应带 `truncated` 字段；其余列表类工具只返回截断后的结果；
 - 响应主体为 JSON 文本，包含 `summary` 字段用于快速摘要；
-- 取数时优先使用内存缓存，响应中的 `source` 标明数据来源（`memory-cache` / `disk` / `scan` 等）；
+- 取数时优先命中内存缓存；`scan_directory` / `list_directory` 的响应带 `source` 标明扫描来源
+  （`memory` / `disk` / `usn` / `usn-disk` / `memory-derived` / `disk-derived` / `scan`），
+  `save_snapshot` 的 `source` 则是 `memory-cache`（命中进程内缓存）或上述扫描来源之一；
 - 路径参数须为存在的本地路径。
 
 ### 8.4 自测
 
 ```powershell
-flashdir.exe --selftest            # 协议与工具（11 项）
-flashdir.exe --selftest-endpoint   # HTTP 端点与令牌（6 项，含错误令牌应被拒绝）
+flashdir.exe --selftest            # 协议与工具
+flashdir.exe --selftest-endpoint   # HTTP 端点与令牌（含错误令牌应被拒绝）
 flashdir.exe --selftest-bridge     # 桥接链路（需桌面端运行）
 ```
+
+三项自测均以**退出码 0 表示通过**（断言数量以命令输出为准，会随测试集扩充而变化）。
 
 设计与实现细节见 [`docs/mcp-design.md`](docs/mcp-design.md)。
 
@@ -481,9 +523,9 @@ flashdir.exe --selftest-bridge     # 桥接链路（需桌面端运行）
 
 | 项目 | 命令 | 说明 |
 |------|------|------|
-| 单元测试 | `cargo test --release --lib` | 覆盖查询语法、索引更新与检索分页、卷枚举、聚合等 |
+| 单元测试 | `cargo test --release --lib` | 覆盖查询语法、索引更新与检索分页、卷枚举、聚合等；通过情况以命令输出为准（测试集仍在扩充，不固定断言数） |
 | 基准测试 | `cargo test --release --lib -- --ignored --nocapture bench` | 聚合、排序、检索基准 |
-| MCP 自测 | 见 [8.4](#84-自测) | 协议、端点、桥接 |
+| MCP 自测 | 见 [8.4](#84-自测) | 协议、端点、桥接，退出码 0 为通过 |
 | 命令行验证 | `cli.exe <路径> --filter "ext:zip size:>10MB"` | 与桌面端一致的过滤语义 |
 
 ---
@@ -492,9 +534,10 @@ flashdir.exe --selftest-bridge     # 桥接链路（需桌面端运行）
 
 | 类别 | 说明 |
 |------|------|
+| 平台 | **仅支持 Windows（x64）**。Rust 工程依赖 Windows 专有的 MFT/USN/文件系统 API（见 [1.2](#12-系统要求)），非 Windows 目标当前无法编译 |
 | 权限 | 非管理员模式无法读取 $MFT 与 USN Journal，扫描回退为目录遍历（速度显著降低），数据新鲜度依赖目录修改时间 |
 | 访问时间 | Windows 可关闭“最后访问时间”更新；此时界面会标注该列不可用，并回退显示修改时间，不将其解释为访问热度 |
-| 文件系统 | 全局索引与 MFT 能力仅覆盖 NTFS 卷；其它文件系统仅在目录遍历模式下可扫描 |
+| 文件系统 | 全局索引与 MFT 能力仅覆盖 NTFS 卷；非 NTFS（如 FAT32/exFAT/网络盘）只能走目录遍历。注意：**应用整体只在 Windows 上构建与运行**，此处描述的是卷类型差异，不是跨平台能力 |
 | 目录体积 | 目录体积为其后代文件体积之和；存在硬链接、稀疏文件或重解析点时，结果可能与资源管理器显示略有差异 |
 | 只读定位 | 本应用不提供删除、移动等操作；清理类功能仅用于定位与建议 |
 | 快照占用 | 快照保存在本地缓存库中并占用磁盘空间，单目录保留 50 份 / 30 天，可在“快照对比”中删除 |

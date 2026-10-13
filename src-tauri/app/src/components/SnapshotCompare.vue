@@ -186,7 +186,14 @@ async function openPath(p) {
           <div class="diff-col">
             <h5>删除 / 缩小（{{ removed.length + modified.filter((m) => m.delta < 0).length }}）</h5>
             <div class="list">
-              <div v-for="i in removed" :key="'r' + i.path" class="diff-row del" :title="i.path">
+              <!-- 已删除项的文件在磁盘上已经不存在，不做 @click（同列"缩小"项仍可用）；
+                   用 gone 类显式去掉可点击外观，避免误导用户以为能打开。 -->
+              <div
+                v-for="i in removed"
+                :key="'r' + i.path"
+                class="diff-row del gone"
+                :title="i.path + '（快照对比：该项已被删除，无法打开）'"
+              >
                 <span class="d">-{{ formatSizeCompact(i.size) }}</span>
                 <span class="p">{{ i.path }}</span>
               </div>
@@ -213,7 +220,6 @@ async function openPath(p) {
 }
 .snap-row:last-child { border-bottom: 0; }
 .snap-row:hover { background: var(--hover); }
-.snap-row.o
 .snap-row.on { background: var(--sel); color: var(--tx-0); }
 .snap-row .t { width: 120px; }
 .snap-row .c { width: 84px; color: var(--tx-3); }
@@ -221,4 +227,7 @@ async function openPath(p) {
 .snap-diff { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .diff-summary { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
 .diff-cols { flex: 1; min-height: 0; }
+/* 已删除项：去掉 .diff-row:hover 的高亮与手型，明确"不可打开" */
+.diff-row.gone { cursor: default; }
+.diff-row.gone:hover { background: none; }
 </style>

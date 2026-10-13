@@ -1258,7 +1258,9 @@ fn try_mft_scan_path(
         dir_count,
         throughput_mbps,
         memory_peak_mb,
-        threads_used: 1, // MFT 扫描是单线程顺序读取
+        // MFT 路径是"顺序读取 + rayon 并行解析记录"，旧实现硬编码 1 与事实不符，
+        // 会让诊断/性能面板低估实际并行度。这里报告解析阶段真正可用的线程数。
+        threads_used: rayon::current_num_threads().max(1),
         mft_available: true,
         verified_usn,
     })
@@ -1311,7 +1313,13 @@ fn save_usn_checkpoint(
 fn usn_checkpoint_path(drive: char) -> std::path::PathBuf {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        // 两个环境变量都缺失时，旧实现 `unwrap_or_default()` 会退化成**相对路径**，
+        // 把 ".flashdir/usn_checkpoint_X.json" 写进进程当前工作目录（与 disk_cache
+        // 在同样情况下直接报错降级的行为也不一致）。退到临时目录：检查点只是缓存，
+        // 由同一个函数一致地读写即可，且不污染 CWD。
+        .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().into_owned());
     let mut p = std::path::PathBuf::from(home);
     p.push(".flashdir");
     p.push(format!("usn_checkpoint_{}.json", drive));

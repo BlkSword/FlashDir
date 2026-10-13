@@ -9,23 +9,31 @@
 //! 3. 内存水位查询与"重活前守卫"：尽量不走到分配失败那一步。
 //!
 //! 日志位置：`~/.flashdir/diag.log`（环境变量 `FLASHDIR_DIAG_LOG` 可重定向，
-//! 便于自测与支持时收集），单个文件超过 1MB 在下次启动时重建，不会长期占盘。
+//! 便于自测与支持时收集），单个文件超过 1MB 会重建：启动时检查一次，
+//! 长会话内再由 `log_line` 按累积字节数触发轮转（不做每行 stat），不会无限增长。
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// 日志文件上限；超过后在下次打开时重建（崩溃日志只关心最近一次问题）。
+/// 日志文件上限；超过后重建（崩溃日志只关心最近一次问题）。
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 /// 保留最近多少次重活记录，写进 panic 日志用于定位。
 const MAX_BREADCRUMBS: usize = 24;
 /// 分配失败日志的固定前缀（无分配路径只写这块静态内容）。
 const OOM_PREFIX: &[u8] = b"ALLOC-FAIL bytes=";
+/// 分配失败行的栈缓冲长度：时间戳(22) + 前缀(17) + 20 位十进制 + 换行，留足余量。
+const OOM_BUF_LEN: usize = 96;
+/// 估算每行日志的固定开销："[YYYY-MM-DD HH:MM:SS] " + 换行 ≈ 23 字节。
+/// 只用于轮转阈值的粗略累计（宁可多算一点），不追求精确字节数。
+const LOG_LINE_OVERHEAD: u64 = 24;
 
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 static LOG_FILE: OnceLock<Mutex<Option<std::fs::File>>> = OnceLock::new();
 static LOG_HANDLE: AtomicIsize = AtomicIsize::new(0);
+/// 本次进程已写入日志的累计字节数（长会话轮转用，避免每行 stat）。
+static LOG_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static BREADCRUMBS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static INSTALLED: AtomicBool = AtomicBool::new(false);
 
@@ -53,7 +61,11 @@ pub fn log_path() -> PathBuf {
         .clone()
 }
 
-fn open_log() -> Option<std::fs::File> {
+/// 打开日志文件；`force_fresh` 为 true 时无条件截断重建（会话内轮转用）。
+///
+/// 同时把"已写字节数"基线与 OOM 用的原始句柄同步好：长会话里 `log_line`
+/// 只靠这个计数判断是否需要轮转，不再对文件做 stat。
+fn open_log_inner(force_fresh: bool) -> Option<std::fs::File> {
     let path = log_path();
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -61,30 +73,38 @@ fn open_log() -> Option<std::fs::File> {
         }
     }
     // 超限则重建：先删后建，保证单文件不会无限增长
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > MAX_LOG_BYTES {
-            let _ = std::fs::remove_file(&path);
-        }
+    let existing = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    let reset = force_fresh || existing > MAX_LOG_BYTES;
+    if reset {
+        let _ = std::fs::remove_file(&path);
     }
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
-        .ok()
+        .ok();
+
+    // 轮转基线：进程启动时按已有文件长度起步，之后由 log_line 累加本次写入量
+    LOG_BYTES_WRITTEN.store(if reset { 0 } else { existing }, Ordering::Relaxed);
+    // OOM 路径只能拿原始句柄写文件，句柄要跟着轮转一起更新
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::io::AsRawHandle;
+        LOG_HANDLE.store(
+            file.as_ref().map_or(0, |f| f.as_raw_handle() as isize),
+            Ordering::Relaxed,
+        );
+    }
+    file
+}
+
+fn open_log() -> Option<std::fs::File> {
+    open_log_inner(false)
 }
 
 fn slot() -> &'static Mutex<Option<std::fs::File>> {
-    LOG_FILE.get_or_init(|| {
-        let file = open_log();
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::io::AsRawHandle;
-            if let Some(f) = file.as_ref() {
-                LOG_HANDLE.store(f.as_raw_handle() as isize, Ordering::Relaxed);
-            }
-        }
-        Mutex::new(file)
-    })
+    // 打开失败时的降级、句柄登记都在 open_log_inner 里统一处理
+    LOG_FILE.get_or_init(|| Mutex::new(open_log()))
 }
 
 /// 追加一行日志（同时输出到 stderr，方便命令行运行时直接看到）。
@@ -98,6 +118,14 @@ pub fn log_line(msg: &str) {
             let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
             let _ = writeln!(file, "[{ts}] {msg}");
             let _ = file.flush();
+
+            // 长会话轮转：旧实现只在打开时检查一次 1MB，进程活多久日志就能涨多久。
+            // 这里按累积写入量做一次廉价判断（不 stat），超限立刻截断重建。
+            let line_bytes = msg.len() as u64 + LOG_LINE_OVERHEAD;
+            let written = LOG_BYTES_WRITTEN.fetch_add(line_bytes, Ordering::Relaxed) + line_bytes;
+            if written > MAX_LOG_BYTES {
+                *guard = open_log_inner(true);
+            }
         }
     }
     eprintln!("[diag] {msg}");
@@ -157,17 +185,11 @@ pub fn alloc_failed(layout: std::alloc::Layout) -> ! {
     std::alloc::handle_alloc_error(layout)
 }
 
-/// 把分配失败信息写进固定缓冲（无分配），返回写入长度。
-fn oom_line(buf: &mut [u8; 64], bytes: u64) -> usize {
-    let mut len = 0usize;
-    for byte in OOM_PREFIX {
-        buf[len] = *byte;
-        len += 1;
-    }
-    // 手工十进制转换，避免格式化（可能分配）
+/// 手工写入十进制（无分配）。`width` 为最小宽度，不足时左侧补 '0'。
+/// 返回 false 表示缓冲不足（正常调用不会发生，纯属防御）。
+fn write_decimal(buf: &mut [u8], len: &mut usize, mut value: u64, width: usize) -> bool {
     let mut digits = [0u8; 20];
     let mut used = 0usize;
-    let mut value = bytes as u64;
     loop {
         digits[used] = b'0' + (value % 10) as u8;
         value /= 10;
@@ -176,11 +198,107 @@ fn oom_line(buf: &mut [u8; 64], bytes: u64) -> usize {
             break;
         }
     }
+    while used < width && used < digits.len() {
+        digits[used] = b'0';
+        used += 1;
+    }
     while used > 0 {
         used -= 1;
-        buf[len] = digits[used];
+        if *len >= buf.len() {
+            return false;
+        }
+        buf[*len] = digits[used];
+        *len += 1;
+    }
+    true
+}
+
+/// 把字段拼成固定宽度 "YYYY-MM-DD HH:MM:SS"（19 字节，无分配）。
+fn timestamp_fields(out: &mut [u8; 19], parts: [u64; 6]) -> bool {
+    let [y, mo, d, h, mi, s] = parts;
+    let mut n = 0usize;
+    write_decimal(out, &mut n, y, 4)
+        && {
+            out[n] = b'-';
+            n += 1;
+            write_decimal(out, &mut n, mo, 2)
+        }
+        && {
+            out[n] = b'-';
+            n += 1;
+            write_decimal(out, &mut n, d, 2)
+        }
+        && {
+            out[n] = b' ';
+            n += 1;
+            write_decimal(out, &mut n, h, 2)
+        }
+        && {
+            out[n] = b':';
+            n += 1;
+            write_decimal(out, &mut n, mi, 2)
+        }
+        && {
+            out[n] = b':';
+            n += 1;
+            write_decimal(out, &mut n, s, 2)
+        }
+        && n == out.len()
+}
+
+/// 取本地时间并格式化成 19 字节时间戳。
+///
+/// 分配失败路径禁止任何堆分配：这里只用 `GetLocalTime`（结果写进栈上结构体），
+/// 不走 `chrono::Local::now()`（它可能为时区数据分配）。
+fn timestamp_bytes(out: &mut [u8; 19]) -> bool {
+    #[cfg(target_os = "windows")]
+    let parts: Option<[u64; 6]> = unsafe {
+        use windows_sys::Win32::Foundation::SYSTEMTIME;
+        use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+        let mut st: SYSTEMTIME = std::mem::zeroed();
+        GetLocalTime(&mut st);
+        Some([
+            st.wYear as u64,
+            st.wMonth as u64,
+            st.wDay as u64,
+            st.wHour as u64,
+            st.wMinute as u64,
+            st.wSecond as u64,
+        ])
+    };
+    #[cfg(not(target_os = "windows"))]
+    let parts: Option<[u64; 6]> = None;
+
+    match parts {
+        Some(parts) => timestamp_fields(out, parts),
+        None => false,
+    }
+}
+
+/// 把分配失败信息写进固定缓冲（无分配），返回写入长度。
+/// 旧实现没有时间戳：进程闪退后无法把这条记录对齐到具体时刻。
+fn oom_line(buf: &mut [u8; OOM_BUF_LEN], bytes: u64) -> usize {
+    let mut len = 0usize;
+
+    // 时间戳：[YYYY-MM-DD HH:MM:SS] ，与 log_line 的行首格式一致
+    let mut ts = [b'0'; 19];
+    if timestamp_bytes(&mut ts) {
+        buf[len] = b'[';
+        len += 1;
+        buf[len..len + ts.len()].copy_from_slice(&ts);
+        len += ts.len();
+        buf[len] = b']';
+        len += 1;
+        buf[len] = b' ';
         len += 1;
     }
+
+    for byte in OOM_PREFIX {
+        buf[len] = *byte;
+        len += 1;
+    }
+    // 手工十进制转换，避免格式化（可能分配）
+    let _ = write_decimal(buf, &mut len, bytes, 1);
     buf[len] = b'\n';
     len += 1;
 
@@ -192,7 +310,7 @@ fn write_oom_line(bytes: usize) {
     if handle == 0 {
         return;
     }
-    let mut buf = [b' '; 64];
+    let mut buf = [b' '; OOM_BUF_LEN];
     let len = oom_line(&mut buf, bytes as u64);
     #[cfg(target_os = "windows")]
     unsafe {
@@ -259,22 +377,56 @@ pub fn ensure_memory_available(need_mb: u64, what: &str) -> Result<u64, String> 
 mod tests {
     use super::*;
 
-    /// 分配失败日志必须在"禁止分配"的前提下格式化出来（含边界值）。
+    /// 分配失败日志必须在"禁止分配"的前提下格式化出来（含边界值），
+    /// 并且必须带时间戳（旧实现没有，事后无法对齐崩溃时刻）。
     #[test]
     fn oom_line_formats_without_allocation() {
-        let mut buf = [b' '; 64];
+        let mut buf = [b' '; OOM_BUF_LEN];
         let n = oom_line(&mut buf, 59097);
+        assert!(n <= OOM_BUF_LEN);
         let text = std::str::from_utf8(&buf[..n]).unwrap();
-        assert!(text.starts_with("ALLOC-FAIL bytes=59097"), "实际: {text}");
+        assert!(text.starts_with('['), "OOM 行必须以时间戳开头，实际: {text}");
+        assert!(
+            text.contains("ALLOC-FAIL bytes=59097"),
+            "实际: {text}"
+        );
         assert_eq!(buf[n - 1], 10, "必须以换行结尾");
 
-        for bytes in [1u64, 9, 10, 99, 100, u64::MAX / 2] {
-            let mut buf = [b' '; 64];
+        for bytes in [0u64, 1, 9, 10, 99, 100, u64::MAX / 2, u64::MAX] {
+            let mut buf = [b' '; OOM_BUF_LEN];
             let n = oom_line(&mut buf, bytes);
+            assert!(n <= OOM_BUF_LEN);
             let text = std::str::from_utf8(&buf[..n]).unwrap();
-            assert!(text.starts_with("ALLOC-FAIL bytes="));
-            assert_eq!(text.trim_end().len(), "ALLOC-FAIL bytes=".len() + bytes.to_string().len());
+            assert!(
+                text.contains(&format!("ALLOC-FAIL bytes={bytes}")),
+                "实际: {text}"
+            );
             assert_eq!(buf[n - 1], 10);
+        }
+    }
+
+    /// 时间戳拼接必须固定宽度且无分配（用固定字段自测，与系统时区无关）。
+    #[test]
+    fn timestamp_is_fixed_width() {
+        let mut out = [0u8; 19];
+        assert!(timestamp_fields(&mut out, [2025, 1, 2, 3, 4, 5]));
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            "2025-01-02 03:04:05"
+        );
+
+        // 年份/月日补零；十进制不越界
+        let mut out = [0u8; 19];
+        assert!(timestamp_fields(&mut out, [999, 12, 31, 23, 59, 59]));
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            "0999-12-31 23:59:59"
+        );
+
+        // 取本地时间也要能写满 19 字节（Windows 上永远成功；其他平台允许失败）
+        let mut now = [0u8; 19];
+        if timestamp_bytes(&mut now) {
+            assert!(std::str::from_utf8(&now).unwrap().contains('-'));
         }
     }
 
@@ -296,5 +448,36 @@ mod tests {
     fn log_path_is_resolvable() {
         let path = log_path();
         assert!(!path.as_os_str().is_empty());
+    }
+
+    /// 长会话轮转（手动运行，需要独占进程级 `FLASHDIR_DIAG_LOG`）：
+    /// `cargo test --lib -- --ignored --exact diag::tests::rotation_truncates_in_long_session`
+    ///
+    /// 旧实现只在打开时检查一次 1MB，长会话里日志可以无限增长；这里写够
+    /// 三倍上限，验证文件在会话内被轮转截断。
+    #[test]
+    #[ignore = "需要独占 FLASHDIR_DIAG_LOG 环境变量，手动运行"]
+    fn rotation_truncates_in_long_session() {
+        if LOG_PATH.get().is_some() {
+            eprintln!("[skip] 日志路径已被初始化，请单独运行本测试（--exact）");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("flashdir-diag-rotation-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("diag.log");
+        std::env::set_var("FLASHDIR_DIAG_LOG", &path);
+
+        let filler = "x".repeat(4096);
+        let lines = 3 * (MAX_LOG_BYTES / 4096) as usize;
+        for i in 0..lines {
+            log_line(&format!("轮转自测 {i} {filler}"));
+        }
+
+        let len = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            len <= MAX_LOG_BYTES + 8192,
+            "长会话日志必须被轮转截断，实际 {len} 字节（上限 {MAX_LOG_BYTES}）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

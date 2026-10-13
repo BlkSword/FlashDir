@@ -1,15 +1,19 @@
 //! MCP（Model Context Protocol）核心：协议 + 工具实现。
 //!
-//! 三种运行形态共用本模块：
-//! 1. **stdio**（`flashdir-mcp.exe`）：Host 直接以子进程启动，最简部署；
+//! 三种运行形态共用本模块，且都复用同一个可执行文件 `flashdir.exe`
+//! （不存在独立的 `flashdir-mcp.exe`；Host 通过参数选择形态）：
+//! 1. **stdio**（`flashdir.exe --mcp`）：Host 直接以子进程启动；该进程的
+//!    内存索引/扫描缓存是**私有**的，只经 SQLite 持久化索引间接共享；
 //! 2. **本机端点**（GUI 内后台线程）：`127.0.0.1` + 一次性 token，
 //!    与桌面端**共享同一份索引与扫描缓存**（热态、且继承管理员权限 → 可走 MFT 直读）；
-//! 3. **桥接**（`flashdir-mcp.exe --bridge`）：Host 的 stdio ↔ GUI 本机端点，
-//!    GUI 未运行时自动拉起并等待就绪。
+//! 3. **桥接**（`flashdir.exe --bridge`）：Host 的 stdio ↔ GUI 本机端点，
+//!    GUI 未运行时自动拉起并等待就绪（因此实际取数发生在 GUI 进程内）。
 //!
 //! 为什么用 127.0.0.1 而不是命名管道：GUI 通常以管理员运行，
 //! 命名管道的强制完整性标签会阻止非管理员进程（Host 启动的桥）读写；
-//! 本机回环 + 仅当前用户可读的 token 文件既跨完整性级别可用，也不对外开放。
+//! 本机回环 + token 文件既跨完整性级别可用，也不对外开放。
+//! 注意：token 文件的可见范围就是 `%USERPROFILE%\.flashdir\` 的继承权限，
+//! 代码并没有单独设置 ACL。
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -19,9 +23,27 @@ use std::sync::{Arc, LazyLock, Mutex};
 /// 支持的协议版本（按新→旧）；回包选择双方都支持的最新版本
 const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 const SERVER_NAME: &str = "flashdir";
-/// 本机端点握手超时 / 桥接等待 GUI 就绪的上限
-const HANDSHAKE_TIMEOUT_MS: u64 = 5000;
+/// 桥接等待 GUI 就绪的上限
 const GUI_WAIT_TIMEOUT_MS: u64 = 25000;
+
+/* ─── 本机端点请求限额（旧实现完全没有上限，见 handle_http_conn） ─── */
+
+/// POST body 上限：旧实现直接 `vec![0u8; len]`，客户端只要声明一个
+/// 超大 Content-Length（如 100GB）就能让端点进程按声明值一次性分配，
+/// 内存瞬间被打爆。这里设为 4 MiB——MCP 请求都是小 JSON 消息，
+/// 正常调用远小于该值；超限直接回 413 而不是"截断后继续解析"，
+/// 避免把半个 JSON 当请求处理。
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// 单个请求头上限（含 CRLF）：旧实现用 read_line 读整行，一个不含换行的
+/// 超长行会被无界膨胀成巨型 String。8 KiB 足够容纳任何正常头。
+const MAX_HEADER_LINE_BYTES: usize = 8 * 1024;
+/// 请求头数量上限：旧实现无上限，客户端可以逐行灌入无限多的头把
+/// headers Vec 撑爆。100 个足够覆盖 Host/UA/Accept/Authorization 等常规头。
+const MAX_HEADER_COUNT: usize = 100;
+
+/// search_files 的分页偏移上限：与 limit 的 clamp 配套，避免
+/// 超大 offset 让索引侧做无意义的越界计算
+const MAX_OFFSET: usize = 1_000_000;
 
 /* ─── 运行状态（供桌面端状态栏展示"谁在用我的磁盘数据"） ─────── */
 
@@ -203,18 +225,23 @@ pub fn tool_definitions() -> Vec<Value> {
     let mut tools = base_tool_definitions();
     // 统一补 MCP 工具标注：除 save_snapshot 外全部只读
     for t in tools.iter_mut() {
-        let read_only = t
+        let name = t
             .get("name")
             .and_then(|n| n.as_str())
-            .map(|n| n != "save_snapshot")
-            .unwrap_or(true);
+            .unwrap_or("")
+            .to_string();
+        let read_only = name != "save_snapshot";
+        // idempotentHint：旧实现对每个工具都无条件写 true，但 save_snapshot
+        // 每次调用都会 insert_snapshot 生成一个**新** id，重复调用产生新记录，
+        // 语义上并非幂等，因此这里按工具区分（其余只读工具保持 true）。
+        let idempotent = name != "save_snapshot";
         if let Some(obj) = t.as_object_mut() {
             obj.insert(
                 "annotations".to_string(),
                 json!({
                     "readOnlyHint": read_only,
                     "destructiveHint": false,
-                    "idempotentHint": true,
+                    "idempotentHint": idempotent,
                     "openWorldHint": false,
                 }),
             );
@@ -237,8 +264,8 @@ fn base_tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "query": { "type": "string", "description": "查询表达式，例如 \"*.pdf size:>10MB\"" },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "返回条数（默认 50）" },
-                    "offset": { "type": "integer", "minimum": 0, "description": "分页偏移（默认 0）" }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "返回条数（默认 50）。实现侧对超出 [1,1000] 的值做 clamp，而不是报错" },
+                    "offset": { "type": "integer", "minimum": 0, "maximum": 1000000, "description": "分页偏移（默认 0）。实现侧把超过 1000000 的值 clamp 到 1000000（旧实现完全不设上限）" }
                 },
                 "required": ["query"],
                 "additionalProperties": false
@@ -268,6 +295,10 @@ fn base_tool_definitions() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
+                    // force：实现（arg_bool(args, "force") → scan_directory_view）一直会读它，
+                    // 但旧 schema 漏声明；additionalProperties=false 下客户端按 schema
+                    // 生成参数就会丢掉它，导致"强制刷新"静默失效。这里与 scan_directory 对齐。
+                    "force": { "type": "boolean", "description": "忽略缓存强制重新扫描（默认 false）" },
                     "sort": { "type": "string", "enum": ["size", "name", "mtime", "atime"] },
                     "direction": { "type": "string", "enum": ["desc", "asc"] },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000 },
@@ -438,7 +469,9 @@ pub async fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
         "search_files" => {
             let query = arg_str(args, "query").ok_or("缺少参数 query")?;
             let limit = arg_usize(args, "limit", 50).clamp(1, 1000);
-            let offset = arg_usize(args, "offset", 0);
+            // 旧实现只 clamp 了 limit，offset 直接透传：客户端给个 usize 级别的
+            // 超大偏移就能让索引侧做无意义的越界计算/分配。上限与 schema 声明一致。
+            let offset = arg_usize(args, "offset", 0).min(MAX_OFFSET);
             let idx = crate::global_search::instance();
             // 索引在后台加载：等一小会儿（首次调用很常见），避免直接返回"未就绪"
             let ready = wait_index_ready(idx, 3000).await;
@@ -718,27 +751,44 @@ pub async fn call_tool(name: &str, args: &Value) -> Result<Value, String> {
                         "fileCount": g.file_count,
                         "wasted": g.wasted_bytes,
                         "wastedFormatted": g.wasted_formatted,
+                        // 组内硬链接数（>0 时 wasted 已排除硬链接，见 hardlinkNote）
+                        "hardlinkCount": g.hardlink_count,
                         // 每组最多列 5 个路径，避免响应过大
                         "files": g.files.iter().take(5).map(|f| f.path.clone()).collect::<Vec<_>>(),
                     })
                 })
                 .collect();
-            Ok(tool_text(
-                json!({
-                    "summary": format!(
-                        "重复文件 {} 组 / {} 个文件，可回收 {}（来源 {}）",
-                        res.total_groups, res.total_files, res.total_wasted_formatted, source
-                    ),
-                    "path": path,
-                    "totalGroups": res.total_groups,
-                    "totalFiles": res.total_files,
-                    "totalWastedBytes": res.total_wasted_bytes,
-                    "totalWastedFormatted": res.total_wasted_formatted,
-                    "truncated": res.total_groups > groups.len(),
-                    "groups": groups,
-                })
-                .to_string(),
-            ))
+            // 硬链接指向同一份数据，删掉多余"副本"并不释放空间；duplicate_finder 已把
+            // 它们排除在 wasted 之外。必须把这一点透出给模型，否则它可能照着
+            // totalWastedFormatted 建议用户去删硬链接。
+            let summary = match &res.hardlink_note {
+                Some(note) => format!(
+                    "重复文件 {} 组 / {} 个文件，可回收 {}（来源 {}；{}）",
+                    res.total_groups, res.total_files, res.total_wasted_formatted, source, note
+                ),
+                None => format!(
+                    "重复文件 {} 组 / {} 个文件，可回收 {}（来源 {}）",
+                    res.total_groups, res.total_files, res.total_wasted_formatted, source
+                ),
+            };
+            let mut body = json!({
+                "summary": summary,
+                "path": path,
+                "totalGroups": res.total_groups,
+                "totalFiles": res.total_files,
+                "totalWastedBytes": res.total_wasted_bytes,
+                "totalWastedFormatted": res.total_wasted_formatted,
+                "truncated": res.total_groups > groups.len(),
+                "groups": groups,
+            });
+            // 仅在确实存在硬链接时追加字段，保持无硬链接场景的响应形状不变（向后兼容）
+            if res.hardlink_files > 0 {
+                body["hardlinkFiles"] = json!(res.hardlink_files);
+                if let Some(note) = &res.hardlink_note {
+                    body["hardlinkNote"] = json!(note);
+                }
+            }
+            Ok(tool_text(body.to_string()))
         }
 
         "analyze_dev_cache" => {
@@ -1124,7 +1174,10 @@ pub async fn serve_stdio() {
 /// 自测：脚本化会话，校验协议与工具返回结构（不依赖 Host）
 pub async fn selftest() -> i32 {
     let mut failures = 0usize;
+    // 断言总数：末尾汇总输出用它，避免手工维护"共 N 项"文案后与实际断言数脱节
+    let mut total = 0usize;
     let mut check = |name: &str, ok: bool, detail: &str| {
+        total += 1;
         if ok {
             eprintln!("  [PASS] {}", name);
         } else {
@@ -1157,9 +1210,48 @@ pub async fn selftest() -> i32 {
         serde_json::from_str(&handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#).await.unwrap_or_default())
             .unwrap_or(Value::Null);
     let tools = resp["result"]["tools"].as_array().cloned().unwrap_or_default();
-    check("tools/list 返回工具清单", tools.len() >= 6, &format!("{} tools", tools.len()));
+    // 旧断言只要求 `len >= 6`：13 个工具掉到 6 个（例如 schema 构建/注册出错）
+    // 依然 PASS，等于没有保护。这里按实际定义数精确断言。
+    check(
+        "tools/list 返回全部 13 个工具",
+        tools.len() == 13,
+        &format!("{} tools", tools.len()),
+    );
     let all_have_schema = tools.iter().all(|t| t["inputSchema"]["type"] == "object" && t["name"].is_string());
     check("每个工具都有 name 与 inputSchema", all_have_schema, "");
+    // 旧断言完全不看 annotations：标注整体丢失（或 readOnlyHint 被写反）
+    // 时自测仍然 PASS。这里补上"存在性 + readOnlyHint 方向"两类校验。
+    let all_have_annotations = tools
+        .iter()
+        .all(|t| t["annotations"].is_object() && t["annotations"]["readOnlyHint"].is_boolean());
+    check(
+        "每个工具都有 annotations（含布尔 readOnlyHint）",
+        all_have_annotations,
+        &tools
+            .iter()
+            .filter(|t| !t["annotations"].is_object())
+            .map(|t| t["name"].as_str().unwrap_or("?").to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    // save_snapshot 会写快照库，必须 readOnlyHint=false；其余工具必须 true
+    let read_only_flags_ok = tools.iter().all(|t| {
+        let expect_read_only = t["name"].as_str().unwrap_or("") != "save_snapshot";
+        t["annotations"]["readOnlyHint"] == expect_read_only
+    });
+    check(
+        "readOnlyHint 与工具语义一致（仅 save_snapshot 为 false）",
+        read_only_flags_ok,
+        &tools
+            .iter()
+            .map(|t| format!(
+                "{}={}",
+                t["name"].as_str().unwrap_or("?"),
+                t["annotations"]["readOnlyHint"]
+            ))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
 
     // 4) 未知方法 → -32601
     let resp: Value = serde_json::from_str(
@@ -1239,10 +1331,10 @@ pub async fn selftest() -> i32 {
     );
 
     if failures == 0 {
-        eprintln!("[MCP] 自测全部通过 ✅");
+        eprintln!("[MCP] 自测全部通过 ✅（共 {} 项断言）", total);
         0
     } else {
-        eprintln!("[MCP] 自测失败 {} 项 ❌", failures);
+        eprintln!("[MCP] 自测失败 {} 项 ❌（共 {} 项断言）", failures, total);
         1
     }
 }
@@ -1254,8 +1346,15 @@ pub async fn selftest() -> i32 {
 pub const DEFAULT_MCP_PORT: u16 = 47821;
 const PORT_FALLBACKS: u16 = 5;
 
+/// 配置目录 `~/.flashdir`。
+/// 旧实现只读 `USERPROFILE`，该变量缺失时直接返回 None → 令牌每次启动
+/// 重新随机、且不落盘，配置里已经复制的 URL 立刻失效。这里补 `HOME` 回退，
+/// 与 `diag.rs` / `disk_cache.rs` 的做法保持一致。
 fn flashdir_dir() -> Option<std::path::PathBuf> {
-    let home = std::env::var("USERPROFILE").ok()?;
+    let home = std::env::var("USERPROFILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("HOME").ok().filter(|s| !s.trim().is_empty()))?;
     Some(std::path::PathBuf::from(home).join(".flashdir"))
 }
 
@@ -1268,18 +1367,15 @@ fn token_file_path() -> Option<std::path::PathBuf> {
     Some(flashdir_dir()?.join("mcp-token"))
 }
 
+/// 生成 32 位十六进制令牌。
+/// 旧实现用 `时间纳秒 ^ pid ^ 栈地址` 再跑一次 xorshift：输出可被同机进程
+/// 观测并猜测（时间与 pid 都可枚举），不是密码学安全的随机源。
+/// 这里改用已有的 `uuid` 依赖（Cargo.toml 已启用 `v4` feature，底层 getrandom
+/// 是 CSPRNG）：两次 UUIDv4 的"无连字符"形式各 32 位十六进制，拼起来正好 32 字符。
 fn random_hex() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id() as u128;
-    let stack = &now as *const _ as u128;
-    let mut x = now ^ (pid << 64) ^ stack.rotate_left(17);
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    format!("{:032x}", x)
+    let a = uuid::Uuid::new_v4().simple().to_string();
+    let b = uuid::Uuid::new_v4().simple().to_string();
+    format!("{}{}", &a[..16], &b[..16])
 }
 
 /// 持久 token：首次生成后固定保存在 `~/.flashdir/mcp-token`，
@@ -1506,8 +1602,32 @@ fn http_reason(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         411 => "Length Required",
+        413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
         _ => "OK",
     }
+}
+
+/// 常量时间字节比较：用于令牌校验。
+/// 旧实现直接 `t == token` / `v == token`——`==` 在首个不同字节处提前返回，
+/// 攻击者可从响应耗时的统计差异逐字节恢复令牌。这里对**长度与内容都不提前返回**：
+/// 先累积长度异或（长度不同也不能短路），再对所有位置做按位或累积。
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u8;
+    // 以较长者为基准遍历；越界一侧取 0，长度差已计入 diff
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// 令牌校验（Bearer 头与 query 两条路径都走常量时间比较）。
+/// 两条路径都必须先 trim 再比较，保持与旧实现相同的宽松语义。
+fn token_matches(candidate: &str, token: &str) -> bool {
+    ct_eq(candidate.trim().as_bytes(), token.as_bytes())
 }
 
 async fn write_http(
@@ -1550,14 +1670,38 @@ async fn handle_http_conn(stream: tokio::net::TcpStream, token: &str) -> Result<
     let method = parts.next().unwrap_or("").to_uppercase();
     let target = parts.next().unwrap_or("/").to_string();
 
-    // 头
+    // 头：旧实现用 read_line 无界读整行、也不限制头的个数——
+    // 一个不含换行的超长行会被膨胀成巨型 String，逐行灌入则把 headers 撑爆。
+    // 这里对"单行长度"与"头数量"分别设上限，超限回 431（Request Header
+    // Fields Too Large）并关闭连接（write_http 固定 Connection: close）。
+    //
+    // 注意：**令牌校验一律留到读完头之后**再做（见下方 bearer_ok / query_ok）。
+    // reason：token 可能出现在任意一个头（Authorization）或 query 里，
+    // 提前校验就必须提前读取/解析头部，反而会绕过这里对头长度与数量的防护；
+    // 而且 OPTIONS/DELETE 也依赖同样的"先读完头再校验"顺序。
     let mut headers: Vec<(String, String)> = Vec::new();
+    let mut header_line = Vec::with_capacity(128);
     loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await.map_err(|e| e.to_string())?;
-        if n == 0 || line == "\r\n" || line == "\n" {
-            break;
+        header_line.clear();
+        // read_until 会一直读到 '\n'；即便没有 '\n'，其内部按 BufReader 每次
+        // 最多读入一个 8KiB 块，因此临时缓冲最多膨胀到"块大小 + 已读字节"，
+        // 不会无限增长；长度上限在下面显式判定。
+        let n = reader
+            .read_until(b'\n', &mut header_line)
+            .await
+            .map_err(|e| e.to_string())?;
+        if n == 0 || header_line == b"\r\n" || header_line == b"\n" {
+            break; // 空行 = 头结束（或对端已关闭）
         }
+        if header_line.len() > MAX_HEADER_LINE_BYTES {
+            write_http(&mut write_half, 431, "text/plain", "请求头过长").await?;
+            return Ok(());
+        }
+        if headers.len() >= MAX_HEADER_COUNT {
+            write_http(&mut write_half, 431, "text/plain", "请求头数量过多").await?;
+            return Ok(());
+        }
+        let line = String::from_utf8_lossy(&header_line);
         if let Some((k, v)) = line.split_once(':') {
             headers.push((k.trim().to_lowercase(), v.trim().to_string()));
         }
@@ -1572,26 +1716,39 @@ async fn handle_http_conn(stream: tokio::net::TcpStream, token: &str) -> Result<
     let path = target.split('?').next().unwrap_or("/");
     let query = target.split_once('?').map(|(_, q)| q.to_string()).unwrap_or_default();
 
-    // token 校验：Authorization: Bearer xxx 或 ?token=xxx
+    // token 校验：Authorization: Bearer xxx 或 ?token=xxx。
+    // 旧实现两条路径都用 `==`：`==` 在首个不同字节处提前返回，响应耗时会随
+    // "匹配前缀长度"变化，可被用来逐字节爆破令牌。这里统一走 ct_eq 常量时间比较。
     let bearer_ok = header("authorization")
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|t| t.trim() == token)
+        .map(|t| token_matches(t, token))
         .unwrap_or(false);
     let query_ok = query
         .split('&')
         .filter_map(|kv| kv.split_once('='))
-        .any(|(k, v)| k == "token" && v == token);
+        .any(|(k, v)| k == "token" && token_matches(v, token));
 
     match method.as_str() {
         "OPTIONS" => {
+            // 旧实现无条件回 204，等价于对未授权客户端也确认"端点存在"。
+            // 现在先校验令牌：有效仍回 204（保持 CORS / 无状态语义），无效回 401。
+            if !bearer_ok && !query_ok {
+                write_http(&mut write_half, 401, "text/plain", "token 无效").await?;
+                return Ok(());
+            }
             write_http(&mut write_half, 204, "text/plain", "").await?;
             Ok(())
         }
         "DELETE" => {
-            // 会话终止（我们无状态，直接确认）
+            // 会话终止（我们无状态，直接确认）。同样先校验令牌，理由见上。
+            if !bearer_ok && !query_ok {
+                write_http(&mut write_half, 401, "text/plain", "token 无效").await?;
+                return Ok(());
+            }
             write_http(&mut write_half, 204, "text/plain", "").await?;
             Ok(())
-        }        "GET" => {
+        }
+        "GET" => {
             // Host 可能打开 SSE 流等待服务端消息：保持连接并周期发心跳
             let wants_sse = header("accept")
                 .map(|a| a.contains("text/event-stream"))
@@ -1619,6 +1776,9 @@ async fn handle_http_conn(stream: tokio::net::TcpStream, token: &str) -> Result<
             Ok(())
         }
         "POST" => {
+            // 路径不匹配先于令牌校验返回 404 是**有意保留**的：
+            // 本机端点的 404 只暴露"这里不是 /mcp"，不涉及任何数据；同时
+            // 保持与旧实现一致的状态码顺序，避免既有客户端行为变化。
             if path != "/mcp" && path != "/" {
                 write_http(&mut write_half, 404, "text/plain", "未知路径").await?;
                 return Ok(());
@@ -1631,6 +1791,15 @@ async fn handle_http_conn(stream: tokio::net::TcpStream, token: &str) -> Result<
                 write_http(&mut write_half, 411, "text/plain", "需要 Content-Length").await?;
                 return Ok(());
             };
+            // 旧实现直接 `vec![0u8; len]`：客户端声明一个超大 Content-Length
+            // 就能让端点按声明值一次性分配（异常客户端/攻击者可借此打爆内存）。
+            // 这里先校验声明长度，超限直接 413，连缓冲都不分配。
+            if len > MAX_BODY_BYTES {
+                write_http(&mut write_half, 413, "text/plain", "请求体过大").await?;
+                return Ok(());
+            }
+            // 只分配已校验过的 len（<= MAX_BODY_BYTES）；对端提前关闭时 read_exact
+            // 返回错误，由上层按"连接结束"处理。
             let mut body = vec![0u8; len];
             reader.read_exact(&mut body).await.map_err(|e| e.to_string())?;
             let text = String::from_utf8_lossy(&body).to_string();
@@ -1707,6 +1876,44 @@ async fn http_post(port: u16, path_with_query: &str, body: &str) -> Result<(u16,
     Ok((status, body.to_string()))
 }
 
+/// 发送一条**原始** HTTP 请求（自定义方法 / 头 / 声明的 Content-Length），只取状态码。
+///
+/// 用于验证那些 `http_post` 无法构造的场景：令牌校验以外的 HTTP 方法、
+/// 超长请求头、以及"声明超大 Content-Length 但不真的发送 body"的限额检查。
+async fn http_raw(port: u16, raw: &str) -> Result<u16, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .map_err(|e| format!("连接端点失败: {}", e))?;
+    stream
+        .write_all(raw.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = stream.flush().await;
+    let mut buf = Vec::new();
+    // 服务端在 204/401/413/431 之后都会关闭连接（响应固定 Connection: close）；
+    // 但仍加超时兜底，避免某个分支不关闭时把自测挂住。
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(1500),
+        stream.read_to_end(&mut buf),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let status = text
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    if status == 0 {
+        return Err(format!(
+            "无有效状态行: {:?}",
+            text.chars().take(80).collect::<String>()
+        ));
+    }
+    Ok(status)
+}
+
 /// 探测端点是否活着（JSON-RPC ping）
 async fn endpoint_alive(port: u16) -> bool {
     let token = persistent_token();
@@ -1719,11 +1926,12 @@ async fn endpoint_alive(port: u16) -> bool {
 
 /// 确保端点可用：不存在或不可达时拉起桌面端并等待
 async fn ensure_endpoint() -> Option<u16> {
+    // 顺带清理：旧实现这里带一个空的 `else {}` 分支，clippy 报
+    // "this `else` branch is empty"，且删除后控制流与语义完全不变。
     if let Some(port) = endpoint_port() {
         if endpoint_alive(port).await {
             return Some(port);
         }
-    } else {
     }
     launch_gui();
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(GUI_WAIT_TIMEOUT_MS);
@@ -1909,6 +2117,48 @@ pub async fn selftest_endpoint() -> i32 {
         Err(e) => check("批量请求返回数组响应", false, &e),
     }
 
+    // 6) OPTIONS / DELETE 必须同样校验令牌。
+    //    旧实现这两个方法无条件回 204，等于让任何本机进程绕过令牌直接探测/使用端点。
+    let opt_no_token = "OPTIONS /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    match http_raw(port, opt_no_token).await {
+        Ok(st) => check("OPTIONS 无令牌返回 401", st == 401, &format!("status={st}")),
+        Err(e) => check("OPTIONS 无令牌返回 401", false, &e),
+    }
+    let opt_with_token = format!(
+        "OPTIONS /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    match http_raw(port, &opt_with_token).await {
+        Ok(st) => check("OPTIONS 有效令牌返回 204", st == 204, &format!("status={st}")),
+        Err(e) => check("OPTIONS 有效令牌返回 204", false, &e),
+    }
+    let del_no_token =
+        "DELETE /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    match http_raw(port, del_no_token).await {
+        Ok(st) => check("DELETE 无令牌返回 401", st == 401, &format!("status={st}")),
+        Err(e) => check("DELETE 无令牌返回 401", false, &e),
+    }
+
+    // 7) 请求体上限：只声明超大 Content-Length，不真的发送 body
+    //    （旧实现会按声明值 `vec![0u8; len]` 一次性分配，直接被撑爆）
+    let huge = format!(
+        "POST /mcp?token={token} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        MAX_BODY_BYTES + 1
+    );
+    match http_raw(port, &huge).await {
+        Ok(st) => check("超大 Content-Length 返回 413", st == 413, &format!("status={st}")),
+        Err(e) => check("超大 Content-Length 返回 413", false, &e),
+    }
+
+    // 8) 单个请求头过长 → 431（旧实现用 read_line 无界膨胀）
+    let long_header = format!(
+        "POST /mcp?token={token} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Big: {}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+        "a".repeat(MAX_HEADER_LINE_BYTES + 16)
+    );
+    match http_raw(port, &long_header).await {
+        Ok(st) => check("超长请求头返回 431", st == 431, &format!("status={st}")),
+        Err(e) => check("超长请求头返回 431", false, &e),
+    }
+
     if failures == 0 {
         eprintln!("[MCP] 端点自测全部通过 ✅");
         0
@@ -1954,4 +2204,107 @@ pub async fn selftest_bridge() -> i32 {
 /// HTTP 地址（含 token），供桌面端设置页展示
 pub fn http_url_for_display() -> String {
     endpoint_url()
+}
+
+/* ─── 回归测试（仅测试构建）───────────────────────────────── */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 常量时间比较：相等 / 长度不同 / 内容不同 / 空串都要给出正确结论。
+    /// 旧实现用的是 `==`，这里锁死行为，避免日后被"优化"回提前返回的实现。
+    /// 注意：参数必须来自变量（写成 `ct_eq(b"", b"")` 会被常量折叠成
+    /// `assert!(true)`，既触发 clippy 警告也失去了测试意义）。
+    #[test]
+    fn ct_eq_matches_by_length_and_content() {
+        let empty: &[u8] = b"";
+        let same_a: &[u8] = b"abc123";
+        let same_b: &[u8] = b"abc123";
+        let last_differs: &[u8] = b"abc124";
+        let shorter: &[u8] = b"abc12";
+        let longer: &[u8] = b"abc1234";
+        let one: &[u8] = b"x";
+        let many: &[u8] = b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let a: &[u8] = b"a";
+
+        assert!(ct_eq(empty, empty));
+        assert!(ct_eq(same_a, same_b));
+        assert!(!ct_eq(same_a, last_differs));
+        assert!(!ct_eq(same_a, shorter));
+        assert!(!ct_eq(shorter, same_a));
+        assert!(!ct_eq(same_a, longer));
+        // 长度差必须体现在结果里（实现里用长度异或累积，不靠提前返回）
+        assert!(!ct_eq(one, many));
+        assert!(!ct_eq(empty, a));
+    }
+
+    /// 令牌校验：两条路径（Bearer 头 / query）都经过 token_matches，
+    /// 必须保留旧实现的 trim 宽松语义，同时拒绝"前缀相同"的令牌。
+    #[test]
+    fn token_matches_is_strict_but_trimming() {
+        let token = "0123456789abcdef0123456789abcdef";
+        assert!(token_matches(token, token));
+        assert!(token_matches(&format!(" {} ", token), token));
+        assert!(!token_matches(&token[..16], token));
+        assert!(!token_matches(&format!("{}0", token), token));
+        assert!(!token_matches("wrong", token));
+    }
+
+    /// 令牌生成：32 位十六进制、且每次生成都不同（CSPRNG 路径不应退化为常量）。
+    #[test]
+    fn random_hex_is_32_hex_chars_and_unique() {
+        let a = random_hex();
+        let b = random_hex();
+        assert_eq!(a.len(), 32, "令牌长度必须仍为 32: {}", a);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()), "必须是十六进制: {}", a);
+        assert!(b.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "两次生成的令牌不应相同");
+        // persistent_token 仍要求长度 >= 16，这里是该下限的来源校验
+        assert!(a.len() >= 16);
+    }
+
+    /// 工具标注：save_snapshot 必须是非只读且非幂等，其余工具只读且幂等。
+    #[test]
+    fn tool_annotations_reflect_snapshot_write() {
+        let tools = tool_definitions();
+        assert_eq!(tools.len(), 13, "工具数量变化时自测断言与文档都要同步");
+        for t in &tools {
+            let name = t["name"].as_str().unwrap_or("");
+            let ann = &t["annotations"];
+            assert_eq!(
+                ann["readOnlyHint"].as_bool(),
+                Some(name != "save_snapshot"),
+                "{} 的 readOnlyHint 不正确",
+                name
+            );
+            assert_eq!(
+                ann["idempotentHint"].as_bool(),
+                Some(name != "save_snapshot"),
+                "{} 的 idempotentHint 不正确（旧实现无条件写 true）",
+                name
+            );
+        }
+    }
+
+    /// list_directory 的 schema 必须声明 force：实现会读取它，
+    /// 而 additionalProperties=false 下未声明就等于该参数不可用。
+    #[test]
+    fn list_directory_schema_declares_force() {
+        let tools = tool_definitions();
+        let ld = tools
+            .iter()
+            .find(|t| t["name"] == "list_directory")
+            .expect("list_directory 必须存在");
+        assert_eq!(ld["inputSchema"]["properties"]["force"]["type"], "boolean");
+        assert_eq!(ld["inputSchema"]["additionalProperties"], false);
+    }
+
+    /// HTTP 状态码文案：新增的 413 / 431 必须有对应 reason，
+    /// 否则响应行会退化成 "HTTP/1.1 413 OK"。
+    #[test]
+    fn http_reason_covers_new_limits() {
+        assert_eq!(http_reason(413), "Payload Too Large");
+        assert_eq!(http_reason(431), "Request Header Fields Too Large");
+    }
 }

@@ -145,9 +145,11 @@ pub struct UsnCheckpoint {
 }
 
 /// USN Journal 操作句柄
+///
+/// 只保留卷句柄：盘符仅用于 `open` 时构造 `\\.\X:` 路径，句柄本身不需要它
+/// （旧实现把 `drive_letter` 存进结构体但从未读取，属死字段）。
 pub struct UsnJournal {
     volume_handle: isize,
-    drive_letter: char,
 }
 
 impl UsnJournal {
@@ -176,7 +178,6 @@ impl UsnJournal {
 
             Ok(Self {
                 volume_handle: handle,
-                drive_letter,
             })
         }
     }

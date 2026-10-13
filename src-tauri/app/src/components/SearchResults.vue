@@ -16,7 +16,8 @@ const props = defineProps({
   scope: { type: String, default: '' },
   exporting: { type: Boolean, default: false },
 })
-const emit = defineEmits(['open', 'navigate', 'back', 'retry', 'copy', 'more', 'export-all'])
+// 'copy' 改为 'context'：旧实现右键直接复制路径，与 FileTable 的右键上下文菜单不一致
+const emit = defineEmits(['open', 'navigate', 'back', 'retry', 'context', 'more', 'export-all'])
 
 const ROW_H = 23
 const body = ref(null)
@@ -24,6 +25,7 @@ const active = ref(-1)
 const scrollTop = ref(0)
 const viewportH = ref(400)
 let ro = null
+let rafId = 0
 
 const rows = computed(() => props.results)
 
@@ -39,24 +41,40 @@ const visibleRows = computed(() =>
 const padTop = computed(() => startIndex.value * ROW_H)
 const totalHeight = computed(() => rows.value.length * ROW_H)
 
-function measure() {
+function readSize() {
   const el = body.value
   if (!el) return
   viewportH.value = el.clientHeight || 400
   scrollTop.value = el.scrollTop
 }
+/** ResizeObserver 一帧内可能回调多次（观察滚动容器时尤其明显），
+ *  旧实现每次回调都同步写响应式状态 → 高频重渲染。合并到一帧一次。 */
+function measure() {
+  if (rafId) return
+  rafId = requestAnimationFrame(() => {
+    rafId = 0
+    readSize()
+  })
+}
 function onScroll() {
   const el = body.value
   if (el) scrollTop.value = el.scrollTop
 }
+function onContext(r, idx, e) {
+  active.value = idx
+  emit('context', { item: r, event: e })
+}
 onMounted(() => {
-  measure()
+  readSize() // 首帧同步测量，避免先按默认 400px 渲染
   if (typeof ResizeObserver !== 'undefined') {
     ro = new ResizeObserver(measure)
     if (body.value) ro.observe(body.value)
   }
 })
-onUnmounted(() => ro?.disconnect())
+onUnmounted(() => {
+  if (rafId) cancelAnimationFrame(rafId)
+  ro?.disconnect()
+})
 watch(
   () => props.query,
   () => {
@@ -175,7 +193,7 @@ function onScrollLoad() {
               }"
               @click="active = row.idx"
               @dblclick="openRow(row.idx)"
-              @contextmenu.prevent="emit('copy', row.r.path)"
+              @contextmenu.prevent="onContext(row.r, row.idx, $event)"
             >
               <div><Icon :name="row.r.isDir ? 'folder' : 'file'" :size="13" /></div>
               <div class="nm"><span style="overflow:hidden;text-overflow:ellipsis">{{ row.r.name }}</span></div>

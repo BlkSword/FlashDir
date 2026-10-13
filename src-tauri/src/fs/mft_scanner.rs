@@ -20,6 +20,7 @@ use rayon::prelude::*;
 use std::io;
 use std::mem;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, GENERIC_READ, INVALID_HANDLE_VALUE,
@@ -141,6 +142,9 @@ type MftIndex = Vec<Option<MftEntry>>;
 /// MFT 扫描器 —— 打开 NTFS 卷并顺序读取 $MFT
 pub struct MftScanner {
     volume_handle: isize,
+    /// 卷的扇区大小（512 或 4Kn 的 4096）；修复 update sequence 时按它定位扇区尾部。
+    /// 旧实现把 512 硬编码进 apply_mft_fixup，4Kn 卷上 fixup 位置会算错。
+    bytes_per_sector: u32,
     bytes_per_cluster: u64,
     mft_start_offset: u64,
     mft_valid_size: u64,
@@ -275,12 +279,30 @@ impl MftScanner {
                 (vol_data.mft_start_lcn as u64) * (vol_data.bytes_per_cluster as u64);
             let mft_valid_size = vol_data.mft_valid_data_length as u64;
 
+            // 文件记录大小必须在合法集合内：旧实现直接把这个值当除数用，
+            // 一旦为 0（卷信息异常/被篡改）就会在
+            // `mft_valid_size / record_size`、`par_chunks_mut(record_size)`
+            // 与 `record_offset_for` 的除法处 panic。
+            let record_size = vol_data.bytes_per_file_record_segment;
+            if !matches!(record_size, 512 | 1024 | 2048 | 4096) {
+                CloseHandle(handle);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "NTFS 文件记录大小异常: {}（合法值 512/1024/2048/4096）",
+                        record_size
+                    ),
+                ));
+            }
+
             let mut scanner = Self {
                 volume_handle: handle,
+                // 4Kn 卷为 4096；异常值（0/过大）由 normalize_sector_size 回退到 512
+                bytes_per_sector: vol_data.bytes_per_sector,
                 bytes_per_cluster: vol_data.bytes_per_cluster as u64,
                 mft_start_offset,
                 mft_valid_size,
-                mft_record_size: vol_data.bytes_per_file_record_segment,
+                mft_record_size: record_size,
                 mft_data_runs: Vec::new(),
                 cancel_id: 0,
             };
@@ -310,7 +332,9 @@ impl MftScanner {
 
         // 第一步：顺序读取 $MFT 并解析记录（rayon 并行解析）
         let read_start = std::time::Instant::now();
-        let index = self.read_all_records()?;
+        // data_read 取真实 ReadFile 字节数：旧实现直接填 mft_valid_size（"$MFT 有效数据
+        // 长度"），诊断/界面上的读取量与吞吐因此是虚构的。
+        let (index, data_read) = self.read_all_records()?;
         let read_secs = read_start.elapsed().as_secs_f64();
 
         // 计数（扁平数组直接遍历，无哈希开销）
@@ -359,7 +383,7 @@ impl MftScanner {
         Ok(MftScanSummary {
             file_count,
             dir_count,
-            data_read: self.mft_valid_size,
+            data_read,
             read_secs,
             path_secs,
         })
@@ -436,7 +460,12 @@ impl MftScanner {
 
         let record_data_start = FILE_RECORD_OUT_HEADER_SIZE;
         let mut record_buffer = out_buffer[record_data_start..record_data_start + record_len].to_vec();
-        apply_mft_fixup(&mut record_buffer);
+        if !apply_mft_fixup(&mut record_buffer, self.bytes_per_sector as usize) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "$MFT 文件记录的 update sequence 校验失败",
+            ));
+        }
 
         // 遍历属性，找到 $DATA (0x80) 非驻留属性
         let first_attr_offset = u16_from_le(&record_buffer[0x14..0x16]) as usize;
@@ -464,7 +493,16 @@ impl MftScanner {
                 if runs_start >= record_buffer.len() {
                     break;
                 }
-                return Ok(parse_data_runs(&record_buffer[runs_start..attr_offset + attr_length]));
+                // run 长度上限：$MFT 自身占用的簇数（+1 余量，最小值兜底）。
+                // 旧实现把 count 按有符号读入再转 u64，最高位为 1 时会得到天文数字。
+                let cluster_size = self.bytes_per_cluster.max(1);
+                let max_run_clusters = (self.mft_valid_size / cluster_size)
+                    .saturating_add(1)
+                    .max(1024);
+                return Ok(parse_data_runs(
+                    &record_buffer[runs_start..attr_offset + attr_length],
+                    max_run_clusters,
+                ));
             }
 
             attr_offset += attr_length;
@@ -479,8 +517,18 @@ impl MftScanner {
 
     /// 读取所有 $MFT FILE 记录，解析 $FILE_NAME 属性。
     /// 使用 $MFT 自身的 $DATA data runs 处理 MFT 碎片，确保不遗漏记录。
-    fn read_all_records(&self) -> io::Result<MftIndex> {
+    ///
+    /// 返回 (记录索引, 真实读取字节数)。旧实现把 `mft_valid_size`（$MFT 的逻辑
+    /// 有效长度）当作"已读字节数"返回，诊断/界面上的读取量与吞吐因此不准。
+    fn read_all_records(&self) -> io::Result<(MftIndex, u64)> {
         let record_size = self.mft_record_size as usize;
+        // 防御性判断：open 已校验过合法集合，这里再挡一次，任何路径都不会除零
+        if record_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "NTFS 文件记录大小异常: 0",
+            ));
+        }
         let max_records = (self.mft_valid_size as usize) / record_size;
         let mut records: MftIndex = std::iter::repeat_with(|| None).take(max_records).collect();
 
@@ -498,12 +546,28 @@ impl MftScanner {
 
         let mut global_record_index: u64 = 0;
         let bytes_per_cluster = self.bytes_per_cluster;
+        // 本次扫描累计的真实读取字节数（ReadFile 的返回值）
+        let mut data_read: u64 = 0;
+        // fixup 校验失败数按"本次扫描增量"汇总输出，不逐条打印刷屏
+        let failures_before = FIXUP_FAILURES.load(Ordering::Relaxed);
 
         unsafe {
             for (start_lcn, cluster_count) in data_runs {
-                let fragment_start_offset = start_lcn * bytes_per_cluster;
-                let fragment_size = cluster_count * bytes_per_cluster;
-                let records_in_fragment = (fragment_size / record_size as u64) as usize;
+                // 损坏的 $MFT 可能给出荒谬的 run：乘法一律 checked，
+                // release（overflow-checks = false）下回绕会算出"往前跳"的偏移。
+                let Some(fragment_start_offset) = start_lcn.checked_mul(bytes_per_cluster) else {
+                    eprintln!("[MFT] data run 起始 LCN 溢出，停止读取剩余 run");
+                    break;
+                };
+                let Some(fragment_size) = cluster_count.checked_mul(bytes_per_cluster) else {
+                    eprintln!("[MFT] data run 长度溢出，停止读取剩余 run");
+                    break;
+                };
+                // 越界部分既没有槽位可写，也没有必要继续读（同时防止损坏的 run
+                // 让外层循环跑出天文数字的轮次）
+                let remaining_slots = records.len().saturating_sub(global_record_index as usize);
+                let records_in_fragment = ((fragment_size / record_size as u64) as usize)
+                    .min(remaining_slots);
 
                 for fragment_batch_start in (0..records_in_fragment).step_by(batch_records) {
                     if crate::cancel::is_requested_for(self.cancel_id) {
@@ -517,8 +581,16 @@ impl MftScanner {
                         (records_in_fragment - fragment_batch_start).min(batch_records);
                     let read_size = records_in_batch * record_size;
 
-                    let seek_offset =
-                        fragment_start_offset + (fragment_batch_start * record_size) as u64;
+                    let Some(seek_offset) = (fragment_batch_start as u64)
+                        .checked_mul(record_size as u64)
+                        .and_then(|delta| fragment_start_offset.checked_add(delta))
+                    else {
+                        break;
+                    };
+                    if seek_offset > i64::MAX as u64 {
+                        eprintln!("[MFT] data run 偏移超出可寻址范围，停止读取剩余 run");
+                        break;
+                    }
                     let mut distance_to_move: i64 = seek_offset as i64;
                     let result = SetFilePointerEx(
                         self.volume_handle,
@@ -548,6 +620,8 @@ impl MftScanner {
                     if result == 0 || bytes_read == 0 {
                         continue;
                     }
+                    // 短读也按实际返回字节数累计（这才是真实 I/O 量）
+                    data_read = data_read.saturating_add(bytes_read as u64);
 
                     let complete = (bytes_read as usize) / record_size;
                     let limit = records_in_batch
@@ -563,14 +637,38 @@ impl MftScanner {
                         .zip(records[base..base + limit].par_iter_mut())
                         .enumerate()
                         .for_each(|(i, (record_data, slot))| {
-                            apply_mft_fixup(record_data);
+                            // fixup 失败（update sequence 不匹配 / 结构调整越界）说明记录
+                            // 已损坏：旧实现忽略返回值继续解析，会用被破坏的字节产出
+                            // 错误的 name/size。这里按"解析失败"处理，槽位保持 None。
+                            if !apply_mft_fixup(record_data, self.bytes_per_sector as usize) {
+                                FIXUP_FAILURES.fetch_add(1, Ordering::Relaxed);
+                                return;
+                            }
                             *slot = parse_mft_record(record_data, base + i);
                         });
                 }
             }
         }
 
-        Ok(records)
+        let failed = FIXUP_FAILURES
+            .load(Ordering::Relaxed)
+            .saturating_sub(failures_before);
+        if failed > 0 {
+            eprintln!("[MFT] update sequence 校验失败 {failed} 条记录，已按解析失败跳过");
+        }
+
+        // 重解析点（junction / 符号链接 / OneDrive 占位文件）在 MFT 路径下**不做区分**，
+        // 而目录遍历路径会跳过它们 —— 两条全量扫描路径的语义因此不一致。
+        // 这里把数量记进日志让差异可观测；行为保持不变（仍然列出并计入目录体积），
+        // 因为直接跳过会隐藏 OneDrive 占位文件，属用户可见的行为变更。
+        let reparse = records.iter().flatten().filter(|e| e.is_reparse).count();
+        if reparse > 0 {
+            crate::diag::log_line(&format!(
+                "[MFT] 重解析点条目 {reparse} 条（MFT 路径不过滤，目录遍历路径会跳过：两条路径语义不一致）"
+            ));
+        }
+
+        Ok((records, data_read))
     }
 
 
@@ -682,21 +780,31 @@ impl MftScanner {
     /// 优先使用缓存的 $MFT data runs 定位，避免 $MFT 碎片化时直接按连续偏移读取。
     /// data runs 为空时回退到传统连续读取。
     fn record_offset_for(&self, record_number: u64) -> Option<u64> {
+        let record_size = self.mft_record_size as u64;
+        // 防御性判断：record_size 为 0 时下面的除法会 panic
+        if record_size == 0 {
+            return None;
+        }
+        let cluster_size = self.bytes_per_cluster;
+
         if self.mft_data_runs.is_empty() {
-            return Some(self.mft_start_offset + record_number * self.mft_record_size as u64);
+            // 溢出（损坏的 FRN / 卷信息）时返回 None，而不是回绕出一个错误的偏移
+            return record_number
+                .checked_mul(record_size)
+                .and_then(|delta| self.mft_start_offset.checked_add(delta));
         }
 
-        let record_size = self.mft_record_size as u64;
         let mut records_before = 0u64;
         for (start_lcn, cluster_count) in &self.mft_data_runs {
-            let fragment_records =
-                (cluster_count * self.bytes_per_cluster) / record_size;
-            if record_number < records_before + fragment_records {
+            let fragment_size = cluster_count.checked_mul(cluster_size)?;
+            let fragment_records = fragment_size / record_size;
+            if record_number < records_before.saturating_add(fragment_records) {
                 let offset_in_fragment =
-                    (record_number - records_before) * record_size;
-                return Some((start_lcn * self.bytes_per_cluster) + offset_in_fragment);
+                    (record_number - records_before).checked_mul(record_size)?;
+                let fragment_start = start_lcn.checked_mul(cluster_size)?;
+                return fragment_start.checked_add(offset_in_fragment);
             }
-            records_before += fragment_records;
+            records_before = records_before.saturating_add(fragment_records);
         }
         None
     }
@@ -707,10 +815,18 @@ impl MftScanner {
         // FRN 结构: [48-bit record number][16-bit sequence number]
         let record_number = frn & 0x0000FFFFFFFFFFFF;
         let record_size = self.mft_record_size as usize;
+        // 防御性判断：为 0 时无法读取/解析（open 已保证不会走到这里）
+        if record_size == 0 {
+            return Ok(None);
+        }
         let offset = match self.record_offset_for(record_number) {
             Some(offset) => offset,
             None => return Ok(None),
         };
+        // 偏移超出可寻址范围（损坏的 data runs）：SetFilePointerEx 收 i64，转出来是负数
+        if offset > i64::MAX as u64 {
+            return Ok(None);
+        }
 
         let mut buffer = vec![0u8; record_size];
 
@@ -737,13 +853,19 @@ impl MftScanner {
                 std::ptr::null_mut(),
             );
 
-            if result == 0 || bytes_read == 0 {
+            // 旧实现只判断 bytes_read == 0：短读（例如卷尾/坏扇区）会拿半截
+            // 缓冲区做 fixup 再解析，产出垃圾 name/size。必须整条读完才认。
+            if result == 0 || bytes_read as usize != record_size {
                 return Ok(None);
             }
         }
 
-        // 应用 fixup 后解析记录
-        apply_mft_fixup(&mut buffer);
+        // 应用 fixup 后解析记录；fixup 失败说明记录已损坏，同样按"读不到"处理
+        // （失败次数累计进 FIXUP_FAILURES，由下一次全量扫描汇总输出，不在这里刷屏）
+        if !apply_mft_fixup(&mut buffer, self.bytes_per_sector as usize) {
+            FIXUP_FAILURES.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
         Ok(parse_mft_record_info(&buffer, frn))
     }
 
@@ -1109,8 +1231,10 @@ fn u64_from_le(data: &[u8]) -> u64 {
 
 /// 解析 NTFS data run 列表。
 /// data 指向 $DATA 属性的 mapping pairs 区域，以 0x00 结束。
+/// `max_run_clusters` 是单条 run 长度的合理上界（$MFT 自身占用的簇数），
+/// 超过即视为解析错误并停止后续解析。
 /// 返回 [(start_lcn, cluster_count)]，start_lcn 已转换为绝对 LCN。
-fn parse_data_runs(data: &[u8]) -> Vec<(u64, u64)> {
+fn parse_data_runs(data: &[u8], max_run_clusters: u64) -> Vec<(u64, u64)> {
     let mut runs = Vec::new();
     let mut pos = 0usize;
     let mut last_lcn: i64 = 0;
@@ -1128,39 +1252,63 @@ fn parse_data_runs(data: &[u8]) -> Vec<(u64, u64)> {
         let lcn_len = ((header >> 4) & 0x0F) as usize;
         pos += 1;
 
-        if count_len == 0 || pos + count_len + lcn_len > data.len() {
+        if count_len == 0 || count_len > 8 || lcn_len > 8 {
+            break;
+        }
+        if pos + count_len + lcn_len > data.len() {
             break;
         }
 
-        let count = read_signed_or_unsigned(&data[pos..pos + count_len], false) as u64;
+        // run 长度必须按**无符号**读：旧实现按有符号读入再转 u64，
+        // count_len == 8 且最高位为 1 时会得到接近 2^64 的"长度"，随后
+        // start_lcn * bytes_per_cluster 在 release（overflow-checks = false）
+        // 下静默回绕，seek_offset as i64 变成负偏移。
+        let count = read_unsigned(&data[pos..pos + count_len]);
         pos += count_len;
 
+        if count > max_run_clusters {
+            // 明显不合理的 run（损坏的 mapping pairs）：停止解析，保留已解析部分
+            break;
+        }
+
         let lcn_delta = if lcn_len > 0 {
-            read_signed_or_unsigned(&data[pos..pos + lcn_len], true) as i64
+            read_signed(&data[pos..pos + lcn_len])
         } else {
             0i64
         };
         pos += lcn_len;
 
-        last_lcn += lcn_delta;
+        // LCN 是相对增量，累加同样不能回绕
+        let Some(next_lcn) = last_lcn.checked_add(lcn_delta) else {
+            break;
+        };
+        last_lcn = next_lcn;
+        if last_lcn < 0 {
+            break;
+        }
         runs.push((last_lcn as u64, count));
     }
 
     runs
 }
 
-/// 读取小端整数，可选有符号。
-fn read_signed_or_unsigned(data: &[u8], signed: bool) -> i64 {
+/// 读取小端无符号整数（最多 8 字节）。
+fn read_unsigned(data: &[u8]) -> u64 {
     let mut buf = [0u8; 8];
-    buf[..data.len()].copy_from_slice(data);
+    let n = data.len().min(8);
+    buf[..n].copy_from_slice(&data[..n]);
+    u64::from_le_bytes(buf)
+}
+
+/// 读取小端有符号整数（最多 8 字节），不足位按符号扩展。
+fn read_signed(data: &[u8]) -> i64 {
+    let mut buf = [0u8; 8];
+    let n = data.len().min(8);
+    buf[..n].copy_from_slice(&data[..n]);
     let val = u64::from_le_bytes(buf);
 
-    if !signed {
-        return val as i64;
-    }
-
     // 符号扩展
-    let shift = (8 - data.len()) * 8;
+    let shift = (8 - n) * 8;
     ((val << shift) as i64) >> shift
 }
 
@@ -1173,10 +1321,29 @@ fn read_utf16le(data: &[u8]) -> String {
     String::from_utf16_lossy(&u16_slice)
 }
 
+/// update sequence（fixup）校验失败的记录条数。
+/// 只累计不逐条打印：MFT 上偶尔会有损坏记录，逐条 eprintln 会把日志刷满。
+/// 全量扫描结束时汇总输出一次（单条读取路径的失败也计入，留给下次扫描汇报）。
+static FIXUP_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// 规范化扇区大小：只接受真实存在的取值（512 与 4Kn 的 4096，以及 1K/2K），
+/// 其余（0 / 过大 / 其他异常值）一律回退到 512，避免越界或算出错误的 fixup 位置。
+#[inline]
+fn normalize_sector_size(sector_size: usize) -> usize {
+    match sector_size {
+        512 | 1024 | 2048 | 4096 => sector_size,
+        _ => 512,
+    }
+}
+
 /// 应用 MFT 记录 fixup（update sequence）。
-/// NTFS 将每个 512 字节扇区最后 2 字节替换为 fixup signature；
-/// 本函数从记录头读取 fixup array 并恢复原始值。返回 false 表示校验失败。
-fn apply_mft_fixup(data: &mut [u8]) -> bool {
+///
+/// NTFS 把每个**扇区**末尾 2 字节替换为 fixup signature，本函数从记录头读取
+/// fixup array 并把原始值写回。`sector_size` 必须是卷的真实扇区大小：
+/// 旧实现把扇区大小硬编码成 512，4Kn（原生 4K 扇区）卷上 fixup 会被写到
+/// 每条 4096 字节扇区中间的错误位置，导致整盘记录解析错误。
+/// 返回 false 表示校验失败（记录损坏）。
+fn apply_mft_fixup(data: &mut [u8], sector_size: usize) -> bool {
     if data.len() < 0x34 {
         return false;
     }
@@ -1184,9 +1351,15 @@ fn apply_mft_fixup(data: &mut [u8]) -> bool {
     let update_sequence_offset = u16_from_le(&data[0x04..0x06]) as usize;
     let update_sequence_count = u16_from_le(&data[0x06..0x08]) as usize;
 
+    // update sequence array 必须完整落在记录内（checked，防异常值回绕）
+    let Some(update_sequence_end) =
+        update_sequence_offset.checked_add(update_sequence_count.saturating_mul(2))
+    else {
+        return false;
+    };
     if update_sequence_offset < 0x30
-        || update_sequence_offset + update_sequence_count * 2 > data.len()
         || update_sequence_count == 0
+        || update_sequence_end > data.len()
     {
         return false;
     }
@@ -1197,9 +1370,15 @@ fn apply_mft_fixup(data: &mut [u8]) -> bool {
         return true;
     }
 
-    let sector_size = 512usize;
+    let sector_size = normalize_sector_size(sector_size);
     for i in 0..sectors {
-        let pos = (i + 1) * sector_size - 2;
+        // (i + 1) * sector_size - 2：全部走 checked，避免异常扇区大小造成回绕
+        let Some(pos) = (i + 1)
+            .checked_mul(sector_size)
+            .and_then(|end| end.checked_sub(2))
+        else {
+            return false;
+        };
         if pos + 2 > data.len() {
             return false;
         }
@@ -1251,12 +1430,6 @@ pub fn is_admin() -> bool {
 
         elevation.TokenIsElevated != 0
     }
-}
-
-/// 非 Windows 平台始终返回 false
-#[cfg(not(target_os = "windows"))]
-pub fn is_admin() -> bool {
-    false
 }
 
 /// 快速检测 MFT 扫描是否可用（仅尝试打开卷，不读取数据）
@@ -1454,6 +1627,143 @@ pub(crate) fn extract_drive_letter(path: &str) -> Option<char> {
     None
 }
 
+
+/// fixup 与 data runs 的定点回归测试（纯内存，不需要卷/管理员权限）。
+#[cfg(test)]
+mod fixup_and_runs_tests {
+    use super::*;
+
+    /// 构造一条最小可用的 MFT 记录：合法头部 + update sequence array。
+    /// 记录按 `sector_size` 分 `sectors` 段，每段末尾写 signature。
+    fn make_record(record_size: usize, sector_size: usize) -> Vec<u8> {
+        const USN_OFFSET: usize = 0x30;
+        const SIGNATURE: u16 = 0xABCD;
+        let sectors = record_size / sector_size;
+        let mut data = vec![0u8; record_size];
+        data[0..4].copy_from_slice(&MFT_FILE_SIGNATURE.to_le_bytes());
+        data[0x04..0x06].copy_from_slice(&(USN_OFFSET as u16).to_le_bytes());
+        data[0x06..0x08].copy_from_slice(&((sectors + 1) as u16).to_le_bytes());
+        data[USN_OFFSET..USN_OFFSET + 2].copy_from_slice(&SIGNATURE.to_le_bytes());
+        for i in 0..sectors {
+            let pos = (i + 1) * sector_size - 2;
+            data[pos..pos + 2].copy_from_slice(&SIGNATURE.to_le_bytes());
+            let original = (0x1000u16 + i as u16).to_le_bytes();
+            let slot = USN_OFFSET + 2 + i * 2;
+            data[slot..slot + 2].copy_from_slice(&original);
+        }
+        data
+    }
+
+    /// 缺陷 1：4Kn 卷上 update sequence 位于扇区（4096 字节）末尾，
+    /// 旧实现固定按 512 定位，会把 fixup 写到错误位置。
+    #[test]
+    fn fixup_uses_volume_sector_size() {
+        let mut rec4k = make_record(4096, 4096);
+        assert!(apply_mft_fixup(&mut rec4k, 4096));
+        assert_eq!(u16_from_le(&rec4k[4094..4096]), 0x1000);
+
+        // 同一份 4Kn 记录按 512 处理：位置算错 → 校验必然失败（旧行为）
+        let mut rec_wrong = make_record(4096, 4096);
+        assert!(!apply_mft_fixup(&mut rec_wrong, 512));
+        assert_eq!(u16_from_le(&rec_wrong[4094..4096]), 0xABCD);
+
+        // 512 字节扇区的常规卷（2 个扇区）
+        let mut rec512 = make_record(1024, 512);
+        assert!(apply_mft_fixup(&mut rec512, 512));
+        assert_eq!(u16_from_le(&rec512[510..512]), 0x1000);
+        assert_eq!(u16_from_le(&rec512[1022..1024]), 0x1001);
+    }
+
+    /// 缺陷 1 的边界：0 / 过大 / 其他异常扇区大小回退到 512，不 panic 也不越界。
+    #[test]
+    fn fixup_falls_back_for_abnormal_sector_size() {
+        assert_eq!(normalize_sector_size(0), 512);
+        assert_eq!(normalize_sector_size(usize::MAX), 512);
+        assert_eq!(normalize_sector_size(3), 512);
+        assert_eq!(normalize_sector_size(512), 512);
+        assert_eq!(normalize_sector_size(4096), 4096);
+
+        // 回退后按 512 正常恢复
+        let mut rec = make_record(1024, 512);
+        assert!(apply_mft_fixup(&mut rec, 0));
+        assert_eq!(u16_from_le(&rec[510..512]), 0x1000);
+
+        // 过大值回退 512 后同样可用；而 fixup array 越界的记录仍必须判失败
+        let mut rec_max = make_record(1024, 512);
+        assert!(apply_mft_fixup(&mut rec_max, usize::MAX));
+        let mut short = vec![0u8; 8];
+        assert!(!apply_mft_fixup(&mut short, 512));
+    }
+
+    /// 缺陷 5：run 长度必须按无符号读，且荒谬长度要被拒绝（而不是回绕成负偏移）。
+    #[test]
+    fn data_runs_read_count_unsigned_and_reject_absurd() {
+        // count_len = 8 且最高位为 1：旧实现得到天文数字长度
+        let mut absurd = vec![0x18u8]; // count_len=8, lcn_len=1
+        absurd.extend_from_slice(&(1u64 << 63).to_le_bytes());
+        absurd.push(7);
+        absurd.push(0);
+        assert!(parse_data_runs(&absurd, 1 << 20).is_empty());
+
+        // 正常单条 run
+        let mut one = vec![0x21u8]; // count_len=1, lcn_len=2
+        one.push(4);
+        one.extend_from_slice(&300u16.to_le_bytes());
+        one.push(0);
+        assert_eq!(parse_data_runs(&one, 1 << 20), vec![(300, 4)]);
+
+        // 第二条 run 的 LCN 是相对增量（可为负）
+        let mut two = vec![0x21u8];
+        two.push(4);
+        two.extend_from_slice(&300u16.to_le_bytes());
+        two.push(0x11u8);
+        two.push(6);
+        two.push((-50i8) as u8);
+        two.push(0);
+        assert_eq!(parse_data_runs(&two, 1 << 20), vec![(300, 4), (250, 6)]);
+    }
+
+    /// 构造一个只用于纯计算的 scanner（句柄非法，不发起任何 I/O）。
+    fn fake_scanner(record_size: u32, data_runs: Vec<(u64, u64)>) -> MftScanner {
+        MftScanner {
+            volume_handle: INVALID_HANDLE_VALUE,
+            bytes_per_sector: 512,
+            bytes_per_cluster: 4096,
+            mft_start_offset: 1024,
+            mft_valid_size: 1024 * 1024,
+            mft_record_size: record_size,
+            mft_data_runs: data_runs,
+            cancel_id: 0,
+        }
+    }
+
+    /// 缺陷 3 + 5：record_size 为 0 不得除零；偏移乘法溢出不得回绕。
+    #[test]
+    fn record_offset_never_divides_by_zero_nor_wraps() {
+        // 旧实现在 mft_record_size == 0 时会在 / record_size 处 panic
+        let zero = fake_scanner(0, vec![]);
+        assert_eq!(zero.record_offset_for(3), None);
+        assert!(zero.read_single_record(3).unwrap().is_none());
+
+        // 连续读取回退路径：正常换算
+        let normal = fake_scanner(1024, vec![]);
+        assert_eq!(normal.record_offset_for(2), Some(1024 + 2048));
+
+        // 乘法溢出 → None（旧实现回绕出一个"往前跳"的偏移）
+        let mut huge = fake_scanner(1024, vec![]);
+        huge.mft_start_offset = u64::MAX - 8;
+        assert_eq!(huge.record_offset_for(1024), None);
+        assert!(huge.read_single_record(1024).unwrap().is_none());
+
+        // data runs 路径：跨 fragment 的记录定位与越界返回 None
+        let frag = fake_scanner(1024, vec![(10, 8), (100, 4)]);
+        assert_eq!(frag.record_offset_for(32), Some(100 * 4096));
+        assert_eq!(frag.record_offset_for(48), None);
+        // 溢出（损坏的 run 长度）同样返回 None，不是回绕值
+        let overflow = fake_scanner(1024, vec![(u64::MAX, u64::MAX)]);
+        assert_eq!(overflow.record_offset_for(1), None);
+    }
+}
 
 /// 基准（手动运行）：流式 MFT 扫描的耗时与条目数。
 /// 需要管理员权限读取 $MFT。

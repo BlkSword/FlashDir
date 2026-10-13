@@ -14,7 +14,8 @@ const props = defineProps({
   totalSize: { type: Number, default: 0 },
   currentPath: { type: String, default: '' },
 })
-const emit = defineEmits(['update:tab', 'navigate', 'open', 'refresh'])
+// 删除了从未 emit 过的 'navigate'：坞内子面板只发 open/refresh，跳转由父级处理
+const emit = defineEmits(['update:tab', 'open', 'refresh'])
 
 const tabs = [
   { key: 'big', label: '大文件', hint: '当前目录最大的文件' },
