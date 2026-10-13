@@ -787,6 +787,16 @@ impl GlobalIndex {
         }
     }
 
+    /// 仅测试用：暴露 `remove_prefix_internal`（按前缀删子树）。
+    ///
+    /// 生产路径由 `add_items` 触发，但它同时会写真实 SQLite 缓存
+    /// （`DiskCache::instance()`），lib 测试不该污染用户的索引库；
+    /// 这里只暴露同一份内部实现，供 `tests_regression` 的等价性测试驱动。
+    #[cfg(test)]
+    pub fn remove_prefix_for_test(&self, prefix: &str) {
+        self.remove_prefix_internal(prefix);
+    }
+
     /// 返回索引中的条目总数（诊断用：若 >0 但搜索无结果，说明匹配逻辑有问题）
     pub fn entries_len(&self) -> usize {
         self.entries.read().len()
@@ -3540,5 +3550,290 @@ mod tests {
         assert!(!is_same_or_child("C:/foo", "C:/bar"));
         assert!(is_same_or_child("C:/", "C:/Windows"));
         assert!(is_same_or_child("C:/", "C:/"));
+    }
+
+    /// `dir:` 查询的成本拆解：现有"全量窗口扫描" vs "逐条 8B 二元组位图预过滤"。
+    ///
+    /// 背景：`dir:S` = 整条路径大小写不敏感包含，必须遍历全部条目。本基准量化在
+    /// `IndexEntry` 里再存 8B/条的**字节二元组位图**（ASCII 折叠）能否把扫描压下来：
+    /// 位图命中只说明"可能有"，未命中的路径连 `path` 字符串都不必读 —— 而正是
+    /// 每次读 `path`（350MB 分散堆内存）构成了全量扫描的主要成本。
+    ///
+    /// 运行：cargo test --release --lib -- --ignored --nocapture bench_dir_query_cost
+    #[test]
+    #[ignore = "benchmark: 依赖本机持久化索引"]
+    fn bench_dir_query_cost() {
+        use rayon::prelude::*;
+        use std::time::Instant;
+
+        let loaded = match crate::disk_cache::DiskCache::instance().load_global_index() {
+            Ok(e) if !e.is_empty() => e,
+            other => {
+                eprintln!("[bench] 无法加载持久化索引: {:?}", other.map(|e| e.len()));
+                return;
+            }
+        };
+        eprintln!("[bench] 索引条目: {}", loaded.len());
+        let idx = GlobalIndex::new();
+        idx.upsert_batch_internal(loaded);
+
+        // 1) 查询级（公共 API：parse + 并行扫描 + top-K + 结果缓存判定）。
+        //    单查询结果缓存只保留最近一条，交替两个不同查询即可强制每次都真扫
+        //    （否则第二次是缓存切片，测的是缓存不是扫描）。
+        for round in 0..3 {
+            for q in ["dir:windows", "dir:windowz"] {
+                let t = Instant::now();
+                let r = idx.search_with_filter(q, 500);
+                eprintln!(
+                    "[bench] round{round} 查询级 {:<14} 命中{:>6} {:?}",
+                    q,
+                    r.len(),
+                    t.elapsed()
+                );
+            }
+        }
+
+        let entries = idx.entries.read();
+        let n = entries.len();
+
+        // 二元组位图：ASCII 折叠后的相邻**字节**对 → 掩码中的一位。
+        // 哈希必须做足雪崩混合：直接 `key.wrapping_mul(C) >> 26` 只用到 key 的高字节
+        // （ASCII 文本里 ≈30 个取值），实测位图只点亮 ~30 个位置、假阳性率被抬到 32%，
+        // 收益从 ~7x 掉到 2.1x —— 位图的成本在**构建期**（并行、一次性），所以这里
+        // 用完整 splitmix 收敛，热路径只剩几条位测试。
+        #[inline]
+        fn fold(b: u8) -> u8 {
+            if b.is_ascii_uppercase() {
+                b + 32
+            } else {
+                b
+            }
+        }
+        #[inline]
+        fn mix(key: u16) -> u32 {
+            let mut h = (key as u32).wrapping_mul(0x9E37_79B1);
+            h ^= h >> 15;
+            h = h.wrapping_mul(0x85EB_CA6B);
+            h ^= h >> 13;
+            h
+        }
+        #[inline]
+        fn bits_of<const W: u32>(bytes: &[u8]) -> u64 {
+            let mut bits = 0u64;
+            for w in bytes.windows(2) {
+                let key = ((fold(w[0]) as u16) << 8) | fold(w[1]) as u16;
+                bits |= 1u64 << (mix(key) & (W - 1));
+            }
+            bits
+        }
+        /// 变体：折叠后的**字节**集合（64 位，一位一个字节值）。
+        /// 构建更便宜（每字节 3 条指令、不用配对），且 1 字符查询也能用。
+        #[inline]
+        fn char_bits(bytes: &[u8]) -> u64 {
+            let mut bits = 0u64;
+            for b in bytes {
+                bits |= 1u64 << (fold(*b) & 63);
+            }
+            bits
+        }
+        // 非 ASCII 路径一律全 1（全候选）：Unicode 折叠能把一个非 ASCII 字符
+        // 变成 ≥2 个 ASCII 字节（ﬀ→ff、İ→i̇、K(U+212A)→k），按字节判会**漏结果**，
+        // 这部分路径必须排除在预过滤之外（本机占 5.3%）。
+        let blooms64: Vec<u64> = entries
+            .par_iter()
+            .map(|e| {
+                if e.path_ascii {
+                    bits_of::<64>(e.path.as_bytes())
+                } else {
+                    u64::MAX
+                }
+            })
+            .collect();
+        let blooms32: Vec<u64> = entries
+            .par_iter()
+            .map(|e| {
+                if e.path_ascii {
+                    bits_of::<32>(e.path.as_bytes())
+                } else {
+                    u32::MAX as u64
+                }
+            })
+            .collect();
+        let charsets: Vec<u64> = entries
+            .par_iter()
+            .map(|e| {
+                if e.path_ascii {
+                    char_bits(e.path.as_bytes())
+                } else {
+                    u64::MAX
+                }
+            })
+            .collect();
+        // 构建成本：`IndexEntry::new` 里逐条算（串行，等于索引构建/载入路径上的新增开销）
+        let t = Instant::now();
+        let serial_masks: usize = entries
+            .iter()
+            .map(|e| {
+                if e.path_ascii {
+                    char_bits(e.path.as_bytes()) as usize
+                } else {
+                    0
+                }
+            })
+            .fold(0usize, |a, b| a ^ b);
+        let serial_cost = t.elapsed();
+        let t = Instant::now();
+        let gram_bits_cost = entries
+            .par_iter()
+            .map(|e| bits_of::<64>(e.path.as_bytes()) as usize)
+            .sum::<usize>();
+        let par_gram_cost = t.elapsed();
+        eprintln!(
+            "[bench] 掩码计算成本：字节集合(串行,等价于 new() 里逐条算) {serial_cost:?}（xor={serial_masks:x}）；二元组(并行8线程) {par_gram_cost:?}（sum={gram_bits_cost:x}）"
+        );
+        let avg_bits = |b: &[u64]| {
+            b.iter().filter(|x| **x != u64::MAX).map(|x| x.count_ones() as f64).sum::<f64>()
+                / b.len() as f64
+        };
+        eprintln!(
+            "[bench] 位图饱和度：8B 二元组 {:.1}/64 位，4B 二元组 {:.1}/32 位，8B 字节集合 {:.1}/64 位；额外常驻 4B={:.1}MB / 8B={:.1}MB",
+            avg_bits(&blooms64),
+            avg_bits(&blooms32),
+            avg_bits(&charsets),
+            (n * 4) as f64 / 1048576.0,
+            (n * 8) as f64 / 1048576.0
+        );
+
+        // 段倒排索引方案的真实规模：不同（折叠后）段名数量 + 总 postings 数
+        {
+            use std::collections::HashSet;
+            let t = Instant::now();
+            let mut distinct: HashSet<u64> = HashSet::new();
+            let mut postings = 0usize;
+            for e in entries.iter() {
+                let mut start = 0usize;
+                let b = e.path.as_bytes();
+                for i in 0..=b.len() {
+                    if i == b.len() || b[i] == b'/' {
+                        if i > start {
+                            let seg = &b[start..i];
+                            let mut h = 0u64;
+                            for c in seg {
+                                h = h.wrapping_mul(0x100_0000_01b3) ^ fold(*c) as u64;
+                            }
+                            distinct.insert(h);
+                            postings += 1;
+                        }
+                        start = i + 1;
+                    }
+                }
+            }
+            eprintln!(
+                "[bench] 段倒排规模：不同段名 {:.2}M，总 postings {:.2}M → 仅 postings 数组(u32) {:.0}MB + 段名字典(HashMap+字符串) 另计；构建 {:?}",
+                distinct.len() as f64 / 1e6,
+                postings as f64 / 1e6,
+                postings as f64 * 4.0 / 1048576.0,
+                t.elapsed()
+            );
+        }
+
+        fn best(mut f: impl FnMut() -> usize) -> (usize, std::time::Duration) {
+            let mut best = (0usize, std::time::Duration::MAX);
+            for _ in 0..3 {
+                let t = Instant::now();
+                let c = f();
+                let d = t.elapsed();
+                if d < best.1 {
+                    best = (c, d);
+                }
+            }
+            best
+        }
+
+        for needle in ["windows", "projects", "appdata/local/temp", "n"] {
+            let need32 = bits_of::<32>(needle.as_bytes());
+            let need64 = bits_of::<64>(needle.as_bytes());
+            let need_ch = char_bits(needle.as_bytes());
+            let usable = needle.is_ascii() && needle.len() >= 2;
+            let cand32 = blooms32.iter().filter(|b| **b & need32 == need32).count();
+            let cand64 = blooms64.iter().filter(|b| **b & need64 == need64).count();
+            let cand_ch = charsets.iter().filter(|b| **b & need_ch == need_ch).count();
+
+            let hit = |e: &IndexEntry| {
+                contains_ignore_case_known_ascii(&e.path, needle, e.path_ascii)
+            };
+            let floor = best(|| entries.iter().filter(|e| hit(e)).count());
+            let pre32 = best(|| {
+                entries
+                    .iter()
+                    .zip(blooms32.iter())
+                    .filter(|(e, b)| (**b & need32) == need32 && hit(e))
+                    .count()
+            });
+            let pre64 = best(|| {
+                entries
+                    .iter()
+                    .zip(blooms64.iter())
+                    .filter(|(e, b)| (**b & need64) == need64 && hit(e))
+                    .count()
+            });
+            let pre_ch = best(|| {
+                entries
+                    .iter()
+                    .zip(charsets.iter())
+                    .filter(|(e, b)| (**b & need_ch) == need_ch && hit(e))
+                    .count()
+            });
+            let par_floor = best(|| entries.par_iter().filter(|e| hit(e)).count());
+            let par32 = best(|| {
+                entries
+                    .par_iter()
+                    .zip(blooms32.par_iter())
+                    .filter(|(e, b)| (**b & need32) == need32 && hit(e))
+                    .count()
+            });
+            let par64 = best(|| {
+                entries
+                    .par_iter()
+                    .zip(blooms64.par_iter())
+                    .filter(|(e, b)| (**b & need64) == need64 && hit(e))
+                    .count()
+            });
+            let par_ch = best(|| {
+                entries
+                    .par_iter()
+                    .zip(charsets.par_iter())
+                    .filter(|(e, b)| (**b & need_ch) == need_ch && hit(e))
+                    .count()
+            });
+            for (label, got) in [
+                ("4B", pre32.0),
+                ("4B/par", par32.0),
+                ("8B二元组", pre64.0),
+                ("8B字节集", pre_ch.0),
+                ("par", par_ch.0),
+            ] {
+                assert_eq!(floor.0, got, "预过滤改变了命中数（漏/多结果）: {needle} {label}");
+            }
+            eprintln!(
+                "[bench] dir:{:<19} 二元组可用={:<5} 命中率{:>5.2}% | 候选率 4B {:>5.2}% / 8B二元组 {:>5.2}% / 8B字节集 {:>5.2}% | 串行 全扫 {:?} → 8B二元组 {:?} ({:.1}x) / 8B字节集 {:?} ({:.1}x) | 并行 全扫 {:?} → 8B二元组 {:?} ({:.1}x) / 8B字节集 {:?} ({:.1}x)",
+                needle,
+                usable,
+                100.0 * floor.0 as f64 / n as f64,
+                100.0 * cand32 as f64 / n as f64,
+                100.0 * cand64 as f64 / n as f64,
+                100.0 * cand_ch as f64 / n as f64,
+                floor.1,
+                pre64.1,
+                floor.1.as_secs_f64() / pre64.1.as_secs_f64().max(1e-9),
+                pre_ch.1,
+                floor.1.as_secs_f64() / pre_ch.1.as_secs_f64().max(1e-9),
+                par_floor.1,
+                par64.1,
+                par_floor.1.as_secs_f64() / par64.1.as_secs_f64().max(1e-9),
+                par_ch.1,
+                par_floor.1.as_secs_f64() / par_ch.1.as_secs_f64().max(1e-9),
+            );
+        }
     }
 }

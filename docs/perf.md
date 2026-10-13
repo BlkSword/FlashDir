@@ -115,6 +115,7 @@ K 敏感度（命中 310 万条的查询，实测）：
 | 给字节窗口匹配加"首字节大小写两态定位" | **828 ms**（比原 510 ms 更慢） | needle 首字节 `w` 在 Windows 路径里极常见，过滤率低；逐位置分支还引入不可预测跳转。std 的 `windows().any(eq_ignore_ascii_case)` 已足够好。 |
 | `Vec::with_capacity(COUNT(*))` 预分配索引 Vec | 未采用 | `COUNT(*)` 自身 0.5s，大于省下的搬运开销 |
 | SQLite `mmap_size=2GB` + `cache_size=256MB` | 无收益（3.0–3.6s 噪声内） | — |
+| `dir:` 加速：段倒排索引 / 逐条位图预过滤 | 否决（典型 needle 1.8x、长路径片段 3.0x；理论上限仅 ~5–6x） | 实测 `dir:windows` 的真实命中率本就占 14.91%（完美索引也只能把候选降到 14.91%）；段倒排需 **33.66M postings / ≥128MB**，且 postings 存 arena 下标后**每次 `swap_remove` 都要修正**（静默错结果的不变式）；4B/条位图正好塞进 `IndexEntry` 现有 padding（零额外内存）但只值 **1.0–1.2x**；8B/条（+23.8MB）才 1.9–3.0x。判据测试已就位：`tests_regression::dir_query_equivalence_under_random_mutations`（随机变异 + 暴力参考对拍，且已验证"有牙"） |
 
 ## 4. 待办与预期收益
 
