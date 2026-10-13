@@ -209,6 +209,16 @@ truncate），必须补 `VACUUM`，否则首次迁移会把库从 995MB 撑到 *
 4. 预期收益上界：路径内容 350 MB 里目录前缀部分（可由 `dirs` 表共享）保守估计能省
    150–250 MB；代价是冷路径拼接的分配。**先用 `bench_index_memory` 量 before，再决定值不值**。
 
+⚠️ **改布局后 `bench_index_memory` 会失效（必须同步改造它，否则会得出反结论）**：
+一旦 `IndexEntry` 变成"按需从目录表拼出来的视图"（例如 `IndexEntry::from_stored(&DirTable, ..)`）、
+而 arena 里实际存的是 `StoredEntry{dir_id, name}`，那么 benchmark 里
+`entries.iter().map(|e| e.path.capacity())` 量到的是**每次现场拼出来的临时 String**，
+既不是真实常驻，还自带分配开销——实测会出现"堆口径合计 686.6 MB / 231 B 每条、
+与改造前完全一致"的假象（数字一字不差正是"量错了对象"的信号）。
+**正确做法**：改为直接统计 `StoredEntry` arena（`size_of::<StoredEntry>() × n`）+
+`DirTable`（`dirs` 的字符串长度与容量 + `dir_of_path` 哈希表规模）+ `name` 的堆占用，
+并**同时**给出改造前的等价口径（谁都不含临时视图）；两者必须口径一致才可比。
+
 #### (b) P2 USN 增量就地更新：先解决"能不能验证"，再谈实现
 
 **当前环境不具备验证条件**（这是它一直没动的唯一原因，不是难度）：
