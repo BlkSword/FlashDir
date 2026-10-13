@@ -3168,6 +3168,51 @@ mod tests {
         }
     }
 
+    /// 索引常驻内存成本基线（P2 内存局部性优化的 before 依据）。
+    ///
+    /// 只统计**逻辑占用**（结构体 + 两个 String 的 capacity），不含分配器元数据
+    /// （mimalloc 每块约 16B 头，每条约 3 个块 ≈ 48B/条，需另计）。
+    /// 运行：cargo test --release --lib -- --ignored --nocapture bench_index_memory
+    #[test]
+    #[ignore = "benchmark: 依赖本机持久化索引"]
+    fn bench_index_memory() {
+        let entries = match crate::disk_cache::DiskCache::instance().load_global_index() {
+            Ok(e) if !e.is_empty() => e,
+            other => {
+                eprintln!("[bench] 无持久化索引，跳过: {:?}", other.map(|e| e.len()));
+                return;
+            }
+        };
+        let n = entries.len();
+        let struct_bytes = std::mem::size_of::<IndexEntry>() * n;
+        let path_bytes: usize = entries.iter().map(|e| e.path.capacity()).sum();
+        let name_bytes: usize = entries.iter().map(|e| e.name_lower.capacity()).sum();
+        let ascii = entries.iter().filter(|e| e.path_ascii).count();
+        let logical = struct_bytes + path_bytes + name_bytes;
+        eprintln!(
+            "[bench] 索引内存 条目{n} size_of={}B/条 | arena {:.1}MB + path {:.1}MB + name_lower {:.1}MB = 逻辑 {:.1}MB（{:.0}B/条）",
+            std::mem::size_of::<IndexEntry>(),
+            struct_bytes as f64 / 1048576.0,
+            path_bytes as f64 / 1048576.0,
+            name_bytes as f64 / 1048576.0,
+            logical as f64 / 1048576.0,
+            logical as f64 / n as f64
+        );
+        eprintln!(
+            "[bench] 非 ASCII 路径 {}/{}（{:.1}%）→ 这部分必须保留 Unicode 折叠回退",
+            n - ascii,
+            n,
+            (n - ascii) as f64 * 100.0 / n as f64
+        );
+        // 可优化空间的上界：name_lower 可由 path 末段派生（省一次堆分配），
+        // 但它是 Text/Name 过滤的热路径（每条目都要 contains），改成按需派生会拖慢查询。
+        eprintln!(
+            "[bench] 若改为按需派生 name_lower 可省约 {:.1}MB（{:.0}B/条），代价是每次查询重算",
+            name_bytes as f64 / 1048576.0,
+            name_bytes as f64 / n as f64
+        );
+    }
+
     /// 检索延迟与"翻页"代价基准（依赖本机持久化索引）。
     ///
     /// 关注点：offset 分页每次都要**重跑整个 top-K** 并 `clone(limit+offset)` 再丢弃
