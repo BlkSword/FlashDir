@@ -12,6 +12,8 @@ use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::scan::CompactString;
+
 /// 索引中的一项（绝对路径）。
 ///
 /// 存储态只保留 path + name_lower（匹配必需）：
@@ -20,8 +22,15 @@ use serde::Serialize;
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
     pub path: String,
-    /// 小写文件名（搜索用，避免每次搜索对全量 name 做 to_lowercase）
-    pub name_lower: String,
+    /// 小写文件名（搜索用，避免每次搜索对全量 name 做 to_lowercase）。
+    ///
+    /// P2 内存局部性：用 `CompactString`（`SmartString<Compact>`）而不是 `String`。
+    /// 它 ≤23 字节**内联**存放、不占堆块；实测 3,115,724 条里 68.6% 的文件名在 23 字节内，
+    /// 这些条目省掉了一次堆分配（内容 + 每块约 16B 分配器元数据，−40% name_lower 堆占用）；
+    /// `size_of` 与 `String` 同为 24B，**arena 不膨胀**（见 `test_index_entry_size_*`）。
+    /// 匹配热路径 `entry.name_lower.contains(t)` 也因此不再解引用指针。
+    /// `Ord`/`Eq`/`Hash` 都按 `as_str()` 内容比较（见 smartstring 实现），语义与 `String` 一致。
+    pub name_lower: CompactString,
     pub size: i64,
     pub is_dir: bool,
     /// 路径是否全为 ASCII。用于免掉 `contains_ignore_case` 对每条路径的 `is_ascii()` 全串扫描：
@@ -35,7 +44,13 @@ pub struct IndexEntry {
 
 impl IndexEntry {
     /// 唯一推荐的构造入口：`path_ascii` 与 `path` 必须同步派生（手写字段极易漏算）。
-    pub fn new(path: String, name_lower: String, size: i64, is_dir: bool, mtime: i64) -> Self {
+    pub fn new(
+        path: String,
+        name_lower: CompactString,
+        size: i64,
+        is_dir: bool,
+        mtime: i64,
+    ) -> Self {
         Self {
             path_ascii: path.is_ascii(),
             path,
@@ -615,7 +630,7 @@ impl GlobalIndex {
                 // 只保留匹配所需的 name_lower，省掉百万级 String 分配。
                 IndexEntry::new(
                     normalize_abs_path(drive, &f.path),
-                    f.name.to_lowercase(),
+                    f.name.to_lowercase().into(),
                     f.size as i64,
                     f.is_dir,
                     f.mtime,
@@ -638,7 +653,7 @@ impl GlobalIndex {
             .map(|item| {
                 IndexEntry::new(
                     normalize_abs_path(drive, item.path.as_str()),
-                    item.name.to_lowercase(),
+                    item.name.to_lowercase().into(),
                     item.size,
                     item.is_dir,
                     item.mtime,
@@ -716,7 +731,7 @@ impl GlobalIndex {
             .map(|item| {
                 IndexEntry::new(
                     index_path_for(&path_base, item.path.as_str()),
-                    item.name.to_lowercase(),
+                    item.name.to_lowercase().into(),
                     item.size,
                     item.is_dir,
                     item.mtime,
@@ -2468,7 +2483,7 @@ impl GlobalIndex {
             let name = path.rsplit('/').next().unwrap_or("").to_string();
             let rewritten = IndexEntry::new(
                 path,
-                name.to_lowercase(),
+                name.to_lowercase().into(),
                 entry.size,
                 entry.is_dir,
                 entry.mtime,
@@ -2562,7 +2577,7 @@ impl GlobalIndex {
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(change.timestamp / 10_000_000);
-        let entry = IndexEntry::new(current, name.to_lowercase(), size, is_dir_now, mtime);
+        let entry = IndexEntry::new(current, name.to_lowercase().into(), size, is_dir_now, mtime);
         self.upsert_internal(entry.clone());
         sink.upserts.push(entry);
         report.upserts += 1;
@@ -2648,7 +2663,7 @@ mod tests {
     fn search_by_absolute_path_and_fragment() {
         let entry = IndexEntry::new(
             "C:/project/CTX-Audit/harness-private/EQM1-METHODOLOGY.md".to_string(),
-            "eqm1-methodology.md".to_string(),
+            "eqm1-methodology.md".into(),
             59097,
             false,
             0,
@@ -2682,7 +2697,7 @@ mod tests {
         let idx = empty_instance_for_test();
         idx.upsert(IndexEntry::new(
             "C:/project/CTX-Audit/harness-private/EQM1-METHODOLOGY.md".to_string(),
-            "eqm1-methodology.md".to_string(),
+            "eqm1-methodology.md".into(),
             59097,
             false,
             0,
@@ -2943,7 +2958,7 @@ mod tests {
     fn test_apply_filters() {
         let entry = IndexEntry::new(
             "C:/docs/report.pdf".to_string(),
-            "report.pdf".to_string(),
+            "report.pdf".into(),
             1024 * 1024,
             false,
             0,
@@ -2971,7 +2986,7 @@ mod tests {
     fn test_apply_filters_wildcard() {
         let entry = IndexEntry::new(
             "C:/docs/report_2024.pdf".to_string(),
-            "report_2024.pdf".to_string(),
+            "report_2024.pdf".into(),
             1024,
             false,
             0,
@@ -3031,7 +3046,7 @@ mod tests {
             let name = format!("report_{:02}.pdf", i);
             idx.upsert(IndexEntry::new(
                 format!("C:/docs/{}", name),
-                name.to_lowercase(),
+                name.to_lowercase().into(),
                 1024 + i as i64,
                 false,
                 0,
@@ -3041,7 +3056,7 @@ mod tests {
             let name = format!("other_{}.txt", i);
             idx.upsert(IndexEntry::new(
                 format!("C:/docs/{}", name),
-                name.to_lowercase(),
+                name.to_lowercase().into(),
                 10,
                 false,
                 0,
@@ -3079,7 +3094,7 @@ mod tests {
         for name in ["report_2024.pdf", "report_2023.pdf", "notes.txt", "archive.zip"] {
             idx.upsert(IndexEntry::new(
                 format!("C:/docs/{}", name),
-                name.to_string(),
+                name.into(),
                 1024,
                 false,
                 0,
@@ -3108,14 +3123,14 @@ mod tests {
         let idx = empty_instance_for_test();
         idx.upsert(IndexEntry::new(
             "C:/a.txt".to_string(),
-            "a.txt".to_string(),
+            "a.txt".into(),
             100,
             false,
             0,
         ));
         idx.upsert(IndexEntry::new(
             "C:/ab.txt".to_string(),
-            "ab.txt".to_string(),
+            "ab.txt".into(),
             200,
             false,
             0,
@@ -3128,6 +3143,121 @@ mod tests {
         idx.remove_by_path("C:/a.txt");
         let r2 = idx.search_with_filter("a", 10);
         assert_eq!(r2.len(), 1);
+    }
+
+    /// P2 内存局部性**上限断言**：`name_lower` 从 `String` 换成 `CompactString`
+    /// 之后 `size_of::<IndexEntry>()` 不得变大。
+    ///
+    /// 72B 是改造前实测值：两个 24B 堆字符串 + `size`/`mtime` 两个 i64 +
+    /// `is_dir`/`path_ascii` 两个 bool（共用填充）。`CompactString` 也是 24B，
+    /// 因此 arena 不该膨胀；一旦超限，说明"省一次堆分配"的收益被每条多出的
+    /// arena 字节吃掉了，必须重新评估值不值得。
+    #[test]
+    fn test_index_entry_size_not_increased_by_compact_name_lower() {
+        assert_eq!(
+            std::mem::size_of::<crate::scan::CompactString>(),
+            std::mem::size_of::<String>(),
+            "CompactString 必须与 String 同宽（24B），否则 name_lower 会撑大 arena"
+        );
+        const BEFORE_LIMIT: usize = 72;
+        let actual = std::mem::size_of::<IndexEntry>();
+        assert!(
+            actual <= BEFORE_LIMIT,
+            "size_of::<IndexEntry>() = {actual}B 超过了改造前的 {BEFORE_LIMIT}B：内联收益被 arena 膨胀抵消"
+        );
+    }
+
+    /// P2：`name_lower` 改成内联 `CompactString` 后，**读取路径的语义必须逐条不变**。
+    ///
+    /// 覆盖 Text/Name 包含、Prefix/Suffix、`ext:`、`dir:`、NOT、非 ASCII 名，
+    /// 以及两种存储表示：≤23B 内联（无堆块）与 >23B 堆块。断言的是**命中集合 + 顺序**
+    /// （相关性分数降序 → name_lower 升序 → path 升序），而不是内部结构。
+    #[test]
+    fn test_name_lower_compact_keeps_search_semantics() {
+        // (path, name_lower)：前 4 条 ≤23B → 内联；后 2 条 >23B → 堆块
+        let cases: [(&str, &str); 6] = [
+            ("C:/docs/report.txt", "report.txt"),
+            ("C:/docs/Report_Final.PDF", "report_final.pdf"),
+            ("C:/src/node_modules", "node_modules"),
+            ("C:/数据/文件.日志", "文件.日志"),
+            (
+                "C:/docs/a_rather_long_report_name_2024.pdf",
+                "a_rather_long_report_name_2024.pdf",
+            ),
+            (
+                "C:/docs/another_very_long_name_here.txt",
+                "another_very_long_name_here.txt",
+            ),
+        ];
+        assert_eq!(
+            cases.iter().filter(|(_, n)| n.len() <= 23).count(),
+            4,
+            "这条测试必须同时覆盖内联与堆块两种表示，别把数据改成清一色"
+        );
+
+        let idx = empty_instance_for_test();
+        for (path, name_lower) in cases {
+            let nl: crate::scan::CompactString = name_lower.into();
+            // 内联判据就是"≤23 字节"，顺带把两种表示真的钉住
+            assert_eq!(
+                nl.is_inline(),
+                name_lower.len() <= 23,
+                "内联判据必须恰好是 ≤23 字节: {name_lower:?} ({}B)",
+                name_lower.len()
+            );
+            idx.upsert(IndexEntry::new(path.to_string(), nl, 10, false, 0));
+        }
+
+        // 结果 → cases 下标；下标即"期望命中集合 + 顺序"的紧凑表达
+        let hits = |q: &str| -> Vec<usize> {
+            idx.search_with_filter(q, 10)
+                .iter()
+                .map(|e| {
+                    cases
+                        .iter()
+                        .position(|(p, _)| *p == e.path)
+                        .unwrap_or_else(|| panic!("结果里出现了没构造过的条目: {}", e.path))
+                })
+                .collect()
+        };
+
+        // 表示覆盖：6 条全回来，其中 4 条内联（省掉堆块）
+        let all = idx.search_with_filter("size:>0", 10);
+        assert_eq!(all.len(), cases.len());
+        assert_eq!(
+            all.iter().filter(|e| e.name_lower.is_inline()).count(),
+            4,
+            "≤23B 的 4 条必须内联；>23B 的 2 条走堆块"
+        );
+        // 同分同长时按 name_lower 升序（末位是中文名，UTF-8 字节序排在 ASCII 之后）
+        assert_eq!(hits("size:>0"), vec![4, 5, 2, 0, 1, 3]);
+
+        // Text 包含 + 相关性：以 "report" 开头的高于仅包含的
+        assert_eq!(hits("report"), vec![0, 1, 4]);
+        // Name 域包含（含大小写折叠：索引里存的是小写，查询也被折成小写）
+        assert_eq!(hits("name:NODE_MODULES"), vec![2]);
+        // Prefix：走"首字符桶"快路径
+        assert_eq!(hits("report*"), vec![0, 1]);
+        // Suffix（*.pdf → 后缀过滤），含 >23B 的那条
+        assert_eq!(hits("*.txt"), vec![5, 0]);
+        // ext: 现算（从 name_lower 的最后一个 '.' 之后取）
+        assert_eq!(hits("ext:pdf"), vec![4, 1]);
+        // dir: 走路径包含
+        assert_eq!(hits("dir:docs"), vec![4, 5, 0, 1]);
+        // NOT
+        assert_eq!(hits("NOT *.pdf"), vec![5, 2, 0, 3]);
+        // 非 ASCII 名（多字节但 ≤23B → 内联）
+        assert_eq!(hits("文件"), vec![3]);
+        assert_eq!(hits("ext:日志"), vec![3]);
+
+        // 返回内容本身：path / size / isDir / mtime 原样，name_lower 逐字节相等
+        let one = idx.search_with_filter("name:report.txt", 10);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].path, "C:/docs/report.txt");
+        assert_eq!(one[0].name_lower, "report.txt");
+        assert_eq!(one[0].size, 10);
+        assert!(!one[0].is_dir);
+        assert_eq!(one[0].mtime, 0);
     }
 
     /// 真实数据基准：从 ~/.flashdir/cache_v2.db 加载持久化索引（百万级），
@@ -3180,12 +3310,59 @@ mod tests {
 
     /// 索引常驻内存成本基线（P2 内存局部性优化的 before 依据）。
     ///
-    /// 只统计**逻辑占用**（结构体 + 两个 String 的 capacity），不含分配器元数据
-    /// （mimalloc 每块约 16B 头，每条约 3 个块 ≈ 48B/条，需另计）。
+    /// **口径**：`name_lower` 已改为 `CompactString`（`SmartString<Compact>`，≤23B 内联）。
+    /// 它的 `.capacity()` 对内联串**恒返回 `MAX_INLINE`(23)**，直接求和会把"零分配"
+    /// 记成 23B/条，与 `String` 的 `capacity` 不可比。因此这里以
+    /// `HeapStr::heap_bytes()`（**堆分配字节数**：无堆块记 0，否则 capacity + 每块约 16B
+    /// 分配器元数据）为主口径；裸 capacity 仍打印，供与旧报告（`path 350.8MB /
+    /// name_lower 76.0MB`，两者当时都是 `String`）对齐。
     /// 运行：cargo test --release --lib -- --ignored --nocapture bench_index_memory
     #[test]
     #[ignore = "benchmark: 依赖本机持久化索引"]
     fn bench_index_memory() {
+        /// mimalloc 每块分配的近似元数据开销（旧报告里引用的 16B/块）。
+        const ALLOC_HEADER: usize = 16;
+
+        /// 把不同字符串类型如实换算到同一"堆分配字节数"口径，before/after 才可比。
+        trait HeapStr {
+            /// 堆分配字节数：无堆块记 0，否则 `capacity + ALLOC_HEADER`。
+            fn heap_bytes(&self) -> usize;
+            /// 裸 `capacity()`（`String` = 堆块大小；内联 `CompactString` = MAX_INLINE）。
+            fn raw_capacity(&self) -> usize;
+            /// true = 字面量全部存在行内，没有堆块。
+            fn no_heap(&self) -> bool;
+        }
+        impl HeapStr for String {
+            fn heap_bytes(&self) -> usize {
+                if self.capacity() == 0 {
+                    0
+                } else {
+                    self.capacity() + ALLOC_HEADER
+                }
+            }
+            fn raw_capacity(&self) -> usize {
+                self.capacity()
+            }
+            fn no_heap(&self) -> bool {
+                self.capacity() == 0
+            }
+        }
+        impl HeapStr for crate::scan::CompactString {
+            fn heap_bytes(&self) -> usize {
+                if self.is_inline() {
+                    0
+                } else {
+                    self.capacity() + ALLOC_HEADER
+                }
+            }
+            fn raw_capacity(&self) -> usize {
+                self.capacity()
+            }
+            fn no_heap(&self) -> bool {
+                self.is_inline()
+            }
+        }
+
         let entries = match crate::disk_cache::DiskCache::instance().load_global_index() {
             Ok(e) if !e.is_empty() => e,
             other => {
@@ -3194,19 +3371,60 @@ mod tests {
             }
         };
         let n = entries.len();
+        let mb = |b: usize| b as f64 / 1048576.0;
         let struct_bytes = std::mem::size_of::<IndexEntry>() * n;
-        let path_bytes: usize = entries.iter().map(|e| e.path.capacity()).sum();
-        let name_bytes: usize = entries.iter().map(|e| e.name_lower.capacity()).sum();
+        let path_bytes: usize = entries.iter().map(|e| e.path.raw_capacity()).sum();
+        let name_bytes: usize = entries.iter().map(|e| e.name_lower.raw_capacity()).sum();
+        let path_heap: usize = entries.iter().map(|e| e.path.heap_bytes()).sum();
+        let name_heap: usize = entries.iter().map(|e| e.name_lower.heap_bytes()).sum();
+        let name_inline = entries.iter().filter(|e| e.name_lower.no_heap()).count();
+        let name_heap_cap: usize = entries
+            .iter()
+            .filter(|e| !e.name_lower.no_heap())
+            .map(|e| e.name_lower.raw_capacity())
+            .sum();
+        // ⑤ path 是否也值得改 CompactString：内联阈值 23B 命中率 + `String` 的容量冗余决定答案
+        let path_len: usize = entries.iter().map(|e| e.path.len()).sum();
+        let path_short = entries.iter().filter(|e| e.path.len() <= 23).count();
         let ascii = entries.iter().filter(|e| e.path_ascii).count();
         let logical = struct_bytes + path_bytes + name_bytes;
         eprintln!(
             "[bench] 索引内存 条目{n} size_of={}B/条 | arena {:.1}MB + path {:.1}MB + name_lower {:.1}MB = 逻辑 {:.1}MB（{:.0}B/条）",
             std::mem::size_of::<IndexEntry>(),
-            struct_bytes as f64 / 1048576.0,
-            path_bytes as f64 / 1048576.0,
-            name_bytes as f64 / 1048576.0,
-            logical as f64 / 1048576.0,
+            mb(struct_bytes),
+            mb(path_bytes),
+            mb(name_bytes),
+            mb(logical),
             logical as f64 / n as f64
+        );
+        let logical_heap = struct_bytes + path_heap + name_heap;
+        eprintln!(
+            "[bench] 堆分配口径(含16B/块) | arena {:.1}MB + path {:.1}MB + name_lower {:.1}MB = {:.1}MB（{:.0}B/条）",
+            mb(struct_bytes),
+            mb(path_heap),
+            mb(name_heap),
+            mb(logical_heap),
+            logical_heap as f64 / n as f64
+        );
+        eprintln!(
+            "[bench] name_lower 无堆块 {}/{}（{:.1}%）→ 这部分省掉的正是堆块 + 16B 分配器头",
+            name_inline,
+            n,
+            name_inline as f64 * 100.0 / n as f64
+        );
+        eprintln!(
+            "[bench] name_lower 有堆块的那部分 capacity 合计 {:.1}MB（{:.0}B/堆块条，篇幅 >23B 的长名）",
+            mb(name_heap_cap),
+            name_heap_cap as f64 / (n - name_inline).max(1) as f64
+        );
+        eprintln!(
+            "[bench] path 实际长度 {:.1}MB vs capacity {:.1}MB（冗余 {:.1}%）；≤23B 可内联的只有 {}/{}（{:.3}%）",
+            mb(path_len),
+            mb(path_bytes),
+            (path_bytes as f64 - path_len as f64) * 100.0 / path_bytes as f64,
+            path_short,
+            n,
+            path_short as f64 * 100.0 / n as f64
         );
         eprintln!(
             "[bench] 非 ASCII 路径 {}/{}（{:.1}%）→ 这部分必须保留 Unicode 折叠回退",
@@ -3214,12 +3432,12 @@ mod tests {
             n,
             (n - ascii) as f64 * 100.0 / n as f64
         );
-        // 可优化空间的上界：name_lower 可由 path 末段派生（省一次堆分配），
-        // 但它是 Text/Name 过滤的热路径（每条目都要 contains），改成按需派生会拖慢查询。
+        // 剩下的可优化空间：name_lower 仍有堆块的部分必然来自 >23B 的长文件名。
+        // 再往下降只能改成"按需从 path 派生（每次查询重算）"，但它是 Text/Name 过滤的热路径。
         eprintln!(
-            "[bench] 若改为按需派生 name_lower 可省约 {:.1}MB（{:.0}B/条），代价是每次查询重算",
-            name_bytes as f64 / 1048576.0,
-            name_bytes as f64 / n as f64
+            "[bench] name_lower 剩余堆占用 {:.1}MB（{:.0}B/条，全来自 >23B 的长文件名）；再降只能改为按需派生",
+            mb(name_heap),
+            name_heap as f64 / n as f64
         );
     }
 

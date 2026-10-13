@@ -17,7 +17,8 @@ fn entry(path: &str, size: i64) -> IndexEntry {
         .rsplit('/')
         .next()
         .unwrap_or(path)
-        .to_lowercase();
+        .to_lowercase()
+        .into();
     IndexEntry::new(path.to_string(), name_lower, size, false, 0)
 }
 
@@ -283,7 +284,7 @@ fn path_ascii_flag_keeps_path_contains_semantics() {
 
     let idx = empty_instance_for_test();
     for &(path, _) in cases {
-        let name_lower = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+        let name_lower = path.rsplit('/').next().unwrap_or(path).to_lowercase().into();
         idx.upsert(IndexEntry::new(path.to_string(), name_lower, 1, false, 0));
     }
 
@@ -291,7 +292,7 @@ fn path_ascii_flag_keeps_path_contains_semantics() {
     let mut non_ascii_paths = 0usize;
     for &(path, needles) in cases {
         // 构造函数必须真的派生标记：漏算/写死都会让热路径判错
-        let probe = IndexEntry::new(path.to_string(), String::new(), 1, false, 0);
+        let probe = IndexEntry::new(path.to_string(), String::new().into(), 1, false, 0);
         assert_eq!(
             probe.path_ascii,
             path.is_ascii(),
@@ -446,7 +447,7 @@ fn gen_path(rng: &mut Rng) -> String {
 }
 
 fn dir_entry(path: &str, is_dir: bool) -> IndexEntry {
-    let name_lower = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    let name_lower = path.rsplit('/').next().unwrap_or(path).to_lowercase().into();
     IndexEntry::new(path.to_string(), name_lower, path.len() as i64, is_dir, 0)
 }
 

@@ -1804,7 +1804,7 @@ fn try_usn_incremental_update(
                             let name = name_from_path(&child.path);
                             upserted_entries.push(crate::global_search::IndexEntry::new(
                                 child.path.to_string(),
-                                name.to_lowercase(),
+                                name.to_lowercase().into(),
                                 child.size,
                                 child.is_dir,
                                 child.mtime,
@@ -1816,7 +1816,7 @@ fn try_usn_incremental_update(
             }
             upserted_entries.push(crate::global_search::IndexEntry::new(
                 abs.clone(),
-                change.name.to_lowercase(),
+                change.name.to_lowercase().into(),
                 file_size,
                 is_dir,
                 file_mtime,
@@ -1845,7 +1845,7 @@ fn try_usn_incremental_update(
                         let name = name_from_path(&item.path);
                         upserted_entries.push(crate::global_search::IndexEntry::new(
                             abs.clone(),
-                            name.to_lowercase(),
+                            name.to_lowercase().into(),
                             new_size,
                             false,
                             record.mtime,

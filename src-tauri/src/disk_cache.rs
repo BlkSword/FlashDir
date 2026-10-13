@@ -479,11 +479,15 @@ fn rebuild_global_index_schema(conn: &mut Connection, cols: &[String]) -> Result
 /// P0-3a'：`global_index.name_lower` 的取值就是"path 末段的小写"，派生可以省掉
 /// 310 万行的整列读取（实测 3,104,835 行"派生 == 存储"零不一致）。
 /// 与 `name_from_path` 的 `rsplit_once('/')` 语义一致：`"C:/"` → `""`。
+///
+/// P2：返回值是 `CompactString`（`IndexEntry::name_lower` 的类型）——≤23B 的小写文件名
+/// 直接内联在该字段里，不再为每条落一次堆分配。中间仍是一次 `to_lowercase()`（返回 String），
+/// `into()` 对 >23B 的会复用那块堆缓冲，对 ≤23B 的则回收它并改为内联。
 #[inline]
-fn name_lower_from_path(path: &str) -> String {
+fn name_lower_from_path(path: &str) -> CompactString {
     match path.rfind('/') {
-        Some(i) => path[i + 1..].to_lowercase(),
-        None => path.to_lowercase(),
+        Some(i) => path[i + 1..].to_lowercase().into(),
+        None => path.to_lowercase().into(),
     }
 }
 
@@ -1654,7 +1658,7 @@ impl DiskCache {
                         stmt.execute(params![
                             entry.path,
                             "",
-                            entry.name_lower,
+                            entry.name_lower.as_str(),
                             "",
                             entry.size,
                             entry.is_dir as i64,
@@ -2143,7 +2147,7 @@ mod tests {
             .map(|i| {
                 IndexEntry::new(
                     format!("C:/bulk/dir{}/file{i}.dat", i % 13),
-                    format!("file{i}.dat"),
+                    format!("file{i}.dat").into(),
                     i as i64 * 3,
                     i % 7 == 0,
                     1_700_000_000 + i as i64,
@@ -2242,7 +2246,7 @@ mod tests {
             .map(|i| {
                 IndexEntry::new(
                     format!("C:/x/f{i}.bin"),
-                    format!("f{i}.bin"),
+                    format!("f{i}.bin").into(),
                     i as i64,
                     false,
                     i as i64,
@@ -2734,10 +2738,11 @@ mod tests {
     // 统一跑法：cargo test --release --lib -- --ignored --nocapture bench
     /// 与 global_search::name_from_path 同构的"路径末段小写"派生。
     /// 基准里用它验证：能否省掉 name_lower 列的读取而结果不变。
-    fn last_segment_lower(path: &str) -> String {
+    /// 返回 `CompactString`：与 `IndexEntry::name_lower` 同型（P2 后 ≤23B 内联）。
+    fn last_segment_lower(path: &str) -> CompactString {
         match path.rfind('/') {
-            Some(i) => path[i + 1..].to_lowercase(),
-            None => path.to_lowercase(),
+            Some(i) => path[i + 1..].to_lowercase().into(),
+            None => path.to_lowercase().into(),
         }
     }
 
@@ -2789,7 +2794,7 @@ mod tests {
                 )
             } else {
                 (
-                    row.get::<_, String>(1).unwrap(),
+                    row.get::<_, String>(1).unwrap().into(),
                     row.get::<_, i64>(2).unwrap(),
                     row.get::<_, i64>(3).unwrap() != 0,
                     row.get::<_, i64>(4).unwrap(),
