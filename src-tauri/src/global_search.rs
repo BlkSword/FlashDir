@@ -24,8 +24,27 @@ pub struct IndexEntry {
     pub name_lower: String,
     pub size: i64,
     pub is_dir: bool,
+    /// 路径是否全为 ASCII。用于免掉 `contains_ignore_case` 对每条路径的 `is_ascii()` 全串扫描：
+    /// 纯 ASCII 路径上字节窗口扫描就是最终结论，不需要 Unicode 折叠回退。
+    /// 结构体本就有 `is_dir: bool`，两个 bool 共用填充：实测 `size_of::<IndexEntry>()`
+    /// 加字段前后都是 72B（旧字段 65B → 对齐 72B，新 66B → 仍 72B），每条不增加内存。
+    pub path_ascii: bool,
     /// 文件修改时间（Windows FILETIME 转换而来的 Unix 时间戳，目录为 0）
     pub mtime: i64,
+}
+
+impl IndexEntry {
+    /// 唯一推荐的构造入口：`path_ascii` 与 `path` 必须同步派生（手写字段极易漏算）。
+    pub fn new(path: String, name_lower: String, size: i64, is_dir: bool, mtime: i64) -> Self {
+        Self {
+            path_ascii: path.is_ascii(),
+            path,
+            name_lower,
+            size,
+            is_dir,
+            mtime,
+        }
+    }
 }
 
 impl Serialize for IndexEntry {
@@ -594,13 +613,13 @@ impl GlobalIndex {
             .map(|f| {
                 // 存储态不保留 name / ext（结果与诊断时由 path 派生），
                 // 只保留匹配所需的 name_lower，省掉百万级 String 分配。
-                IndexEntry {
-                    path: normalize_abs_path(drive, &f.path),
-                    name_lower: f.name.to_lowercase(),
-                    size: f.size as i64,
-                    is_dir: f.is_dir,
-                    mtime: f.mtime,
-                }
+                IndexEntry::new(
+                    normalize_abs_path(drive, &f.path),
+                    f.name.to_lowercase(),
+                    f.size as i64,
+                    f.is_dir,
+                    f.mtime,
+                )
             })
             .collect();
         self.upsert_batch_internal(batch);
@@ -616,12 +635,14 @@ impl GlobalIndex {
     pub fn append_scan(&self, drive: char, items: &[crate::scan::Item]) {
         let batch: Vec<IndexEntry> = items
             .iter()
-            .map(|item| IndexEntry {
-                path: normalize_abs_path(drive, item.path.as_str()),
-                name_lower: item.name.to_lowercase(),
-                size: item.size,
-                is_dir: item.is_dir,
-                mtime: item.mtime,
+            .map(|item| {
+                IndexEntry::new(
+                    normalize_abs_path(drive, item.path.as_str()),
+                    item.name.to_lowercase(),
+                    item.size,
+                    item.is_dir,
+                    item.mtime,
+                )
             })
             .collect();
         self.upsert_batch_internal(batch);
@@ -692,12 +713,14 @@ impl GlobalIndex {
 
         let batch: Vec<IndexEntry> = items
             .iter()
-            .map(|item| IndexEntry {
-                path: index_path_for(&path_base, item.path.as_str()),
-                name_lower: item.name.to_lowercase(),
-                size: item.size,
-                is_dir: item.is_dir,
-                mtime: item.mtime,
+            .map(|item| {
+                IndexEntry::new(
+                    index_path_for(&path_base, item.path.as_str()),
+                    item.name.to_lowercase(),
+                    item.size,
+                    item.is_dir,
+                    item.mtime,
+                )
             })
             .collect();
 
@@ -1231,7 +1254,9 @@ fn apply_filters_at(entry: &IndexEntry, filters: &[SearchFilter], now: i64) -> b
     for f in filters {
         let matched = match &f.kind {
             SearchFilterKind::Text(t) => entry.name_lower.contains(t),
-            SearchFilterKind::PathText(p) => contains_ignore_case(&entry.path, p),
+            SearchFilterKind::PathText(p) => {
+                contains_ignore_case_known_ascii(&entry.path, p, entry.path_ascii)
+            }
             SearchFilterKind::Name(n) => entry.name_lower.contains(n),
             SearchFilterKind::Prefix(p) => entry.name_lower.starts_with(p),
             SearchFilterKind::Suffix(s) => entry.name_lower.ends_with(s),
@@ -1245,7 +1270,9 @@ fn apply_filters_at(entry: &IndexEntry, filters: &[SearchFilter], now: i64) -> b
                         .unwrap_or(false)
             }
             // 用无分配的 ASCII 快速路径，避免每条目一次 String 分配
-            SearchFilterKind::Dir(d) => contains_ignore_case(&entry.path, d),
+            SearchFilterKind::Dir(d) => {
+                contains_ignore_case_known_ascii(&entry.path, d, entry.path_ascii)
+            }
             SearchFilterKind::Type { is_dir } => entry.is_dir == *is_dir,
             SearchFilterKind::Size { op, bytes } => compare_op(entry.size, *op, *bytes),
             SearchFilterKind::Mtime { op, seconds } => {
@@ -1378,6 +1405,48 @@ fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
         return false;
     }
     haystack.to_lowercase().contains(needle_lower)
+}
+
+/// 与 `contains_ignore_case` 语义完全一致，但调用方已知 `haystack_is_ascii`
+/// （来自 `IndexEntry::path_ascii`，入库时算过一次）。
+///
+/// 热路径收益：`dir:` / `PathText` 要在 310 万条完整路径上逐条判定。原实现窗口未命中后
+/// 必然对每条路径再做一次 `is_ascii()` 全串扫描；带标记后纯 ASCII 路径（本机索引 94.7%）
+/// 的未命中判定只剩字节窗口扫描，不再扫 `is_ascii()`、也不分配。
+///
+/// 实测（约 310 万条真实索引，needle="windows"，4 个变体交替跑 3 轮取最小，多次运行波动 ±3ms）：
+/// 纯窗口扫描 427ms / 旧 `contains_ignore_case` 562ms / 本函数（真实标记）506ms。
+/// 差掉的约 56ms 正是 294 万条 ASCII 路径上的 `is_ascii()`（单次全量冷扫 100~145ms，
+/// 但热路径里路径字节已被窗口扫描带入缓存，故计入 loop 后只值这个数）；剩下的约 72ms
+/// 是 16.4 万条非 ASCII 路径走 Unicode 折叠回退时 `to_lowercase()` 分配的成本 —— 那部分
+/// 不能省，省掉就会漏掉西里尔 / `İ` 这类只有折叠后才能命中的路径。
+///
+/// 语义等价性：`haystack_is_ascii == true` 时，字节窗口比较已覆盖全部 ASCII 折叠，
+/// 未命中就是最终结论 —— 与原实现 `if haystack.is_ascii() { return false; }` 是同一条分支，
+/// 只是判定结果改成构造期缓存。`haystack_is_ascii == false` 时原样回退完整实现。
+fn contains_ignore_case_known_ascii(
+    haystack: &str,
+    needle_lower: &str,
+    haystack_is_ascii: bool,
+) -> bool {
+    if !haystack_is_ascii {
+        return contains_ignore_case(haystack, needle_lower);
+    }
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle_lower.len() {
+        return false;
+    }
+    // needle 不含大小写字符（CJK/数字/标点）时折叠是恒等变换，字节包含即最终结论。
+    if !has_cased_char(needle_lower) {
+        return haystack.contains(needle_lower);
+    }
+    // 纯 ASCII haystack：大小写折叠只涉及 ASCII，字节窗口扫描即完整判定。
+    haystack
+        .as_bytes()
+        .windows(needle_lower.len())
+        .any(|w| w.eq_ignore_ascii_case(needle_lower.as_bytes()))
 }
 
 fn starts_with_ignore_case_ci(haystack: &str, prefix_lower: &str) -> bool {
@@ -1655,9 +1724,11 @@ pub fn repair_corrupt_path(path: &str) -> Option<String> {
 
 /// 入库兜底：路径里出现反斜杠说明上游漏了规范化（历史脏数据或新增调用点）。
 /// 命中概率极低，因此只有真的含 `\` 时才走慢路径。
-fn repair_entry_path(mut entry: IndexEntry) -> IndexEntry {
+fn repair_entry_path(entry: IndexEntry) -> IndexEntry {
     if entry.path.as_bytes().contains(&b'\\') {
-        entry.path = normalize_index_path(&entry.path).into_owned();
+        // 路径被改写 → 必须重算 path_ascii（走构造函数，别手写字段）
+        let path = normalize_index_path(&entry.path).into_owned();
+        return IndexEntry::new(path, entry.name_lower, entry.size, entry.is_dir, entry.mtime);
     }
     entry
 }
@@ -2385,13 +2456,13 @@ impl GlobalIndex {
             };
             let path = format!("{new_prefix}{suffix}");
             let name = path.rsplit('/').next().unwrap_or("").to_string();
-            let rewritten = IndexEntry {
+            let rewritten = IndexEntry::new(
                 path,
-                name_lower: name.to_lowercase(),
-                size: entry.size,
-                is_dir: entry.is_dir,
-                mtime: entry.mtime,
-            };
+                name.to_lowercase(),
+                entry.size,
+                entry.is_dir,
+                entry.mtime,
+            );
             self.upsert_internal(rewritten.clone());
             sink.upserts.push(rewritten);
             sink.removals.push(old_entry_path);
@@ -2481,13 +2552,7 @@ impl GlobalIndex {
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
             .unwrap_or(change.timestamp / 10_000_000);
-        let entry = IndexEntry {
-            path: current,
-            name_lower: name.to_lowercase(),
-            size,
-            is_dir: is_dir_now,
-            mtime,
-        };
+        let entry = IndexEntry::new(current, name.to_lowercase(), size, is_dir_now, mtime);
         self.upsert_internal(entry.clone());
         sink.upserts.push(entry);
         report.upserts += 1;
@@ -2571,13 +2636,13 @@ mod tests {
     /// （Windows 文件名不允许出现 `/`、`\`，所以含分隔符的输入只能按路径匹配）。
     #[test]
     fn search_by_absolute_path_and_fragment() {
-        let entry = IndexEntry {
-            path: "C:/project/CTX-Audit/harness-private/EQM1-METHODOLOGY.md".to_string(),
-            name_lower: "eqm1-methodology.md".to_string(),
-            size: 59097,
-            is_dir: false,
-            mtime: 0,
-        };
+        let entry = IndexEntry::new(
+            "C:/project/CTX-Audit/harness-private/EQM1-METHODOLOGY.md".to_string(),
+            "eqm1-methodology.md".to_string(),
+            59097,
+            false,
+            0,
+        );
         let hit = |q: &str| apply_filters(&entry, &parse_search_filter(q));
 
         assert!(hit("eqm1-methodology.md"), "按文件名");
@@ -2605,13 +2670,13 @@ mod tests {
     #[test]
     fn search_matches_substring_anywhere_in_name() {
         let idx = empty_instance_for_test();
-        idx.upsert(IndexEntry {
-            path: "C:/project/CTX-Audit/harness-private/EQM1-METHODOLOGY.md".to_string(),
-            name_lower: "eqm1-methodology.md".to_string(),
-            size: 59097,
-            is_dir: false,
-            mtime: 0,
-        });
+        idx.upsert(IndexEntry::new(
+            "C:/project/CTX-Audit/harness-private/EQM1-METHODOLOGY.md".to_string(),
+            "eqm1-methodology.md".to_string(),
+            59097,
+            false,
+            0,
+        ));
         for q in [
             "qm1-methodology",
             "qm1-methodology.md",
@@ -2866,13 +2931,13 @@ mod tests {
 
     #[test]
     fn test_apply_filters() {
-        let entry = IndexEntry {
-            path: "C:/docs/report.pdf".to_string(),
-            name_lower: "report.pdf".to_string(),
-            size: 1024 * 1024,
-            is_dir: false,
-            mtime: 0,
-        };
+        let entry = IndexEntry::new(
+            "C:/docs/report.pdf".to_string(),
+            "report.pdf".to_string(),
+            1024 * 1024,
+            false,
+            0,
+        );
         let filters = vec![
             SearchFilter {
                 kind: SearchFilterKind::Text("report".to_string()),
@@ -2894,13 +2959,13 @@ mod tests {
 
     #[test]
     fn test_apply_filters_wildcard() {
-        let entry = IndexEntry {
-            path: "C:/docs/report_2024.pdf".to_string(),
-            name_lower: "report_2024.pdf".to_string(),
-            size: 1024,
-            is_dir: false,
-            mtime: 0,
-        };
+        let entry = IndexEntry::new(
+            "C:/docs/report_2024.pdf".to_string(),
+            "report_2024.pdf".to_string(),
+            1024,
+            false,
+            0,
+        );
 
         assert!(apply_filters(
             &entry,
@@ -2954,23 +3019,23 @@ mod tests {
         let idx = empty_instance_for_test();
         for i in 0..25 {
             let name = format!("report_{:02}.pdf", i);
-            idx.upsert(IndexEntry {
-                path: format!("C:/docs/{}", name),
-                name_lower: name.to_lowercase(),
-                size: 1024 + i as i64,
-                is_dir: false,
-                mtime: 0,
-            });
+            idx.upsert(IndexEntry::new(
+                format!("C:/docs/{}", name),
+                name.to_lowercase(),
+                1024 + i as i64,
+                false,
+                0,
+            ));
         }
         for i in 0..5 {
             let name = format!("other_{}.txt", i);
-            idx.upsert(IndexEntry {
-                path: format!("C:/docs/{}", name),
-                name_lower: name.to_lowercase(),
-                size: 10,
-                is_dir: false,
-                mtime: 0,
-            });
+            idx.upsert(IndexEntry::new(
+                format!("C:/docs/{}", name),
+                name.to_lowercase(),
+                10,
+                false,
+                0,
+            ));
         }
 
         let (page1, total1) = idx.search_with_filter_paged("report", 10, 0);
@@ -3002,13 +3067,13 @@ mod tests {
     fn test_search_with_filter_suffix_syntax() {
         let idx = empty_instance_for_test();
         for name in ["report_2024.pdf", "report_2023.pdf", "notes.txt", "archive.zip"] {
-            idx.upsert(IndexEntry {
-                path: format!("C:/docs/{}", name),
-                name_lower: name.to_string(),
-                size: 1024,
-                is_dir: false,
-                mtime: 0,
-            });
+            idx.upsert(IndexEntry::new(
+                format!("C:/docs/{}", name),
+                name.to_string(),
+                1024,
+                false,
+                0,
+            ));
         }
 
         let r = idx.search_with_filter("*.pdf", 10);
@@ -3031,20 +3096,20 @@ mod tests {
     #[test]
     fn test_global_index_upsert_and_search() {
         let idx = empty_instance_for_test();
-        idx.upsert(IndexEntry {
-            path: "C:/a.txt".to_string(),
-            name_lower: "a.txt".to_string(),
-            size: 100,
-            is_dir: false,
-            mtime: 0,
-        });
-        idx.upsert(IndexEntry {
-            path: "C:/ab.txt".to_string(),
-            name_lower: "ab.txt".to_string(),
-            size: 200,
-            is_dir: false,
-            mtime: 0,
-        });
+        idx.upsert(IndexEntry::new(
+            "C:/a.txt".to_string(),
+            "a.txt".to_string(),
+            100,
+            false,
+            0,
+        ));
+        idx.upsert(IndexEntry::new(
+            "C:/ab.txt".to_string(),
+            "ab.txt".to_string(),
+            200,
+            false,
+            0,
+        ));
         let r = idx.search_with_filter("a", 10);
         assert_eq!(r.len(), 2);
         // ab.txt 是前缀匹配，相关性高于 a.txt 的包含匹配
@@ -3188,33 +3253,102 @@ mod tests {
         }
 
         // P1-2b 对照：ASCII needle 的"路径包含"匹配（`dir:` / `PathText` 的热点）。
-        // 纯窗口扫描是这条路径的理论下限；完整 contains_ignore_case 若明显更慢，
-        // 说明它在未命中时多做了事（例如分配小写副本）。
+        // 三段：① 纯窗口扫描（理论上限速）；② 旧 `contains_ignore_case`（窗口未命中后还要
+        // 对每条路径做一次 `is_ascii()`，纯 ASCII 路径才需要它）；③ 新的带标记快路径
+        // （`is_ascii` 的结果来自构造期的 `entry.path_ascii`，不再逐条扫描）。
+        // 4 个变体交替跑 3 轮取最小值（单轮会被并行编译/页缓存抖动放大）；
+        // ①②③ 的命中数必须完全一致。
         {
             let needle = "windows";
             let n = needle.as_bytes();
             let entries = idx.entries.read();
+
+            // 先量化"标记覆盖到什么程度"：只有 ASCII 路径才吃得到免扫收益。
+            // 顺带在全量真实索引上验证 `path_ascii` 与 `path.is_ascii()` 完全一致
+            // （任何构造点漏算都会在这里被打出来）。
             let t = Instant::now();
-            let floor = entries
-                .iter()
-                .filter(|e| {
-                    e.path
-                        .as_bytes()
-                        .windows(n.len())
-                        .any(|w| w.eq_ignore_ascii_case(n))
-                })
-                .count();
-            let floor_ms = t.elapsed();
-            let t = Instant::now();
-            let full = entries
-                .iter()
-                .filter(|e| contains_ignore_case(&e.path, needle))
-                .count();
-            let full_ms = t.elapsed();
-            assert_eq!(floor, full, "两种实现结果必须一致");
+            let ascii_scan = entries.iter().filter(|e| e.path.is_ascii()).count();
+            let ascii_scan_ms = t.elapsed();
+            let ascii_paths = entries.iter().filter(|e| e.path_ascii).count();
+            assert_eq!(
+                ascii_scan, ascii_paths,
+                "path_ascii 标记与 path.is_ascii() 不一致（有构造点漏算）"
+            );
             eprintln!(
-                "[bench] ASCII 路径包含 纯窗口扫描(下限) 命中{floor} {:?}  →  完整实现 命中{full} {:?}",
-                floor_ms, full_ms
+                "[bench] 路径 ASCII 分布: ascii={} ({:.1}%) 非ascii={}  |  单独 is_ascii() 全量扫描(冷数据) {:?}",
+                ascii_paths,
+                100.0 * ascii_paths as f64 / entries.len().max(1) as f64,
+                entries.len() - ascii_paths,
+                ascii_scan_ms
+            );
+
+            let floor_scan = || {
+                entries
+                    .iter()
+                    .filter(|e| {
+                        e.path
+                            .as_bytes()
+                            .windows(n.len())
+                            .any(|w| w.eq_ignore_ascii_case(n))
+                    })
+                    .count()
+            };
+            // 拆解用：错误地把所有路径都当成 ASCII（非 ASCII 路径不再回退），
+            // 语义上不完整，仅用于量出"窗口扫描 + 每条目 has_cased_char(needle)"的成本。
+            let ascii_only_scan = || {
+                entries
+                    .iter()
+                    .filter(|e| contains_ignore_case_known_ascii(&e.path, needle, true))
+                    .count()
+            };
+            let flagged_scan = || {
+                entries
+                    .iter()
+                    .filter(|e| contains_ignore_case_known_ascii(&e.path, needle, e.path_ascii))
+                    .count()
+            };
+            let legacy_scan =
+                || entries.iter().filter(|e| contains_ignore_case(&e.path, needle)).count();
+
+            let run = |f: &dyn Fn() -> usize| {
+                let t = Instant::now();
+                let count = f();
+                (count, t.elapsed())
+            };
+            let mut floor = (0usize, std::time::Duration::MAX);
+            let mut ascii_only = (0usize, std::time::Duration::MAX);
+            let mut flagged = (0usize, std::time::Duration::MAX);
+            let mut legacy = (0usize, std::time::Duration::MAX);
+            for _round in 0..3 {
+                let r = run(&floor_scan);
+                if r.1 < floor.1 {
+                    floor = r;
+                }
+                let r = run(&ascii_only_scan);
+                if r.1 < ascii_only.1 {
+                    ascii_only = r;
+                }
+                let r = run(&flagged_scan);
+                if r.1 < flagged.1 {
+                    flagged = r;
+                }
+                let r = run(&legacy_scan);
+                if r.1 < legacy.1 {
+                    legacy = r;
+                }
+            }
+            assert_eq!(floor.0, legacy.0, "窗口扫描与完整实现命中数必须一致");
+            assert_eq!(floor.0, flagged.0, "带标记快路径与窗口扫描命中数必须一致");
+            eprintln!(
+                "[bench] ASCII 路径包含 纯窗口扫描(下限) 命中{} {:?}  |  旧 contains_ignore_case 命中{} {:?}  |  新 带标记快路径 命中{} {:?}",
+                floor.0, floor.1, legacy.0, legacy.1, flagged.0, flagged.1
+            );
+            eprintln!(
+                "[bench] 成本拆解(仅下限+has_cased_char/needle，无回退) 命中{} {:?}  + 非ASCII回退({}条, 含 to_lowercase 分配) ≈ {:?}",
+                ascii_only.0,
+                ascii_only.1,
+                entries.len() - ascii_paths,
+                flagged.1.saturating_sub(ascii_only.1)
             );
         }
 
@@ -3284,6 +3418,51 @@ mod tests {
         assert!(!contains_ignore_case("C:/foo/bar.txt", "windows"));
         assert!(!contains_ignore_case("c:/windows", "linux"));
         assert!(!contains_ignore_case("C:/Windows", "windows7"));
+    }
+
+    /// 回归：带标记快路径（`contains_ignore_case_known_ascii`）必须与完整实现逐条一致。
+    ///
+    /// 它用构造期算好的 `path_ascii` 替掉热路径上那次全串 `is_ascii()` 扫描，
+    /// 因此"标记为 ASCII 时字节窗口比较已是最终结论"这条前提必须成立：
+    /// - needle 带 ASCII 大小写字符 → ASCII 折叠全覆盖，窗口未命中即 false；
+    /// - needle 含非 ASCII 字节 → ASCII 串里不可能出现这些字节，同样未命中即 false。
+    /// 非 ASCII 路径（西里尔/İ/ß）一律回退完整实现，语义不受影响。
+    #[test]
+    fn contains_ignore_case_known_ascii_matches_full_impl() {
+        let needles = [
+            "windows", "i", "x.dll", "c:/", "文档", "папка", "ß", "strasse", "",
+        ];
+        let haystacks = [
+            "C:/Windows/System32/x.dll",
+            "c:/windows",
+            "C:/用户/文档/a.txt",
+            "C:/ПАПКА/файл.txt",
+            "C:/straße/a.txt",
+            "C:/İstanbul/a.txt",
+            "C:/MiXeD/ÄÖÜ.txt",
+            "İ",
+            "",
+        ];
+        for h in haystacks {
+            let ascii = h.is_ascii();
+            for n in needles {
+                let flagged = contains_ignore_case_known_ascii(h, n, ascii);
+                assert_eq!(
+                    flagged,
+                    contains_ignore_case(h, n),
+                    "带标记快路径与完整实现不一致: h={h:?} n={n:?} ascii={ascii}"
+                );
+                // 参考实现（旧语义）：小写化后包含
+                assert_eq!(
+                    flagged,
+                    h.to_lowercase().contains(n),
+                    "带标记快路径与旧语义不一致: h={h:?} n={n:?}"
+                );
+            }
+        }
+        // 非 ASCII 路径（标记为 false）必须原样回退到完整实现
+        assert!(contains_ignore_case_known_ascii("C:/ПАПКА", "папка", false));
+        assert!(contains_ignore_case_known_ascii("C:/İstanbul", "i", false));
     }
 
     /// 契约：响应是对象且 results 为数组、字段为 camelCase（前端据此渲染列表）

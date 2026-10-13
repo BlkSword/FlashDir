@@ -18,13 +18,7 @@ fn entry(path: &str, size: i64) -> IndexEntry {
         .next()
         .unwrap_or(path)
         .to_lowercase();
-    IndexEntry {
-        path: path.to_string(),
-        name_lower,
-        size,
-        is_dir: false,
-        mtime: 0,
-    }
+    IndexEntry::new(path.to_string(), name_lower, size, false, 0)
 }
 
 /// 缺陷：`remove_path_internal` 用 `retain` 摘桶槽位，与 `swap_remove` 的搬移相互干扰。
@@ -250,4 +244,108 @@ fn paged_search_cache_keeps_results_identical_and_invalidates() {
     let (tail, total_tail) = idx.search_with_filter_paged("report", 10, 1000);
     assert!(tail.is_empty());
     assert_eq!(total_tail, 24);
+}
+
+/// 回归：`IndexEntry::path_ascii` 标记（`dir:` / 粘贴完整路径这两条"整条路径包含"的
+/// 热路径用它免掉逐条 `is_ascii()` 全串扫描）不得改变匹配语义。
+///
+/// 带标记的快路径在 `path_ascii == true` 时，字节窗口扫描未命中就直接返回 false，
+/// 不再对路径做一次 `is_ascii()` 扫描（310 万条真实索引上，串行扫描实测 562ms → 506ms，
+/// 其中约 56ms 正是 294 万条 ASCII 路径的 `is_ascii()`）。
+/// 风险点在于"ASCII 字节窗口比较是否真的覆盖了全部折叠可能"：非 ASCII 大小写
+/// （西里尔/希腊/İ）必须仍然走 Unicode 折叠回退，否则会静默漏结果。
+/// 这里对每个条目、每个查询词用参考实现 `path.to_lowercase().contains(needle_lower)`
+/// 逐条对拍（参考实现 = 旧语义），并验证构造函数确实按 `path` 算出了标记。
+#[test]
+fn path_ascii_flag_keeps_path_contains_semantics() {
+    // (路径, 查询词)。每个词都会走 `dir:词`；词里含分隔符时再加一条"裸粘贴路径"
+    // （parse 后是 `PathText`）——两条正是本次改动的分支。
+    let cases: &[(&str, &[&str])] = &[
+        // 纯 ASCII 大小写混合 → 走带标记快路径（不扫 is_ascii、不分配）
+        (
+            "C:/Windows/System32/x.dll",
+            &["windows", "system32/x.dll", "x.DLL", "linux"],
+        ),
+        // CJK：折叠是恒等变换，needle 无大小写字符 → 朴素包含
+        ("C:/用户/文档/a.txt", &["文档", "用户/文档", "图片"]),
+        // 西里尔：非 ASCII 且真正区分大小写 → 必须仍然命中（靠折叠回退）
+        (
+            "C:/ПАПКА/файл.txt",
+            &["папка", "ПАПКА/ФАЙЛ", "файл", "ящик"],
+        ),
+        // 德语 ß：`to_lowercase` 不会变成 "ss"，因此 "strasse" 不命中（与参考实现一致）
+        ("C:/straße/a.txt", &["straße", "strasse", "a.txt"]),
+        // İ (U+0130) 折叠为 "i" + 组合点：needle "i" 只有折叠之后才可能命中
+        ("C:/İstanbul/a.txt", &["i", "İSTANBUL", "z"]),
+        // 非 ASCII 段与 ASCII 段大小写混合
+        ("C:/MiXeD/ÄÖÜ.txt", &["äöü", "mixed/äöü", "xyz"]),
+    ];
+
+    let idx = empty_instance_for_test();
+    for &(path, _) in cases {
+        let name_lower = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+        idx.upsert(IndexEntry::new(path.to_string(), name_lower, 1, false, 0));
+    }
+
+    let mut ascii_paths = 0usize;
+    let mut non_ascii_paths = 0usize;
+    for &(path, needles) in cases {
+        // 构造函数必须真的派生标记：漏算/写死都会让热路径判错
+        let probe = IndexEntry::new(path.to_string(), String::new(), 1, false, 0);
+        assert_eq!(
+            probe.path_ascii,
+            path.is_ascii(),
+            "path_ascii 必须等于 path.is_ascii(): {path:?}"
+        );
+        if probe.path_ascii {
+            ascii_paths += 1;
+        } else {
+            non_ascii_paths += 1;
+        }
+
+        for &needle in needles {
+            // 参考实现：旧语义 = 整条路径小写化后做包含（查询值在 parse 阶段已小写化）
+            let reference = path.to_lowercase().contains(&needle.to_lowercase());
+            let found = |q: &str| {
+                idx.search_with_filter(q, 100)
+                    .iter()
+                    .any(|e| e.path.as_str() == path)
+            };
+
+            assert_eq!(
+                found(&format!("dir:{needle}")),
+                reference,
+                "dir: 查询与参考实现不一致: path={path:?} needle={needle:?}"
+            );
+            if needle.contains('/') {
+                assert_eq!(
+                    found(needle),
+                    reference,
+                    "粘贴路径(PathText)与参考实现不一致: path={path:?} needle={needle:?}"
+                );
+            }
+        }
+    }
+
+    // 两类路径都必须覆盖到，否则这个测试证明不了"标记不改变语义"
+    assert!(ascii_paths > 0, "必须覆盖纯 ASCII 路径");
+    assert!(non_ascii_paths > 0, "必须覆盖非 ASCII 路径");
+
+    // 防止"两边都是 false"的假对拍：西里尔/İ 这两类必须真的能搜到
+    assert!(
+        idx.search_with_filter("dir:ПАПКА/ФАЙЛ", 100)
+            .iter()
+            .any(|e| e.path == "C:/ПАПКА/файл.txt"),
+        "非 ASCII 大小写折叠场景漏结果（带标记快路径误判为 ASCII 结论）"
+    );
+    assert!(
+        idx.search_with_filter("dir:i", 100)
+            .iter()
+            .any(|e| e.path.starts_with("C:/İstanbul")),
+        "İ → i 折叠边界漏结果"
+    );
+    assert!(
+        idx.search_with_filter("dir:молоко", 100).is_empty(),
+        "不相关查询不该命中"
+    );
 }

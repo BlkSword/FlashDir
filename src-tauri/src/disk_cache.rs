@@ -1194,13 +1194,16 @@ impl DiskCache {
             let mut entries: Vec<IndexEntry> = Vec::new();
             while let Some(row) = rows.next()? {
                 let path: String = row.get(0)?;
-                entries.push(IndexEntry {
-                    name_lower: name_lower_from_path(&path),
+                let name_lower = name_lower_from_path(&path);
+                // 走构造函数：path_ascii 由 path 派生（载入是唯一"路径来自磁盘"的入口，
+                // 必须在这里算一次，否则热路径又得逐条扫 is_ascii()）
+                entries.push(IndexEntry::new(
                     path,
-                    size: row.get(1)?,
-                    is_dir: row.get::<_, i64>(2)? != 0,
-                    mtime: row.get(3)?,
-                });
+                    name_lower,
+                    row.get(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                    row.get(3)?,
+                ));
             }
             Ok(entries)
         })
@@ -1226,13 +1229,14 @@ impl DiskCache {
             let mut total = 0usize;
             while let Some(row) = rows.next()? {
                 let path: String = row.get(0)?;
-                buf.push(IndexEntry {
-                    name_lower: name_lower_from_path(&path),
+                let name_lower = name_lower_from_path(&path);
+                buf.push(IndexEntry::new(
                     path,
-                    size: row.get(1)?,
-                    is_dir: row.get::<_, i64>(2)? != 0,
-                    mtime: row.get(3)?,
-                });
+                    name_lower,
+                    row.get(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                    row.get(3)?,
+                ));
                 total += 1;
                 if buf.len() >= chunk_size {
                     f(std::mem::replace(&mut buf, Vec::with_capacity(chunk_size)))?;
@@ -1724,13 +1728,7 @@ mod tests {
                     row.get::<_, i64>(4).unwrap(),
                 )
             };
-            out.push(IndexEntry {
-                path,
-                name_lower,
-                size,
-                is_dir,
-                mtime,
-            });
+            out.push(IndexEntry::new(path, name_lower, size, is_dir, mtime));
         }
         out
     }

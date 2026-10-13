@@ -1802,25 +1802,25 @@ fn try_usn_incremental_update(
                             // 名字按**改写后**的路径现派生：落盘 blob 不再保存 name，
                             // 派生结果与旧的存储值一致（目录改名只换前缀，末段不变）。
                             let name = name_from_path(&child.path);
-                            upserted_entries.push(crate::global_search::IndexEntry {
-                                path: child.path.to_string(),
-                                name_lower: name.to_lowercase(),
-                                size: child.size,
-                                is_dir: child.is_dir,
-                                mtime: child.mtime,
-                            });
+                            upserted_entries.push(crate::global_search::IndexEntry::new(
+                                child.path.to_string(),
+                                name.to_lowercase(),
+                                child.size,
+                                child.is_dir,
+                                child.mtime,
+                            ));
                             items_map.insert(child.path.clone(), child);
                         }
                     }
                 }
             }
-            upserted_entries.push(crate::global_search::IndexEntry {
-                path: abs.clone(),
-                name_lower: change.name.to_lowercase(),
-                size: file_size,
+            upserted_entries.push(crate::global_search::IndexEntry::new(
+                abs.clone(),
+                change.name.to_lowercase(),
+                file_size,
                 is_dir,
-                mtime: file_mtime,
-            });
+                file_mtime,
+            ));
             eprintln!(
                 "  [USN-{}] 添加: {} ({} bytes, dir={})",
                 if is_create { "CREATE" } else { "RN_NEW" },
@@ -1843,13 +1843,13 @@ fn try_usn_incremental_update(
                         item.mtime = record.mtime;
                         // 同上：名字从路径派生，不依赖可能来自落盘 blob 的 `name` 字段
                         let name = name_from_path(&item.path);
-                        upserted_entries.push(crate::global_search::IndexEntry {
-                            path: abs.clone(),
-                            name_lower: name.to_lowercase(),
-                            size: new_size,
-                            is_dir: false,
-                            mtime: record.mtime,
-                        });
+                        upserted_entries.push(crate::global_search::IndexEntry::new(
+                            abs.clone(),
+                            name.to_lowercase(),
+                            new_size,
+                            false,
+                            record.mtime,
+                        ));
                     }
                 }
             }
