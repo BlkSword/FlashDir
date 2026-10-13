@@ -374,6 +374,9 @@ kbd {
 .dot.warn { background: var(--warn); }
 .dot.bad { background: var(--bad); }
 .dot.idle { background: var(--tx-3); }
+/* 索引构建中的状态点：呼吸式闪烁（表示"正在进行"，与静态的成功/警告点区分开） */
+.dot.busy { background: var(--accent); animation: fd-pulse 1.1s ease-in-out infinite; }
+@keyframes fd-pulse { 0%, 100% { opacity: 1 } 50% { opacity: .25 } }
 
 /* 扫描进度条（工具栏下方细条） */
 .scan-strip {

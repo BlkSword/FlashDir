@@ -17,13 +17,19 @@ const state = reactive({
 
 let listenStarted = false
 let pollTimer = null
+let pollInterval = 0
 let visibilityBound = false
+/** 处于 notLoaded 时已轮询的次数：只在启动后一段有界时间内轮询，避免永久空转 IPC */
+let idlePollCount = 0
+const IDLE_POLL_MS = 3000
+const IDLE_POLL_MAX = 40
 
 function stopPolling() {
   if (pollTimer) {
     clearInterval(pollTimer)
     pollTimer = null
   }
+  pollInterval = 0
 }
 
 /** 页面是否处于前台；后台标签页不该继续空转 IPC */
@@ -46,12 +52,14 @@ function bindVisibility() {
   document.addEventListener('visibilitychange', onVisibilityChange)
 }
 
-function startPolling() {
-  if (pollTimer) return
+function startPolling(intervalMs = 1000) {
+  if (pollTimer && pollInterval === intervalMs) return
+  if (pollTimer) stopPolling()
   // 旧实现无条件 setInterval：窗口最小化/被切走后仍每秒 invoke 一次，
   // 进程常驻期间持续产生后台 IPC。隐藏时不启动。
   if (!isVisible()) return
   bindVisibility()
+  pollInterval = intervalMs
   pollTimer = setInterval(() => {
     if (!isVisible()) return
     fetchStatus()
@@ -67,8 +75,18 @@ async function fetchStatus() {
   if (!hasTauri()) return
   try {
     state.index = await invoke('global_search_status')
-    if (state.index?.kind === 'loading') {
-      startPolling()
+    const kind = state.index?.kind
+    if (kind === 'loading') {
+      idlePollCount = 0
+      startPolling(1000)
+    } else if (kind === 'notLoaded' && idlePollCount < IDLE_POLL_MAX) {
+      // 首次启动时后端"开始构建"的进度事件可能早于 webview 注册监听（事件会丢），
+      // 只依赖事件就会让整个构建过程在界面上一直停在"未建立"。
+      // 因此 notLoaded 也在启动后一段**有界**时间内轮询（3s 一次、最多 IDLE_POLL_MAX 次）：
+      // 后端一转入 Loading 就立刻切成 1s 轮询并显示"构建中 · Ns"，
+      // 而长期没有索引时也不会永久空转 IPC。
+      idlePollCount += 1
+      startPolling(IDLE_POLL_MS)
     } else {
       stopPolling()
     }
@@ -88,13 +106,15 @@ function ensureListener() {
       fetchStatus()
     } else if (event.payload?.phase === 'loading-persisted') {
       state.index = { kind: 'loading', data: { drive: '索引缓存', scanned: 0 } }
-      startPolling()
+      idlePollCount = 0
+      startPolling(1000)
     } else {
       state.index = {
         kind: 'loading',
         data: { drive: event.payload?.drive || '', scanned: event.payload?.scanned || 0 }
       }
-      startPolling()
+      idlePollCount = 0
+      startPolling(1000)
     }
     })
   } catch (e) {
@@ -119,30 +139,6 @@ export function useGlobalSearch() {
   // ready 时的索引元数据（fileCount / dirCount / driveCount / failedDrives）
   const indexMeta = computed(() => (ready.value ? state.index.data : null))
 
-  const statusText = computed(() => {
-    if (loading.value) {
-      if (state.progress?.phase === 'loading-persisted') {
-        return '全局索引：正在加载索引缓存…'
-      }
-      const drive = state.progress?.drive || state.index?.data?.drive || '…'
-      const scanned = (state.progress?.scanned > 0
-        ? state.progress.scanned
-        : state.index?.data?.scanned) || 0
-      return `全局索引：正在扫描 ${drive} · ${scanned.toLocaleString()} 项`
-    }
-    if (failed.value) {
-      return `全局索引失败：${failedReason.value}`
-    }
-    if (ready.value) {
-      const data = state.index.data
-      const total = (data?.fileCount || 0) + (data?.dirCount || 0)
-      // partial = 只索引了主界面扫描过的目录，不代表全盘
-      const scope = data?.partial ? '（部分目录）' : ''
-      return `全局索引就绪 · ${total.toLocaleString()} 项${scope}`
-    }
-    return ''
-  })
-
     // USN 增量同步状态（就绪后可见）：最近同步时间与"增量窗口已失效"的盘
     const usnLastSync = computed(() => (ready.value ? state.index.data?.usnLastSync || 0 : 0))
     const usnStaleDrives = computed(() => (ready.value ? state.index.data?.usnStaleDrives || [] : []))
@@ -163,6 +159,10 @@ export function useGlobalSearch() {
 
   // 已删除未被任何调用方使用的 search(query, limit) 导出：
   // 搜索统一走 utils/globalSearchApi.js 的 searchGlobal()，此处保留只会造成两套入口
+  //
+  // 同时删除 statusText：它从未被任何组件使用，而 App.vue 已按"进度事件 + 已用时长"
+  // 生成状态栏与进度卡文案（indexBusyLabel / indexProgressText）。保留两份文案逻辑
+  // 只会让它们随进度事件字段变化而悄悄漂移。
   const ensureIndex = async () => {
     await invoke('global_search_ensure_index')
     await fetchStatus()
@@ -186,7 +186,6 @@ export function useGlobalSearch() {
     failed,
     failedReason,
     indexMeta,
-    statusText,
     fetchStatus,
     ensureIndex,
     refreshIndex,

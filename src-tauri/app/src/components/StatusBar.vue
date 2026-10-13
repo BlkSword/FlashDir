@@ -14,6 +14,14 @@ const props = defineProps({
   mftAvailable: { type: Boolean, default: false },
   isAdmin: { type: Boolean, default: false },
   indexCount: { type: Number, default: 0 },
+  /**
+   * 索引正在构建/载入。
+   * 必须与"未建立"区分开：构建期间 `indexCount` 仍是 0，旧实现只按 count 判断，
+   * 于是整个构建过程在状态栏里都显示成"未建立"，用户只能看到"未建立 / N 项"两态。
+   */
+  indexBusy: { type: Boolean, default: false },
+  /** 构建中的简短文案（由 App 依据进度事件 + 已用时长生成，例如"扫描中 · 12s"） */
+  indexBusyLabel: { type: String, default: '' },
   indexPartial: { type: Boolean, default: false },
   usnVerified: { type: Boolean, default: false },
   filter: { type: String, default: '' },
@@ -33,6 +41,8 @@ const cacheLabel = computed(() => ({
 }[props.cacheSource] || '—'))
 
 const indexLabel = computed(() => {
+  // 构建中 indexCount 还是 0：不做这一层区分就会显示成"未建立"
+  if (props.indexBusy) return props.indexBusyLabel || '构建中…'
   if (!props.indexCount) return '未建立'
   return `${props.indexCount.toLocaleString()} 项`
 })
@@ -67,10 +77,17 @@ const indexLabel = computed(() => {
       <template v-if="mcp.connected && mcp.lastTool"> · {{ mcp.lastTool }}</template>
       <template v-else-if="mcp.calls"> · {{ mcp.calls }} 次</template>
     </span>
-    <span class="st click" :title="'全局索引：' + indexLabel + '（点击重建/刷新）'" @click="emit('index-action')">
-      <Icon name="search" :size="12" />
+    <span
+      class="st click"
+      :title="indexBusy
+        ? '全局索引正在构建：' + (indexBusyLabel || '进行中') + '。构建期间搜索仍可用，结果为已索引部分；完成后自动转为增量跟随'
+        : '全局索引：' + indexLabel + '（点击重建/刷新）'"
+      @click="emit('index-action')"
+    >
+      <span v-if="indexBusy" class="dot busy" />
+      <Icon v-else name="search" :size="12" />
       索引 <b>{{ indexLabel }}</b>
-      <span v-if="indexPartial" class="badge warn">部分</span>
+      <span v-if="indexPartial && !indexBusy" class="badge warn">部分</span>
     </span>
     <span v-if="!isAdmin" class="st click" title="以管理员重启可获得 MFT 直读与 USN 增量" @click="emit('restart-admin')">
       <Icon name="shield" :size="12" />

@@ -539,13 +539,59 @@ async function indexAction() {
 /** 右下角进度卡：构建/载入中显示进度；就绪后若某盘增量窗口失效则提示重建 */
 const indexBusy = computed(() => gs.loading.value)
 const indexStaleDrives = computed(() => gs.usnStaleDrives.value || [])
+
+/**
+ * 索引构建已用时长（秒）。
+ * 构建期间 indexCount 仍是 0，状态栏原本只会显示"未建立"，整个等待过程没有任何
+ * "正在进行"的反馈。这里计时并把秒数带进状态栏与进度卡，让等待可见。
+ */
+const indexElapsed = ref(0)
+let indexBusyTimer = null
+watch(
+  () => gs.loading.value,
+  (busy) => {
+    if (indexBusyTimer) {
+      clearInterval(indexBusyTimer)
+      indexBusyTimer = null
+    }
+    if (!busy) {
+      indexElapsed.value = 0
+      return
+    }
+    const startedAt = Date.now()
+    indexElapsed.value = 0
+    indexBusyTimer = setInterval(() => {
+      indexElapsed.value = Math.floor((Date.now() - startedAt) / 1000)
+    }, 1000)
+  },
+  { immediate: true }
+)
+
+/** 构建中的简短阶段名（状态栏空间有限，细节放 title） */
+const indexPhaseLabel = computed(() =>
+  gs.state.progress?.phase === 'loading-persisted' ? '载入缓存' : '扫描中'
+)
+
+/** 状态栏里的索引进度文案，例如"扫描中 · 12s" */
+const indexBusyLabel = computed(() => {
+  if (!gs.loading.value) return ''
+  return indexElapsed.value > 0
+    ? `${indexPhaseLabel.value} · ${indexElapsed.value}s`
+    : indexPhaseLabel.value
+})
+
 const indexProgressText = computed(() => {
   if (!gs.loading.value) return ''
   const progress = gs.state.progress
-  if (progress?.phase === 'loading-persisted') return '正在载入索引缓存…'
-  const drive = progress?.drive || gs.state.index?.data?.drive || ''
-  const scanned = progress?.scanned || gs.state.index?.data?.scanned || 0
-  return '正在扫描 ' + drive + ' · ' + scanned.toLocaleString() + ' 项'
+  let base
+  if (progress?.phase === 'loading-persisted') {
+    base = '正在载入索引缓存…'
+  } else {
+    const drive = progress?.drive || gs.state.index?.data?.drive || ''
+    const scanned = progress?.scanned || gs.state.index?.data?.scanned || 0
+    base = '正在扫描 ' + (drive || '…') + ' · ' + scanned.toLocaleString() + ' 项'
+  }
+  return indexElapsed.value > 0 ? base + ' · 已用 ' + indexElapsed.value + 's' : base
 })
 
 async function syncIndexNow() {
@@ -695,6 +741,10 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopMcpPolling()
+  if (indexBusyTimer) {
+    clearInterval(indexBusyTimer)
+    indexBusyTimer = null
+  }
   document.removeEventListener('visibilitychange', onVisibilityChange)
   document.removeEventListener('keydown', onKeydown)
   if (unlistenPhase) unlistenPhase()
@@ -895,6 +945,8 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
       :mft-available="mftAvailable"
       :is-admin="isAdmin"
       :index-count="gs.indexMeta.value ? (gs.indexMeta.value.fileCount || 0) + (gs.indexMeta.value.dirCount || 0) : 0"
+      :index-busy="indexBusy"
+      :index-busy-label="indexBusyLabel"
       :index-partial="!!gs.indexMeta.value?.partial"
       :usn-verified="usnVerified"
       :filter="filter"
