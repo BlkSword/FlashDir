@@ -145,3 +145,59 @@ fn mtime_filter_uses_supplied_now() {
     // 1 小时前修改 → 不命中
     assert!(!item_matches_filters_at("a", "C:/a", 1, false, now - 3_600, &f, now));
 }
+
+/// offset 分页结果缓存（P1-1）的正确性：
+/// 缓存只能"少扫几次"，绝不能改变结果本身。这里覆盖三种最容易出错的场景 ——
+/// 分页拼接与一次性取数是否逐条一致、缓存窗口小于请求量时是否会少给结果、
+/// 索引增删后是否立刻失效。
+#[test]
+fn paged_search_cache_keeps_results_identical_and_invalidates() {
+    let idx = empty_instance_for_test();
+    for i in 0..25 {
+        idx.upsert(entry(&format!("C:/docs/report_{i:02}.pdf"), 100 + i));
+    }
+
+    // 一次性取全量作为基准
+    let full: Vec<String> = idx
+        .search_with_filter("report", 100)
+        .into_iter()
+        .map(|e| e.path)
+        .collect();
+    assert_eq!(full.len(), 25);
+
+    // 分页拼接必须与一次性结果完全一致（顺序、条数、内容都不能变）
+    let mut paged: Vec<String> = Vec::new();
+    for p in 0..9usize {
+        let (page, total) = idx.search_with_filter_paged("report", 3, p * 3);
+        assert_eq!(total, 25, "命中总数必须与 limit/offset 无关");
+        paged.extend(page.into_iter().map(|e| e.path));
+    }
+    assert_eq!(paged, full, "分页拼接必须与一次性取数逐条一致（缓存不得漏项或乱序）");
+
+    // 缓存窗口小于请求量时必须重取，而不是少给结果
+    // （真实场景：命令面板 limit=60 → 结果视图 limit=1000）
+    let idx2 = empty_instance_for_test();
+    for i in 0..30 {
+        idx2.upsert(entry(&format!("C:/logs/log_{i:02}.txt"), 10 + i));
+    }
+    let (first, total1) = idx2.search_with_filter_paged("log", 10, 0);
+    assert_eq!(first.len(), 10);
+    assert_eq!(total1, 30);
+    let (bigger, total2) = idx2.search_with_filter_paged("log", 25, 0);
+    assert_eq!(bigger.len(), 25, "缓存窗口不足时必须重取，不能返回不足一页");
+    assert_eq!(total2, 30);
+
+    // 索引发生增删必须让缓存立刻失效
+    idx.remove_by_path("C:/docs/report_00.pdf");
+    let (after, total_after) = idx.search_with_filter_paged("report", 30, 0);
+    assert_eq!(total_after, 24, "删除后命中总数必须更新");
+    assert!(
+        !after.iter().any(|e| e.path.ends_with("report_00.pdf")),
+        "缓存未随索引变化失效，仍返回已删除条目"
+    );
+
+    // 越界翻页：缓存已含全部命中时应回空页且 total 正确
+    let (tail, total_tail) = idx.search_with_filter_paged("report", 10, 1000);
+    assert!(tail.is_empty());
+    assert_eq!(total_tail, 24);
+}

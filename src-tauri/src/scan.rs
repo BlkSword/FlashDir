@@ -453,6 +453,10 @@ impl ScanCache {
     }
 
     fn estimate_size(result: &ArcScanResult) -> usize {
+        // 注意：落盘 blob 不再保存 name / size_formatted（见 disk_cache::ItemDisk），
+        // 从磁盘载入的条目 name 是按 path 现派生的、size_formatted 为空 ——
+        // 这里只是**内存占用估算**（用于 LRU 的 200MB 上限），不是正确性依赖；
+        // 估算偏小只意味着内存缓存能多放一点，不影响返回结果。
         result.items.iter().map(|item| {
             std::mem::size_of::<Item>()
                 + item.path.len()
@@ -660,6 +664,19 @@ pub fn format_size(bytes: i64) -> CompactString {
         CompactString::from(format!("{:.1} {}", size, SIZE_UNITS[unit_index]))
     } else {
         CompactString::from(format!("{:.0} {}", size, SIZE_UNITS[unit_index]))
+    }
+}
+
+/// 从绝对路径派生文件名（`path` 的最后一段）。
+///
+/// 落盘 blob 不再保存 `name`（见 `disk_cache::ItemDisk`），载入时用它派生；
+/// `SmartString<Compact>` 对 ≤23 字节内联存放，派生几乎零分配。
+/// 与 `global_search::name_from_path` 保持同一套规则（同为 `rsplit_once('/')` 语义）。
+#[inline]
+pub fn name_from_path(path: &str) -> CompactString {
+    match path.rfind('/') {
+        Some(i) => CompactString::from(&path[i + 1..]),
+        None => CompactString::from(path),
     }
 }
 
@@ -1782,7 +1799,9 @@ fn try_usn_incremental_update(
                         let child_path = child.path.as_str().to_string();
                         if let Some(rest) = child_path.strip_prefix(old_prefix.as_str()) {
                             child.path = CompactString::from(format!("{}{}", abs, rest).as_str());
-                            let name = child.name.to_string();
+                            // 名字按**改写后**的路径现派生：落盘 blob 不再保存 name，
+                            // 派生结果与旧的存储值一致（目录改名只换前缀，末段不变）。
+                            let name = name_from_path(&child.path);
                             upserted_entries.push(crate::global_search::IndexEntry {
                                 path: child.path.to_string(),
                                 name_lower: name.to_lowercase(),
@@ -1822,7 +1841,8 @@ fn try_usn_incremental_update(
                         item.size = new_size;
                         item.size_formatted = format_size(new_size);
                         item.mtime = record.mtime;
-                        let name = item.name.to_string();
+                        // 同上：名字从路径派生，不依赖可能来自落盘 blob 的 `name` 字段
+                        let name = name_from_path(&item.path);
                         upserted_entries.push(crate::global_search::IndexEntry {
                             path: abs.clone(),
                             name_lower: name.to_lowercase(),
@@ -2373,15 +2393,27 @@ mod tests {
             );
         }
 
-        // 1) 当前路径：bincode 反序列化整份 Vec<Item>。
+        // 1) 当前路径：按**当前落盘形态**解码（BLOB_VERSION=3 的紧凑 ItemDisk：
+        //    只落盘 path/size/is_dir/mtime/atime，name 由 path 末段派生、size_formatted 留空）。
         //    注意必须先跳过 FDBL 文件头（magic 4 + version 1 + path_len(u16) 2 + path），
         //    旧实现把整个文件（含头）直接交给 bincode，`unwrap()` 必然 panic ——
         //    这个基准因此长期失效（`#[ignore]` 掩盖了它）。
+        //    形态对照（370.6MB / 193 万条 / 646ms → 新形态）见
+        //    disk_cache::tests::bench_blob_disk_form。
         let path_len = u16::from_le_bytes([blob[5], blob[6]]) as usize;
         let hdr = 7 + path_len;
         let t = Instant::now();
         let items: Vec<Item> = if blob.len() > hdr {
-            bincode::deserialize(&blob[hdr..]).unwrap()
+            match DiskCache::decode_blob_payload_for_bench(&blob[hdr..]) {
+                Some(items) => items,
+                None => {
+                    eprintln!(
+                        "[bench] 该 blob 是 bump 之前的旧版本（BLOB_VERSION 已升到 3），\
+                         目录首次访问会重扫重写；新旧形态对照见 bench_blob_disk_form"
+                    );
+                    return;
+                }
+            }
         } else {
             eprintln!("[bench] blob 头长度异常，跳过反序列化");
             return;

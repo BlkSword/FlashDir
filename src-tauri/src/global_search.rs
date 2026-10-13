@@ -7,8 +7,8 @@
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::mpsc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use parking_lot::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
 use serde::Serialize;
 
@@ -109,6 +109,35 @@ pub struct GlobalIndex {
     dir_count: AtomicUsize,
     /// 索引构建中标志（进程内互斥；跨进程还有锁文件）
     building: AtomicBool,
+    /// 索引内容代次：任何增删都会 +1，用于让查询结果缓存立刻失效。
+    /// 用代次而不是"逐条精确校验"，是因为失效只是性能问题、漏失效才是正确性问题。
+    generation: AtomicU64,
+    /// 上一次查询的有序命中集（仅服务 offset 分页）。
+    ///
+    /// 为什么需要：`search_with_filter_paged` 原本每翻一页都要**重跑整个 top-K**
+    /// 并 clone(limit+offset) 再丢弃前 offset 条；前端"触底加载更多"连续 10 页
+    /// 实测 215ms，几乎全是重复劳动。这里按 (query, generation) 缓存一次有序结果
+    /// （上限 `QUERY_CACHE_CAP` 条），翻页直接切片；索引任何增删都会让代次变化，
+    /// 使缓存自动失效。
+    query_cache: Mutex<Option<QueryCache>>,
+}
+
+/// 结果缓存最多保存多少条有序命中。
+///
+/// 它只影响"是否值得把整个命中集补齐进缓存"与内存上限，**不影响首屏取数条数**
+/// （首屏永远只取本页所需）。5 万条约 6MB，足以让常见查询（几千到几万命中）的
+/// 后续翻页全部免扫描。
+const QUERY_CACHE_CAP: usize = 50_000;
+
+/// 单条查询的结果缓存。只保留一份：搜索是"一个查询连续翻很多页"的访问模式，
+/// 多查询 LRU 的收益远小于它带来的内存与失效复杂度。
+struct QueryCache {
+    generation: u64,
+    query: String,
+    /// 有序命中集（已按相关性/体积排好），长度 ≤ QUERY_CACHE_CAP
+    entries: Vec<IndexEntry>,
+    /// 全量命中总数（不受缓存容量限制）
+    total: usize,
 }
 
 /// 路径 → 128 位哈希（双 64 位 FNV-1a 拼接，冲突概率可忽略）
@@ -171,7 +200,15 @@ impl GlobalIndex {
             file_count: AtomicUsize::new(0),
             dir_count: AtomicUsize::new(0),
             building: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            query_cache: Mutex::new(None),
         }
+    }
+
+    /// 索引内容发生变化时调用：让查询结果缓存失效。
+    #[inline]
+    fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
 
@@ -284,6 +321,7 @@ impl GlobalIndex {
     /// 添加或替换一条索引。entries / by_path / name_index 在同一锁临界区内更新。
     /// 锁顺序：永远先 entries 再 by_path 再 name_index，避免死锁。
     fn upsert_internal(&self, entry: IndexEntry) {
+        self.bump_generation();
         let entry = repair_entry_path(entry);
         let first_char = bucket_char(&entry.name_lower);
         let hash = path_hash(&entry.path);
@@ -340,6 +378,7 @@ impl GlobalIndex {
 
     /// 批量 upsert：整批在同一个锁临界区内完成（按值消费，避免逐条 clone）
     fn upsert_batch_internal(&self, batch: Vec<IndexEntry>) {
+        self.bump_generation();
         let mut entries = self.entries.write();
         let mut by_path = self.by_path.write();
         let mut name_index = self.name_index.write();
@@ -386,6 +425,7 @@ impl GlobalIndex {
 
     /// 移除指定路径的索引（swap_remove 保持 arena 紧凑）
     fn remove_path_internal(&self, path: &str) {
+        self.bump_generation();
         let mut entries = self.entries.write();
         let mut by_path = self.by_path.write();
         let mut name_index = self.name_index.write();
@@ -448,6 +488,7 @@ impl GlobalIndex {
 
     /// 按前缀移除索引（仅该路径本身及其子路径）
     fn remove_prefix_internal(&self, prefix: &str) {
+        self.bump_generation();
         let paths: Vec<String> = {
             let entries = self.entries.read();
             entries
@@ -474,6 +515,7 @@ impl GlobalIndex {
 
     /// 准备开始构建索引（设置 Loading 状态）
     pub fn set_loading(&self) {
+        self.bump_generation();
         *self.state.write() = IndexState::Loading { drive: String::new(), scanned: 0 };
         self.clear_internal();
         *self.meta.write() = IndexMeta::default();
@@ -684,21 +726,80 @@ impl GlobalIndex {
 
     /// 分页搜索：返回 `(结果, 命中总数)`。
     ///
-    /// 实现方式是"取前 limit+offset 条再丢弃前 offset 条"——搜索本身是 top-K 收集，
-    /// 没有可随机访问的全序结果；offset 通常很小（前端按页加载），代价可接受。
+    /// 搜索本身是 top-K 收集，没有可随机访问的全序结果，因此**首次**访问仍需一次全量扫描；
+    /// 但同一查询的后续翻页会命中 `query_cache`（按索引代次失效），直接从内存切片，
+    /// 不再重跑全量。首屏取数条数只取本页所需，绝不为了后续页放大 K。
     pub fn search_with_filter_paged(
         &self,
         query: &str,
         limit: usize,
         offset: usize,
     ) -> (Vec<IndexEntry>, usize) {
-        let (mut all, total) = self.search_internal(query, limit.saturating_add(offset));
-        let page = if offset >= all.len() {
-            Vec::new()
-        } else {
-            all.split_off(offset)
+        let generation = self.generation.load(Ordering::Acquire);
+
+        // 1) 缓存命中：直接从有序结果切片，不再重跑 top-K。
+        //    - `complete`：缓存已包含全部命中，越界请求可直接回空页（且 total 准确）；
+        //    - `enough`：缓存窗口覆盖本次 [offset, offset+limit)，可正常切片。
+        //    两者都不满足就必须重取：否则"先小 limit 查询、再大 limit 翻页"
+        //    （命令面板 60 条 → 结果视图 1000 条）会静默返回不足一页。
+        let known_total = {
+            let guard = self.query_cache.lock();
+            match guard.as_ref() {
+                Some(cache) if cache.generation == generation && cache.query == query => {
+                    let complete = cache.entries.len() >= cache.total;
+                    let enough = offset.saturating_add(limit) <= cache.entries.len();
+                    if complete || enough {
+                        let end = offset.saturating_add(limit).min(cache.entries.len());
+                        let page = if offset < cache.entries.len() {
+                            cache.entries[offset..end].to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                        return (page, cache.total);
+                    }
+                    Some(cache.total)
+                }
+                _ => None,
+            }
         };
-        (page, total)
+
+        // 2) 决定本次取数条数 K（top-K 的 K）。
+        //    首屏只取本页所需：K 直接决定堆维护成本，实测"命中数百万条"的查询在
+        //    K=20000 时 24ms → 155ms，绝不能为后续翻页先付这笔钱。
+        //    只有在**已知**总命中数装得进缓存（≤ CAP）时才一次补齐到 total，
+        //    使之后所有翻页都命中缓存；总数超过 CAP 时逐页按需取（与改造前一致）。
+        let want = limit.saturating_add(offset);
+        let fetch = match known_total {
+            Some(total) if total <= QUERY_CACHE_CAP => want.max(total),
+            _ => want,
+        };
+        let (all, total) = self.search_internal(query, fetch);
+
+        if fetch <= QUERY_CACHE_CAP {
+            let page = if offset < all.len() {
+                let end = offset.saturating_add(limit).min(all.len());
+                all[offset..end].to_vec()
+            } else {
+                Vec::new()
+            };
+            // 条目整体移入缓存（不额外拷贝），只克隆真正要返回的这一页
+            *self.query_cache.lock() = Some(QueryCache {
+                generation: self.generation.load(Ordering::Acquire),
+                query: query.to_string(),
+                entries: all,
+                total,
+            });
+            (page, total)
+        } else {
+            // 超大请求（如导出 5 万条以上）：按原样取数且不写缓存，避免大结果集常驻内存
+            let mut all = all;
+            let page = if offset >= all.len() {
+                Vec::new()
+            } else {
+                all.split_off(offset)
+            };
+            (page, total)
+        }
     }
 
     fn search_internal(&self, query: &str, limit: usize) -> (Vec<IndexEntry>, usize) {
@@ -1173,18 +1274,41 @@ pub fn item_matches_filters_at(
     true
 }
 
-/// 大小写不敏感的包含匹配（ASCII 零分配快速路径 + 非 ASCII 回退）
+/// 是否含"有大小写区分"的字符（Unicode 语义）。
+///
+/// 用来判断大小写折叠是否**可能**改变匹配结果：CJK、数字、标点都不算有大小写。
+/// 若一段文本没有任何这类字符，折叠对它就是恒等变换。
+fn has_cased_char(s: &str) -> bool {
+    s.chars().any(|c| c.is_lowercase() || c.is_uppercase())
+}
+
+/// 大小写不敏感的包含匹配（尽量零分配）。
+///
+/// 旧实现对非 ASCII 场景一律 `haystack.to_lowercase().contains(..)`：在 310 万条索引上
+/// 每个条目都要分配一份小写路径 —— CJK 查询（其折叠本是恒等变换）为此白付 310 万次
+/// 堆分配。现在按"折叠是否可能改变结果"分流：
+/// 1. needle 不含大小写字符（CJK/数字/标点）→ 折叠不可能创造或破坏匹配 → 朴素包含；
+/// 2. 否则先做 ASCII 字节窗口扫描（零分配，且对 ASCII 折叠 + 非 ASCII 逐字节精确）；
+/// 3. 窗口未命中且 haystack 也不含大小写字符 → 折叠是恒等，结论已完整，无需再分配；
+/// 4. 仅当两侧都涉及真正的大小写字符（如西里尔/希腊文）时才回退到小写副本比较。
 fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
     if needle_lower.is_empty() {
         return true;
     }
-    if haystack.is_ascii() && needle_lower.is_ascii() {
-        let h = haystack.as_bytes();
-        let n = needle_lower.as_bytes();
-        if n.len() > h.len() {
-            return false;
-        }
-        return h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n));
+    if haystack.len() < needle_lower.len() {
+        return false;
+    }
+    if !has_cased_char(needle_lower) {
+        return haystack.contains(needle_lower);
+    }
+
+    let h = haystack.as_bytes();
+    let n = needle_lower.as_bytes();
+    if h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n)) {
+        return true;
+    }
+    if !has_cased_char(haystack) {
+        return false;
     }
     haystack.to_lowercase().contains(needle_lower)
 }
@@ -1196,7 +1320,9 @@ fn starts_with_ignore_case_ci(haystack: &str, prefix_lower: &str) -> bool {
     {
         return true;
     }
-    !haystack.is_ascii() && haystack.to_lowercase().starts_with(prefix_lower)
+    // 只有"含真正大小写字符"的非 ASCII 文本才需要小写副本比较；
+    // CJK 路径的折叠是恒等变换，前面按字节的比较已经给出完整结论。
+    !haystack.is_ascii() && has_cased_char(haystack) && haystack.to_lowercase().starts_with(prefix_lower)
 }
 
 fn ends_with_ignore_case_ci(haystack: &str, suffix_lower: &str) -> bool {
@@ -1207,7 +1333,8 @@ fn ends_with_ignore_case_ci(haystack: &str, suffix_lower: &str) -> bool {
     {
         return true;
     }
-    !haystack.is_ascii() && haystack.to_lowercase().ends_with(suffix_lower)
+    // 同 starts_with：无大小写字符的 haystack 不需要分配小写副本
+    !haystack.is_ascii() && has_cased_char(haystack) && haystack.to_lowercase().ends_with(suffix_lower)
 }
 
 fn extension_matches(name: &str, ext_lower: &str) -> bool {
@@ -2089,6 +2216,7 @@ impl GlobalIndex {
         sink: &mut DeltaSink,
         report: &mut UsnSyncReport,
     ) {
+        self.bump_generation();
         if prefixes.is_empty() {
             return;
         }
@@ -2931,11 +3059,21 @@ mod tests {
         let idx = GlobalIndex::new();
         idx.upsert_batch_internal(entries);
 
-        // 全量扫描的"地板价"：条件永不命中，但仍需遍历并求值全部条目
+        // 全量扫描的"地板价"：条件永不命中，但仍需遍历并求值全部条目。
+        // 注意单位只支持 B/KB/MB/GB/TB：早期这里写的是 "1PB"，未知单位被当成 1 字节，
+        // 于是"永不命中"的查询实际上匹配了全部条目，测到的根本不是地板。
         for _ in 0..2 {
             let t = Instant::now();
-            let r = idx.search_with_filter("size:>1PB", 500);
+            let r = idx.search_with_filter("size:>999TB", 500);
             eprintln!("[bench] 全量扫描地板(无命中)      命中{:>5}  {:?}", r.len(), t.elapsed());
+        }
+
+        // K 敏感性：K（top-K 堆大小）直接决定"命中数百万条"时的成本，
+        // 也是分页策略最容易踩的坑（为后续页预先放大 K 会让首屏变慢一个数量级）。
+        for k in [500usize, 5_000, 50_000] {
+            let t = Instant::now();
+            let r = idx.search_with_filter("size:>1", k);
+            eprintln!("[bench] K 敏感性 size:>1 K={:<6} 命中{:>6}  {:?}", k, r.len(), t.elapsed());
         }
 
         // 前缀快路径（首字符分桶）vs 包含匹配（全量并行）
@@ -2958,6 +3096,30 @@ mod tests {
             );
         }
 
+        // P1-2 对照：同一索引上"旧实现（每条目分配一份小写路径）"vs"新实现（零分配）"。
+        // 即使索引里没有中文路径，旧实现也要为 310 万条各分配一次 String。
+        {
+            let needle = "文档";
+            let entries = idx.entries.read();
+            let t = Instant::now();
+            let old = entries
+                .iter()
+                .filter(|e| e.path.to_lowercase().contains(needle))
+                .count();
+            let old_ms = t.elapsed();
+            let t = Instant::now();
+            let new = entries
+                .iter()
+                .filter(|e| contains_ignore_case(&e.path, needle))
+                .count();
+            let new_ms = t.elapsed();
+            assert_eq!(old, new, "两种实现结果必须一致");
+            eprintln!(
+                "[bench] CJK 包含匹配 旧(逐条 to_lowercase) 命中{old} {:?}  →  新(零分配) 命中{new} {:?}",
+                old_ms, new_ms
+            );
+        }
+
         // 前端"触底加载更多"的真实模式：连续取 10 页
         let t_all = Instant::now();
         let mut acc = 0usize;
@@ -2966,6 +3128,58 @@ mod tests {
             acc += r.len();
         }
         eprintln!("[bench] 连续加载 10 页(每页1000) 共{acc} 条  {:?}", t_all.elapsed());
+    }
+
+    /// 回归：`contains_ignore_case` 的零分配快路径不得改变匹配语义。
+    ///
+    /// 关键是"折叠不可能改变结果"这一判断必须成立：CJK/数字/标点没有大小写，
+    /// 而西里尔/希腊文/德语 ß 等必须仍然走小写副本回退。这里既做定点断言，
+    /// 也与"旧实现"（无条件 to_lowercase 后 contains）逐条对拍。
+    #[test]
+    fn contains_ignore_case_semantics_unchanged_by_fast_paths() {
+        assert!(contains_ignore_case("C:/Windows/System32", "windows"));
+        assert!(!contains_ignore_case("C:/Windows/System32", "linux"));
+        assert!(contains_ignore_case("C:/用户/文档", "文档"));
+        assert!(!contains_ignore_case("C:/用户/文档", "图片"));
+        // CJK 路径 + 需要折叠的 ASCII needle
+        assert!(contains_ignore_case("C:/用户/ABC", "abc"));
+        // 真正涉及 Unicode 折叠的场景必须仍然命中（靠回退分支）
+        assert!(contains_ignore_case("C:/ПАПКА/файл", "папка"));
+
+        for (h, n) in [
+            ("C:/Windows", "windows"),
+            ("C:/WINDOWS", "windows"),
+            ("C:/用户/ABC", "abc"),
+            ("C:/ПАПКА", "папка"),
+            ("C:/文档", "文档"),
+            ("C:/文档", "abc"),
+            ("C:/straße", "straße"),
+            ("C:/STRASSE", "strasse"),
+            ("", "a"),
+            ("abc", ""),
+            ("C:/a", "a"),
+        ] {
+            assert_eq!(
+                contains_ignore_case(h, n),
+                h.to_lowercase().contains(n),
+                "包含匹配与旧实现不一致: haystack={h:?} needle={n:?}"
+            );
+        }
+
+        for (h, n) in [("C:/ПАПКА/x", "папка"), ("C:/文档/x", "文档"), ("C:/A", "a"), ("C:/文档", "abc")] {
+            assert_eq!(
+                starts_with_ignore_case_ci(h, n),
+                h.to_lowercase().starts_with(n),
+                "前缀匹配与旧实现不一致: haystack={h:?} needle={n:?}"
+            );
+        }
+        for (h, n) in [("C:/x/ПАПКА", "папка"), ("C:/x/文档", "文档"), ("C:/A.PDF", "pdf"), ("C:/文档", "abc")] {
+            assert_eq!(
+                ends_with_ignore_case_ci(h, n),
+                h.to_lowercase().ends_with(n),
+                "后缀匹配与旧实现不一致: haystack={h:?} needle={n:?}"
+            );
+        }
     }
 
     /// 契约：响应是对象且 results 为数组、字段为 camelCase（前端据此渲染列表）
