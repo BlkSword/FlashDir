@@ -524,9 +524,12 @@ flashdir.exe --selftest-bridge     # 桥接链路（需桌面端运行）
 | 项目 | 命令 | 说明 |
 |------|------|------|
 | 单元测试 | `cargo test --release --lib` | 覆盖查询语法、索引更新与检索分页、卷枚举、聚合等；通过情况以命令输出为准（测试集仍在扩充，不固定断言数） |
-| 基准测试 | `cargo test --release --lib -- --ignored --nocapture bench` | 聚合、排序、检索基准 |
+| 基准测试 | `cargo test --release --lib -- --ignored --nocapture <基准名>` | 聚合、排序、检索、分页、索引载入、blob 编解码基准。**必须按名字单独跑**：并行执行多个基准会互相污染数字（详见 [docs/perf.md](docs/perf.md)） |
 | MCP 自测 | 见 [8.4](#84-自测) | 协议、端点、桥接，退出码 0 为通过 |
 | 命令行验证 | `cli.exe <路径> --filter "ext:zip size:>10MB"` | 与桌面端一致的过滤语义 |
+
+性能基准的口径（冷/热页缓存、串行 A/B 与 rayon 并行查询不可直接比较、波动幅度）、
+逐项优化前后对比、以及**被实测证伪的尝试**都记录在 [docs/perf.md](docs/perf.md)。
 
 ---
 
