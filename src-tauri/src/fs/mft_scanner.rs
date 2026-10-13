@@ -472,11 +472,18 @@ impl MftScanner {
 
         let record_data_start = FILE_RECORD_OUT_HEADER_SIZE;
         let mut record_buffer = out_buffer[record_data_start..record_data_start + record_len].to_vec();
-        if !apply_mft_fixup(&mut record_buffer, self.bytes_per_sector as usize) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "$MFT 文件记录的 update sequence 校验失败",
-            ));
+        // 这条记录来自 FSCTL_GET_NTFS_FILE_RECORD：**通常已由文件系统处理过 update
+        // sequence**，因此再校验会不匹配；旧实现忽略返回值继续解析是对的。
+        // 一旦把它当硬错误返回，$MFT 的 data runs 就解析不出来 → mft_data_runs 为空 →
+        // read_all_records 里的 `read_mft_data_runs()?` 直接 Err → 整个 MFT 扫描失败 →
+        // 界面永远回退"目录遍历"（3.5.1 及以前不会 —— 这是回归）。
+        // fixup 在首个扇区不匹配时不写回任何字节，因此"按原样解析"是安全的。
+        if !apply_mft_fixup_with_fallback(&mut record_buffer, self.bytes_per_sector as usize) {
+            FIXUP_IOCTL_NOTED.call_once(|| {
+                crate::diag::log_line(
+                    "[MFT] $MFT 记录的 update sequence 校验未通过（IOCTL 返回的记录一般已由文件系统处理过），按原样解析",
+                );
+            });
         }
 
         // 遍历属性，找到 $DATA (0x80) 非驻留属性
@@ -652,7 +659,7 @@ impl MftScanner {
                             // fixup 失败（update sequence 不匹配 / 结构调整越界）说明记录
                             // 已损坏：旧实现忽略返回值继续解析，会用被破坏的字节产出
                             // 错误的 name/size。这里按"解析失败"处理，槽位保持 None。
-                            if !apply_mft_fixup(record_data, self.bytes_per_sector as usize) {
+                            if !apply_mft_fixup_with_fallback(record_data, self.bytes_per_sector as usize) {
                                 FIXUP_FAILURES.fetch_add(1, Ordering::Relaxed);
                                 return;
                             }
@@ -872,11 +879,15 @@ impl MftScanner {
             }
         }
 
-        // 应用 fixup 后解析记录；fixup 失败说明记录已损坏，同样按"读不到"处理
-        // （失败次数累计进 FIXUP_FAILURES，由下一次全量扫描汇总输出，不在这里刷屏）
-        if !apply_mft_fixup(&mut buffer, self.bytes_per_sector as usize) {
-            FIXUP_FAILURES.fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
+        // 同上：IOCTL 返回的记录通常已由文件系统处理过 update sequence，校验不匹配
+        // 并不代表记录损坏。旧实现忽略返回值继续解析；改成 Ok(None) 会让 USN 增量
+        // 路径把改名/删除/体积变更全部读不到，反而更糟。
+        if !apply_mft_fixup_with_fallback(&mut buffer, self.bytes_per_sector as usize) {
+            FIXUP_IOCTL_NOTED.call_once(|| {
+                crate::diag::log_line(
+                    "[MFT] 单条记录 update sequence 校验未通过（IOCTL 路径），按原样解析",
+                );
+            });
         }
         Ok(parse_mft_record_info(&buffer, frn))
     }
@@ -1407,7 +1418,26 @@ fn apply_mft_fixup(data: &mut [u8], sector_size: usize) -> bool {
     true
 }
 
-// ─── 公共接口 ──────────────────────────────────────────────
+/// IOCTL 路径上"fixup 校验未通过但记录仍可用"只记一次日志，避免每次扫描刷屏。
+static FIXUP_IOCTL_NOTED: std::sync::Once = std::sync::Once::new();
+
+/// 带扇区大小兜底的 fixup。
+///
+/// 优先用卷报告的扇区大小；若校验不通过再退回 512（两者的 update sequence 步长都
+/// 试一遍）。**先在同一份副本上验证**，成功才写回原 buffer —— 避免"前半记录已按 A
+/// 步长写回、后半改用 B 步长"的混用。
+fn apply_mft_fixup_with_fallback(data: &mut [u8], sector_size: usize) -> bool {
+    let preferred = normalize_sector_size(sector_size);
+    if preferred == 512 {
+        return apply_mft_fixup(data, 512);
+    }
+    let mut probe = data.to_vec();
+    if apply_mft_fixup(&mut probe, preferred) {
+        data.copy_from_slice(&probe);
+        return true;
+    }
+    apply_mft_fixup(data, 512)
+}
 
 /// 检测当前进程是否以管理员/提升权限运行（Windows）
 #[cfg(target_os = "windows")]
@@ -1684,6 +1714,41 @@ mod fixup_and_runs_tests {
         assert!(apply_mft_fixup(&mut rec512, 512));
         assert_eq!(u16_from_le(&rec512[510..512]), 0x1000);
         assert_eq!(u16_from_le(&rec512[1022..1024]), 0x1001);
+    }
+
+    /// 回归（管理员仍走目录遍历）：IOCTL 路径把 fixup 校验失败当硬错误会让整个 MFT
+    /// 扫描失败。本测试钉住该修复依赖的两个前提：
+    /// 1) 校验失败时不得写回任何字节 —— 否则调用方"按原样解析"会读到被改坏的字节；
+    /// 2) 带兜底的版本在卷报告的扇区大小与实际步长不符时会退回 512 并成功。
+    #[test]
+    fn fixup_failure_leaves_record_intact_and_fallback_tries_512() {
+        // 1) 模拟"已被文件系统处理过"的记录：扇区末尾不是 signature → 校验失败
+        let mut cooked = make_record(1024, 512);
+        cooked[510..512].copy_from_slice(&0xBEEFu16.to_le_bytes());
+        cooked[1022..1024].copy_from_slice(&0xBEEFu16.to_le_bytes());
+        let before = cooked.clone();
+        assert!(!apply_mft_fixup(&mut cooked, 512), "校验应当失败");
+        assert_eq!(
+            cooked, before,
+            "校验失败时不得写回任何字节（否则 IOCTL 路径按原样解析会读到坏数据）"
+        );
+
+        // 2) 兜底：卷报 4096、记录实际按 512 步长 → 首选失败后应退回 512 并成功
+        let mut rec = make_record(1024, 512);
+        assert!(
+            apply_mft_fixup_with_fallback(&mut rec, 4096),
+            "首选步长失败后应退回 512 并成功"
+        );
+        assert_eq!(u16_from_le(&rec[510..512]), 0x1000);
+        assert_eq!(u16_from_le(&rec[1022..1024]), 0x1001);
+
+        // 3) 两种步长都失败（cooked）时 buffer 仍逐字节不变
+        let mut cooked2 = make_record(1024, 512);
+        cooked2[510..512].copy_from_slice(&0xBEEFu16.to_le_bytes());
+        cooked2[1022..1024].copy_from_slice(&0xBEEFu16.to_le_bytes());
+        let before2 = cooked2.clone();
+        assert!(!apply_mft_fixup_with_fallback(&mut cooked2, 4096));
+        assert_eq!(cooked2, before2, "全部步长失败后 buffer 必须保持原样");
     }
 
     /// 缺陷 1 的边界：0 / 过大 / 其他异常扇区大小回退到 512，不 panic 也不越界。
