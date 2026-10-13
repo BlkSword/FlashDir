@@ -1,6 +1,6 @@
 use anyhow::Result;
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -36,6 +36,30 @@ const BLOB_MAGIC: &[u8; 4] = b"FDBL";
 // 注意：判定为未命中的行仍留在 scan_meta 里（dir_mtime/verified_usn 仍在），
 // 因此不会误删其它有效缓存，也不会把"上次已校验 USN"清零。
 const BLOB_VERSION: u8 = 3;
+
+/// 缓存库路径的**环境变量覆盖**：`FLASHDIR_CACHE_DB`。
+///
+/// 只为测试/基准服务 —— `global_index` 的 schema 收拢**不可逆**（老列被 DROP 后
+/// 只能靠重建整份索引恢复），必须先在真实库的**副本**上验证，绝不能拿用户那份
+/// ~1GB 的真实索引当试验田。设置后 `DiskCache` 的所有 I/O（含迁移）都指向该文件；
+/// 未设置或为空串时行为与旧版完全一致（`%USERPROFILE%\.flashdir\cache_v2.db`）。
+const CACHE_DB_ENV: &str = "FLASHDIR_CACHE_DB";
+
+/// `global_index` **新 schema** 的列集合 = `load_global_index` 真正读取的 4 列。
+///
+/// 老 schema 有 9 列，其中 5 列只写不读，全部收拢掉：
+/// - `name` / `name_lower` / `ext`：都能由 `path` 派生（`name_lower_from_path`），
+///   载入侧已不再读 `name_lower`，写入侧 `name` / `ext` 本来就恒写空串；
+/// - `drive`：无任何查询使用，其索引 `idx_global_index_drive` 早已 DROP；
+/// - `created_at`：写入时打时间戳，**从未被读过**（`scan_meta.created_at` 是另一张表，
+///   与本表无关）。
+const GLOBAL_INDEX_COLUMNS: [&str; 4] = ["path", "size", "is_dir", "mtime"];
+
+/// `index_meta` 中"`global_index` 已收拢到新 schema"的标记键。
+///
+/// 与列探测（`PRAGMA table_info`）双重判定：标记保证"同一份库不重复迁移"，
+/// 列探测保证"标记丢失/写了标记但迁移没落地"时仍能补做一次真实迁移。
+const GLOBAL_INDEX_SCHEMA_KEY: &str = "schema_v2";
 
 /// 仅用于落盘的紧凑条目（**不是**对外契约，`scan::Item` 的字段集合与名字都不变）。
 ///
@@ -246,36 +270,60 @@ fn mark_accessed(conn: &Connection, path: &str) {
     );
 }
 
-/// 全局索引相关表与迁移（幂等）。
-///
-/// P0-3b：这些语句只在**一处**执行——要么在独立的索引连接上，要么（第二条连接打不开时）
-/// 退回主连接补做。两条连接共享同一个 DB 文件，表是库级对象，重复迁移既无意义也会
-/// 在启动路径上白付 ALTER/DROP 的代价。
-fn migrate_global_index_schema(conn: &Connection) -> Result<()> {
-    // ── 全局搜索索引表：持久化全局索引条目 ──
+/// 读 `global_index` 的列名（空 = 表不存在）。
+fn global_index_columns(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare("PRAGMA table_info(global_index)")?;
+    let cols: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(cols)
+}
+
+/// 是否为收拢后的新 schema（列集合恰好等于 `GLOBAL_INDEX_COLUMNS`，与顺序无关）。
+fn is_new_global_index_schema(cols: &[String]) -> bool {
+    cols.len() == GLOBAL_INDEX_COLUMNS.len()
+        && GLOBAL_INDEX_COLUMNS
+            .iter()
+            .all(|need| cols.iter().any(|c| c == need))
+}
+
+/// 建新 schema 的 `global_index`（空库 / 表缺失时用）。
+fn create_global_index_table(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS global_index (
             path TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            name_lower TEXT NOT NULL,
-            ext TEXT NOT NULL DEFAULT '',
             size INTEGER NOT NULL,
             is_dir INTEGER NOT NULL,
-            drive TEXT NOT NULL,
-            mtime INTEGER NOT NULL,
-            created_at INTEGER NOT NULL
+            mtime INTEGER NOT NULL
         )",
         [],
     )?;
+    Ok(())
+}
 
-    // 兼容旧库：缺少 ext 列时补上
-    let _ = conn.execute("ALTER TABLE global_index ADD COLUMN ext TEXT NOT NULL DEFAULT ''", []);
+/// 落 `schema_v2` 标记。
+fn mark_global_index_schema(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?1, '1')",
+        params![GLOBAL_INDEX_SCHEMA_KEY],
+    )?;
+    Ok(())
+}
 
-    // 全局索引只按主键(path)读写或全表加载：name_lower / drive 索引从未被查询使用
-    let _ = conn.execute("DROP INDEX IF EXISTS idx_global_index_name_lower", []);
-    let _ = conn.execute("DROP INDEX IF EXISTS idx_global_index_drive", []);
-
-    // 全局索引元数据（是否为全盘构建 / 盘符列表），用于重启后恢复状态语义
+/// 启动路径的**廉价表准备**：只保证 `index_meta` / `global_index` 存在，**绝不动已有表**。
+///
+/// 与 `migrate_global_index_schema` 的关键区别：这里不做任何表重建、不做 VACUUM。
+/// `CREATE TABLE IF NOT EXISTS` 在老库（9 列）上是一条 no-op —— SQLite 只读 schema 元数据、
+/// 不碰数据页，因此开销与表大小无关（310 万行也一样是微秒级）。
+///
+/// 这正是不再有启动冻结的原因：`DiskCache::instance()` 在 main.rs 里于**建窗之前**被调用，
+/// 原本它会在 `open_index_conn` → `migrate_global_index_schema` 里同步跑"重建 34s + VACUUM 8s"。
+/// 现在启动只建表；schema 收拢改由两条本就要花时间的路径承担：
+/// 1. 用户主动重建索引 → `save_global_index_stream`（它第一件事本来就是清空整表 + 全量重灌）；
+/// 2. 在那之前，写路径按"当前列集合"自适应（`DiskCache::global_index_is_new_schema`），
+///    老库不迁移也能继续读写，行为对调用方完全一致。
+fn ensure_global_index_tables(conn: &Connection) -> Result<()> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS index_meta (
             key TEXT PRIMARY KEY,
@@ -283,7 +331,147 @@ fn migrate_global_index_schema(conn: &Connection) -> Result<()> {
         )",
         [],
     )?;
+    // 表缺失（全新库）→ 直接是新 schema；表已存在（老 9 列库）→ IF NOT EXISTS 使它原样保留
+    create_global_index_table(conn)?;
     Ok(())
+}
+
+/// 全局索引相关表与 schema 迁移（幂等）。
+///
+/// **注意：本函数已不在启动路径上**，`DiskCache::open` / `open_index_conn` 只走
+/// `ensure_global_index_tables`。保留为**内部工具**：测试用它验证"重建式迁移"的事务原子性
+/// （含强制失败完整回滚），未来若要在空闲时刻做一次性收拢也可以复用它。
+///
+/// P0-3b：这些语句只在**一处**执行——要么在独立的索引连接上，要么（第二条连接打不开时）
+/// 退回主连接补做。两条连接共享同一个 DB 文件，表是库级对象，重复迁移既无意义也会
+/// 在启动路径上白付 ALTER/DROP 的代价。
+///
+/// schema 收拢（9 列 → `GLOBAL_INDEX_COLUMNS`）：用"重建表 + 拷贝 + 改名"而不是
+/// `ALTER TABLE DROP COLUMN` —— 重建在一个**事务**里完成，失败即完整回滚，不会留下
+/// 半迁移状态；事务提交后再补一次 `VACUUM` 把 freelist 真正还给文件系统
+/// （见 `rebuild_global_index_schema` 的实测数据）。
+///
+/// **不可逆**：老列一旦 DROP 就无法还原，唯一的恢复手段是删掉索引库重建整份索引。
+///
+/// 失败语义：返回 Err → 索引连接不可用 → 退回主连接再试一次 → 仍失败则整个缓存降级为
+/// 无缓存模式。宁可降级也不在半迁移的库上继续读写（老 schema 下写入侧的 4 列 INSERT
+/// 会撞上 name/name_lower/drive/created_at 的 NOT NULL，索引将永远无法重建）。
+#[allow(dead_code)] // 仅测试/未来工具使用，见上方说明
+fn migrate_global_index_schema(conn: &mut Connection) -> Result<()> {
+    // index_meta 先建：迁移标记就存在这里
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS index_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    let cols = global_index_columns(conn)?;
+    let marked = conn
+        .query_row(
+            "SELECT value FROM index_meta WHERE key = ?1",
+            params![GLOBAL_INDEX_SCHEMA_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some();
+
+    // 表缺失（全新库）：直接建新 schema，不算迁移
+    if cols.is_empty() {
+        create_global_index_table(conn)?;
+        mark_global_index_schema(conn)?;
+        return Ok(());
+    }
+
+    // 已是新 schema：no-op（只补标记；重复执行不会再动表）
+    if is_new_global_index_schema(&cols) {
+        if !marked {
+            mark_global_index_schema(conn)?;
+        }
+        return Ok(());
+    }
+
+    // 老 schema → 一次性收拢。标记只是"快路径"信息，真正决定动作的是列探测：
+    // 即使标记丢了（或被误写）也仍会走一次迁移，不会漏。
+    rebuild_global_index_schema(conn, &cols)
+}
+
+/// 老 schema → 新 schema 的**一次性**收拢：单事务重建 + 事务外 VACUUM。
+///
+/// 步骤：建新表 → 逐行拷贝 4 列 → DROP 老表（连带其旧索引）→ 改名 → 落标记 → 提交。
+/// `Transaction` 在任意一步出错时析构回滚，库里仍是**原样**的老 schema。
+///
+/// 提交后必须补一次 `VACUUM`：重建只把老表的页退进 freelist，SQLite **不会**在提交时
+/// 收缩数据库文件。本机真实库副本实测（3,106,896 行）：`global_index` 表 548.8MB →
+/// 414.1MB，而库文件反而从 994.5MB 涨到 1854.9MB；补 `VACUUM`（8.2s）后落到 803.1MB。
+/// `VACUUM` 不能在事务里、也不参与迁移原子性：失败只影响空间回收（schema 已是新形态），
+/// 因此只记日志、不改变返回值。
+///
+/// 只在 `migrate_global_index_schema`（内部工具）里用；生产路径的 schema 收拢在
+/// `save_global_index_stream`，那里用更简单的"直接 DROP + CREATE"（理由见该函数注释）。
+#[allow(dead_code)] // 仅被同样保留为工具的 migrate_global_index_schema 调用
+fn rebuild_global_index_schema(conn: &mut Connection, cols: &[String]) -> Result<()> {
+    for need in GLOBAL_INDEX_COLUMNS {
+        if !cols.iter().any(|c| c == need) {
+            anyhow::bail!("global_index 缺少列 {need}（实际列: {cols:?}），拒绝迁移以免丢数据");
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let outcome = (|| -> Result<usize> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "CREATE TABLE global_index_v2 (
+                path TEXT PRIMARY KEY,
+                size INTEGER NOT NULL,
+                is_dir INTEGER NOT NULL,
+                mtime INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        let copied = tx.execute(
+            "INSERT INTO global_index_v2 (path, size, is_dir, mtime)
+             SELECT path, size, is_dir, mtime FROM global_index",
+            [],
+        )?;
+        // 老表连同它的索引（idx_global_index_name_lower / _drive）一起消失
+        tx.execute("DROP TABLE global_index", [])?;
+        tx.execute("ALTER TABLE global_index_v2 RENAME TO global_index", [])?;
+        tx.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES (?1, '1')",
+            params![GLOBAL_INDEX_SCHEMA_KEY],
+        )?;
+        tx.commit()?;
+        Ok(copied)
+    })();
+
+    match outcome {
+        Ok(copied) => {
+            let rebuild_cost = started.elapsed();
+            let vacuum = std::time::Instant::now();
+            let vacuum_note = match conn.execute_batch("VACUUM") {
+                Ok(()) => {
+                    // 顺手把 VACUUM 撑大的 WAL 折回主文件（失败无所谓）
+                    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+                    format!("VACUUM {:?}", vacuum.elapsed())
+                }
+                Err(e) => format!("VACUUM 失败（仅影响空间回收，schema 已生效）: {e:#}"),
+            };
+            crate::diag::log_line(&format!(
+                "[Index] global_index schema 收拢完成: {copied} 行, 老列 {:?} -> {:?}, 重建 {rebuild_cost:?} + {vacuum_note}（不可逆，恢复只能重建索引）",
+                cols,
+                GLOBAL_INDEX_COLUMNS,
+            ));
+            Ok(())
+        }
+        Err(e) => {
+            crate::diag::log_line(&format!(
+                "[Index] global_index schema 迁移失败，已回滚（库仍是老 schema）: {e:#}"
+            ));
+            Err(e)
+        }
+    }
 }
 
 /// 从绝对路径派生小写文件名（与 `global_search::name_from_path` 同一套规则）。
@@ -296,6 +484,21 @@ fn name_lower_from_path(path: &str) -> String {
     match path.rfind('/') {
         Some(i) => path[i + 1..].to_lowercase(),
         None => path.to_lowercase(),
+    }
+}
+
+/// 从绝对路径取盘符（`"C:/…"` → `'C'`）。
+///
+/// 只为**老 schema（9 列）**服务：那一版的 `drive` 列是 NOT NULL，而它从来没有任何读方
+/// （其索引 `idx_global_index_drive` 早已 DROP）。新 schema 已无该列，所以这个函数只在
+/// `global_index` 仍是 9 列时被调用 —— 它存在的意义就是让**老库在迁移前也能继续写**。
+#[inline]
+fn extract_drive(path: &str) -> Option<char> {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        Some(bytes[0] as char)
+    } else {
+        None
     }
 }
 
@@ -319,6 +522,17 @@ pub struct DiskCache {
     max_size_mb: usize,
     /// 当前缓存字节数（以字节为单位维护，删除时同步回退）
     current_bytes: Mutex<u64>,
+    /// **本实例打开的这份库**里 `global_index` 是否为收拢后的 4 列 schema。
+    ///
+    /// 写路径必须按表结构分支（老库 9 列 / 新库 4 列），但绝不能每次写都 `PRAGMA table_info`
+    /// （`upsert_global_index_entries` 在 USN 增量同步里是高频调用），所以探测一次就缓存住。
+    ///
+    /// 刻意**不用进程级 `static OnceLock`**：同一进程会先后打开**不同**的库
+    /// （测试/基准用 `FLASHDIR_CACHE_DB` 指向副本、或用户删库后重开），
+    /// 进程级缓存会把 A 库的结论套到 B 库上，直接按错误的列集合去 INSERT。
+    /// 实例级缓存随 `DiskCache` 生命周期失效，且 `save_global_index_stream` 收拢 schema 后会
+    /// 立刻把它刷成 `true`。
+    global_index_new_schema: Mutex<Option<bool>>,
 }
 
 static DISK_CACHE: OnceLock<Arc<DiskCache>> = OnceLock::new();
@@ -342,6 +556,7 @@ impl DiskCache {
             index_conn: Mutex::new(None),
             max_size_mb: 500,
             current_bytes: Mutex::new(0),
+            global_index_new_schema: Mutex::new(None),
         }
     }
 
@@ -350,8 +565,14 @@ impl DiskCache {
     }
 
     pub fn new() -> Result<Self> {
-        let cache_path = Self::get_cache_path()?;
+        Self::open(Self::get_cache_path()?)
+    }
 
+    /// 按**显式路径**打开缓存库（`new` 的实参化版本）。
+    ///
+    /// 测试/基准用它指向真实库的副本：`new()` 走 `get_cache_path()`（含
+    /// `FLASHDIR_CACHE_DB` 覆盖），这里绕开全局单例，避免测试之间互相污染。
+    fn open(cache_path: PathBuf) -> Result<Self> {
         if let Some(parent) = cache_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -435,10 +656,17 @@ impl DiskCache {
 
         // ── 全局搜索索引连接：与目录缓存分离的**第二条**连接 ──
         //
-        // 建表/迁移只在下面这一处执行一次（两条连接共享同一 DB 文件，表是库级对象，
-        // 因此绝不能让两条连接各跑一遍迁移）。第二条连接只负责全局索引与 index_meta。
+        // 建表只在下面这一处执行一次（两条连接共享同一 DB 文件，表是库级对象，
+        // 因此绝不能让两条连接各跑一遍）。第二条连接只负责全局索引与 index_meta。
         //
-        // 降级语义（与旧实现一致）：只有"主连接上的迁移失败"才会让整个缓存进入
+        // **启动路径不做 schema 迁移**：这里只调 `ensure_global_index_tables`（两条
+        // `CREATE TABLE IF NOT EXISTS`）。老库（9 列）上它是一条 no-op，SQLite 只读 schema
+        // 不碰数据页，因此 `DiskCache::instance()`（main.rs 在**建窗之前**就调用了它）
+        // 不再有"重建 34s + VACUUM 8s ≈ 42s 窗口都不出现"的冻结，只剩微秒级开销。
+        // schema 收拢改由 `save_global_index_stream`（用户主动重建索引那条本来就很重的路径）
+        // 顺手完成；在那之前，写路径按当前列集合自适应，老库不迁移也能正常读写。
+        //
+        // 降级语义（与旧实现一致）：只有"主连接上的表准备失败"才会让整个缓存进入
         // conn=None 的降级模式；第二条连接打不开时退回主连接跑索引 I/O，功能不丢。
         let index_conn = match Self::open_index_conn(&cache_path) {
             Ok(ic) => Some(ic),
@@ -449,9 +677,9 @@ impl DiskCache {
                 None
             }
         };
-        // 第二条连接不可用：索引相关表/迁移在主连接上补做（旧行为）
+        // 第二条连接不可用：索引相关表在主连接上补做（旧行为，同样不做迁移）
         if index_conn.is_none() {
-            migrate_global_index_schema(&conn)?;
+            ensure_global_index_tables(&conn)?;
         }
 
         let current_size: i64 = conn
@@ -463,6 +691,7 @@ impl DiskCache {
             index_conn: Mutex::new(index_conn),
             max_size_mb: 500,
             current_bytes: Mutex::new(current_size.max(0) as u64),
+            global_index_new_schema: Mutex::new(None),
         };
 
         cache.cleanup_old_entries()?;
@@ -470,7 +699,7 @@ impl DiskCache {
         Ok(cache)
     }
 
-    /// 打开全局索引专用连接并完成它的表/迁移。
+    /// 打开全局索引专用连接并完成它的**表准备**（不迁移 schema）。
     ///
     /// 与主连接共享同一个 DB 文件：WAL 是库级设置（旧库首次打开时已写入），
     /// 这里只需给这条连接单独设置 busy_timeout —— 跨连接写冲突（例如
@@ -480,11 +709,24 @@ impl DiskCache {
         let conn = Connection::open(cache_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        migrate_global_index_schema(&conn)?;
+        // 索引重建（全表 DELETE + 310 万行 INSERT）与 schema 收拢都会让 WAL 短时间大幅增长：
+        // checkpoint 后截断到 64MB 以内，避免 WAL 常驻几百 MB。
+        let _ = conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024i64);
+        ensure_global_index_tables(&conn)?;
         Ok(conn)
     }
 
+    /// 缓存库路径。
+    ///
+    /// 默认 `%USERPROFILE%\.flashdir\cache_v2.db`（`HOME` 回退）；
+    /// 环境变量 `FLASHDIR_CACHE_DB` 可覆盖（用途见 `CACHE_DB_ENV` 的注释：只给测试/基准
+    /// 指向真实库副本用，避免在用户真实索引上试错 schema 迁移）。
     fn get_cache_path() -> Result<PathBuf> {
+        if let Some(custom) = std::env::var_os(CACHE_DB_ENV) {
+            if !custom.is_empty() {
+                return Ok(PathBuf::from(custom));
+            }
+        }
         let home_dir = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
             .map_err(|_| anyhow::anyhow!("Cannot get home directory"))?;
@@ -1099,14 +1341,44 @@ impl DiskCache {
         f(conn)
     }
 
+    /// 当前 `global_index` 是不是收拢后的 4 列 schema（**每个实例只探测一次**）。
+    ///
+    /// 探测本身很便宜（`PRAGMA table_info` 只读 schema，与行数无关），但 `upsert_global_index_entries`
+    /// 在 USN 增量同步里是高频调用，所以结果缓存在 `global_index_new_schema` 里：
+    /// 进程内、每实例一次，之后所有写入都不再问表结构。
+    ///
+    /// 返回值决定写路径用哪套列：
+    /// - `false`（老 9 列库）→ 按老列写，补 `name`/`ext`/`drive`/`created_at`；
+    /// - `true`（新 4 列库）→ 只写 `path, size, is_dir, mtime`。
+    ///
+    /// 表意外缺失（正常路径已由 `ensure_global_index_tables` 建好）时补建成新 schema 并返回 `true`，
+    /// 这样写入永远不会撞上"表不存在"。
+    fn global_index_is_new_schema(&self, conn: &Connection) -> Result<bool> {
+        if let Some(cached) = *self.global_index_new_schema.lock() {
+            return Ok(cached);
+        }
+        let cols = global_index_columns(conn)?;
+        let is_new = if cols.is_empty() {
+            create_global_index_table(conn)?;
+            true
+        } else {
+            is_new_global_index_schema(&cols)
+        };
+        *self.global_index_new_schema.lock() = Some(is_new);
+        Ok(is_new)
+    }
+
     /// 一次性修复历史畸形索引路径（形如 `C:\root/C:/root/xxx`）。
     ///
     /// 这类脏行是早期版本拼接路径时留下的，占过索引三成：既让搜索结果出现
     /// 奇怪路径与重复项，又让"粘贴完整路径"永远搜不到东西。
     /// 修复策略：截出其中的真实绝对路径；已有正确行就只删脏行（保留较新的元数据），
     /// 没有就按脏行的元数据补写一条。返回（合并数, 补写数）。
+    ///
+    /// 按**表结构自适应**写列（老库 9 列 / 新库 4 列），对调用方语义完全一致。
     pub fn repair_corrupt_paths(&self) -> Result<(usize, usize)> {
         self.with_index(|conn| {
+            let legacy = !self.global_index_is_new_schema(conn)?;
             // 先取出候选行，避免边遍历边改
             let rows: Vec<(String, i64, i64, i64)> = {
                 let mut stmt = conn
@@ -1130,41 +1402,63 @@ impl DiskCache {
             let mut written = 0usize;
             {
                 let mut del = tx.prepare("DELETE FROM global_index WHERE path = ?1")?;
-                let mut ins = tx.prepare(
-                    "INSERT OR IGNORE INTO global_index
-                     (path, name, name_lower, ext, size, is_dir, drive, mtime, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                )?;
-                let now = chrono::Utc::now().timestamp();
-                for (bad, size, is_dir, mtime) in &rows {
-                    if let Some(fixed) = crate::global_search::repair_corrupt_path(bad) {
-                        let name = fixed.rsplit('/').next().unwrap_or(fixed.as_str());
-                        let ext = if *is_dir != 0 {
-                            String::new()
-                        } else {
-                            name.rsplit_once('.')
-                                .map(|(_, e)| e.to_lowercase())
-                                .unwrap_or_default()
-                        };
-                        let drive = Self::extract_drive(&fixed).unwrap_or('?').to_string();
-                        let changed = ins.execute(params![
-                            fixed,
-                            "",
-                            name.to_lowercase(),
-                            ext,
-                            size,
-                            is_dir,
-                            drive,
-                            mtime,
-                            now
-                        ])?;
-                        if changed > 0 {
-                            written += 1;
-                        } else {
-                            merged += 1;
+                if legacy {
+                    // 老 schema：9 列都是 NOT NULL，必须把派生列补齐（与收拢前的实现逐字一致）
+                    let now = chrono::Utc::now().timestamp();
+                    let mut ins = tx.prepare(
+                        "INSERT OR IGNORE INTO global_index
+                         (path, name, name_lower, ext, size, is_dir, drive, mtime, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    )?;
+                    for (bad, size, is_dir, mtime) in &rows {
+                        if let Some(fixed) = crate::global_search::repair_corrupt_path(bad) {
+                            let name = fixed.rsplit('/').next().unwrap_or(fixed.as_str());
+                            let ext = if *is_dir != 0 {
+                                String::new()
+                            } else {
+                                name.rsplit_once('.')
+                                    .map(|(_, e)| e.to_lowercase())
+                                    .unwrap_or_default()
+                            };
+                            let drive = extract_drive(&fixed).unwrap_or('?').to_string();
+                            let changed = ins.execute(params![
+                                fixed,
+                                "",
+                                name.to_lowercase(),
+                                ext,
+                                size,
+                                is_dir,
+                                drive,
+                                mtime,
+                                now
+                            ])?;
+                            if changed > 0 {
+                                written += 1;
+                            } else {
+                                merged += 1;
+                            }
                         }
+                        del.execute([bad.as_str()])?;
                     }
-                    del.execute([bad.as_str()])?;
+                } else {
+                    // 新 schema 只有 4 列：name / name_lower / ext / drive / created_at 都已收拢掉
+                    // （name_lower 由 path 末段派生，语义不变）。
+                    let mut ins = tx.prepare(
+                        "INSERT OR IGNORE INTO global_index
+                         (path, size, is_dir, mtime)
+                         VALUES (?1, ?2, ?3, ?4)",
+                    )?;
+                    for (bad, size, is_dir, mtime) in &rows {
+                        if let Some(fixed) = crate::global_search::repair_corrupt_path(bad) {
+                            let changed = ins.execute(params![fixed, size, is_dir, mtime])?;
+                            if changed > 0 {
+                                written += 1;
+                            } else {
+                                merged += 1;
+                            }
+                        }
+                        del.execute([bad.as_str()])?;
+                    }
                 }
             }
             tx.commit()?;
@@ -1253,69 +1547,136 @@ impl DiskCache {
     ///
     /// P0-3b：整段（DELETE 全表 + 310 万行 INSERT，单个事务）现在跑在**索引连接**上，
     /// 期间目录缓存的 blob/快照读写不再排队。
+    ///
+    /// **schema 收拢就挂在这条路径上**：它本来就要清空整表 + 全量重灌（用户主动重建索引），
+    /// 而 `DiskCache::instance()` 的启动路径已不再迁移 schema（见 `ensure_global_index_tables`）。
+    /// 所以老库（9 列）会在这里被换成收拢后的 4 列：
+    ///
+    /// - 用"直接 `DROP TABLE` + `CREATE TABLE`"而不是老迁移的"建 `global_index_v2` → 拷 4 列 →
+    ///   DROP 老表 → 改名"：本函数第一件事就是全表清空，表里**现有每一行都注定被删掉**，
+    ///   把 9 列拷进新表纯属白干（真实库 310 万行 = 那 34s 的重建成本，正是要消灭的开销），
+    ///   而 DROP + CREATE 是瞬时的。选择更简单的这条。
+    /// - 事务安全：SQLite 的 DDL 参与事务，`DROP`/`CREATE`/`INSERT` 任意一步出错（含调用方
+    ///   提前关掉 channel 导致 `for` 循环后的 `?`），`Transaction` 析构即整体回滚，
+    ///   老表连同全部数据原样回来——"表被删了但数据没写进去"不会发生。
+    /// - 提交后再补一次 `VACUUM`（只能在事务外）：老表那 9 列的页只进 freelist，
+    ///   不 VACUUM 的话文件只会涨（实测 994.5MB → 1854.9MB，VACUUM 后 803.1MB）。
+    ///   只在这一条"刚收拢过 schema"的分支做——新 schema 分支不需要，DELETE 腾出的页会被
+    ///   紧接着的 INSERT 原地复用，白白 VACUUM 8s 是净亏。
+    ///   VACUUM 失败只记 diag，不影响本函数契约（"提交后即可被 `load_global_index` 正确读回"）。
+    ///
+    /// 新 schema 分支只写 4 列：`name_lower` 由 `path` 末段派生（载入侧本来就不读它），
+    /// `name` / `ext` / `drive` / `created_at` 从来没有任何读方。
     pub fn save_global_index_stream(
         &self,
         rx: std::sync::mpsc::Receiver<Vec<IndexEntry>>,
     ) -> Result<()> {
         self.with_index(|conn| {
+            let legacy = !self.global_index_is_new_schema(conn)?;
             let tx = conn.transaction()?;
-            tx.execute("DELETE FROM global_index", [])?;
+            if legacy {
+                tx.execute("DROP TABLE global_index", [])?;
+                tx.execute(
+                    "CREATE TABLE global_index (
+                        path TEXT PRIMARY KEY,
+                        size INTEGER NOT NULL,
+                        is_dir INTEGER NOT NULL,
+                        mtime INTEGER NOT NULL
+                    )",
+                    [],
+                )?;
+            } else {
+                // 已是新 schema：表结构不用动，清空即可（腾出的页会被下面的 INSERT 复用）
+                tx.execute("DELETE FROM global_index", [])?;
+            }
             {
                 let mut stmt = tx.prepare(
                     "INSERT OR REPLACE INTO global_index
-                     (path, name, name_lower, ext, size, is_dir, drive, mtime, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     (path, size, is_dir, mtime)
+                     VALUES (?1, ?2, ?3, ?4)",
                 )?;
-                let now = chrono::Utc::now().timestamp();
                 for chunk in rx {
                     for e in chunk {
-                        let drive = Self::extract_drive(&e.path).unwrap_or('?').to_string();
-                        stmt.execute(params![
-                            e.path,
-                            "",
-                            e.name_lower,
-                            "",
-                            e.size,
-                            e.is_dir as i64,
-                            drive,
-                            e.mtime,
-                            now,
-                        ])?;
+                        stmt.execute(params![e.path, e.size, e.is_dir as i64, e.mtime])?;
                     }
                 }
             }
+            // 全量重建结束时这份库一定是 4 列 schema（老库刚被 DROP+CREATE 换掉），
+            // 顺手落标记：与 migrate_global_index_schema 同一套语义（见 GLOBAL_INDEX_SCHEMA_KEY）。
+            // 标记只是"快路径"信息，真正判定始终是列探测，所以这里写不写都不影响正确性。
+            mark_global_index_schema(&tx)?;
             tx.commit()?;
+            if legacy {
+                // 缓存必须立刻跟上：否则同一实例后面的 upsert 还会按 9 列去写这张 4 列的表
+                *self.global_index_new_schema.lock() = Some(true);
+
+                let vacuum = std::time::Instant::now();
+                match conn.execute_batch("VACUUM") {
+                    Ok(()) => {
+                        // 顺手把 VACUUM 撑大的 WAL 折回主文件（失败无所谓）
+                        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+                        crate::diag::log_line(&format!(
+                            "[Index] 索引重建顺带完成 global_index schema 收拢（4 列）: VACUUM {:?}",
+                            vacuum.elapsed()
+                        ));
+                    }
+                    Err(e) => crate::diag::log_line(&format!(
+                        "[Index] 索引重建已换成 4 列 schema，但 VACUUM 失败（仅影响空间回收，索引正确性不受影响）: {e:#}"
+                    )),
+                }
+            }
             Ok(())
         })
     }
 
-    /// 批量 upsert（USN 增量同步）：单事务写入，避免逐条自动提交带来的 fsync 开销
+    /// 批量 upsert（USN 增量同步）：单事务写入，避免逐条自动提交带来的 fsync 开销。
+    ///
+    /// 按**表结构自适应**写列（见 `global_index_is_new_schema`）：老库 9 列时按老列写
+    /// （`name`/`ext` 空串、`drive` 由盘符派生、`created_at` 取当前时间戳），新库只写 4 列。
+    /// 两条分支对调用方的可见行为完全一致 —— 老库不需要迁移也能继续写索引。
     pub fn upsert_global_index_entries(&self, entries: &[IndexEntry]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
         self.with_index(|conn| {
+            let legacy = !self.global_index_is_new_schema(conn)?;
             let tx = conn.transaction()?;
             {
-                let mut stmt = tx.prepare(
-                    "INSERT OR REPLACE INTO global_index
-                     (path, name, name_lower, ext, size, is_dir, drive, mtime, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                )?;
-                let now = chrono::Utc::now().timestamp();
-                for entry in entries {
-                    let drive = Self::extract_drive(&entry.path).unwrap_or('?').to_string();
-                    stmt.execute(params![
-                        entry.path,
-                        "",
-                        entry.name_lower,
-                        "",
-                        entry.size,
-                        entry.is_dir as i64,
-                        drive,
-                        entry.mtime,
-                        now,
-                    ])?;
+                if legacy {
+                    let now = chrono::Utc::now().timestamp();
+                    let mut stmt = tx.prepare(
+                        "INSERT OR REPLACE INTO global_index
+                         (path, name, name_lower, ext, size, is_dir, drive, mtime, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    )?;
+                    for entry in entries {
+                        let drive = extract_drive(&entry.path).unwrap_or('?').to_string();
+                        stmt.execute(params![
+                            entry.path,
+                            "",
+                            entry.name_lower,
+                            "",
+                            entry.size,
+                            entry.is_dir as i64,
+                            drive,
+                            entry.mtime,
+                            now
+                        ])?;
+                    }
+                } else {
+                    let mut stmt = tx.prepare(
+                        "INSERT OR REPLACE INTO global_index
+                         (path, size, is_dir, mtime)
+                         VALUES (?1, ?2, ?3, ?4)",
+                    )?;
+                    for entry in entries {
+                        stmt.execute(params![
+                            entry.path,
+                            entry.size,
+                            entry.is_dir as i64,
+                            entry.mtime
+                        ])?;
+                    }
                 }
             }
             tx.commit()?;
@@ -1376,15 +1737,6 @@ impl DiskCache {
         })
         .ok()
         .flatten()
-    }
-
-    fn extract_drive(path: &str) -> Option<char> {
-        let bytes = path.as_bytes();
-        if bytes.len() >= 2 && bytes[1] == b':' {
-            Some(bytes[0] as char)
-        } else {
-            None
-        }
     }
 }
 
@@ -1461,6 +1813,712 @@ mod tests {
     fn test_escape_like() {
         assert_eq!(escape_like(r"C:\Users"), r"C:\\Users");
         assert_eq!(escape_like("100%_done"), r"100\%\_done");
+    }
+
+    // ─── global_index schema 收拢（9 列 → `GLOBAL_INDEX_COLUMNS`） ─────────────
+
+    /// 唯一的临时库路径（测试结束用 `remove_db_files` 清掉整个临时目录）。
+    fn temp_db_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "flashdir-idx-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("cache_v2.db")
+    }
+
+    fn remove_db_files(db: &std::path::Path) {
+        if let Some(dir) = db.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    /// 在缓存实例的**索引连接**上跑一段只读查询（测试用）。
+    fn with_index_conn<R>(cache: &DiskCache, f: impl FnOnce(&Connection) -> R) -> R {
+        let g = cache.index_conn.lock();
+        f(g.as_ref().expect("索引连接可用"))
+    }
+
+    /// `sqlite_master` 里某对象的建表 SQL（对象不存在时为空串）。
+    fn master_sql(conn: &Connection, name: &str) -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE name = ?1",
+            params![name],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .unwrap()
+        .flatten()
+        .unwrap_or_default()
+    }
+
+    /// `sqlite_master` 里某名字的对象个数（查残留表/索引用）。
+    fn master_count(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// `global_index` 的 rootpage（老 schema 的 b-tree 根页）。
+    fn table_rootpage(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// 当前 `global_index` 的列（走缓存实例的**索引连接**）。
+    fn cache_columns(cache: &DiskCache) -> Vec<String> {
+        let g = cache.index_conn.lock();
+        global_index_columns(g.as_ref().expect("索引连接可用")).unwrap()
+    }
+
+    /// 是否已落 `schema_v2` 标记。
+    fn schema_marked(cache: &DiskCache) -> bool {
+        let g = cache.index_conn.lock();
+        g.as_ref()
+            .expect("索引连接可用")
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = ?1",
+                params![GLOBAL_INDEX_SCHEMA_KEY],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+            .is_some()
+    }
+
+    /// `global_index` 的 rootpage（老 schema 的 b-tree 根页）。
+    fn cache_rootpage(cache: &DiskCache) -> i64 {
+        let g = cache.index_conn.lock();
+        g.as_ref()
+            .expect("索引连接可用")
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE name = 'global_index'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+    }
+
+    /// 建老 schema（9 列）的 `global_index` 并插 3 行；`name/name_lower/ext/drive/created_at`
+    /// 都填**真实值**，用来证明这些列确实被丢弃而不是"本来就是空串"。
+    fn create_legacy_global_index(conn: &Connection) {
+        conn.execute(
+            "CREATE TABLE global_index (
+                path TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                name_lower TEXT NOT NULL,
+                ext TEXT NOT NULL DEFAULT '',
+                size INTEGER NOT NULL,
+                is_dir INTEGER NOT NULL,
+                drive TEXT NOT NULL,
+                mtime INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        let rows = [
+            ("C:/dir/a.TXT", "a.TXT", "a.txt", "txt", 100i64, 0i64, "C", 111i64),
+            ("C:/dir/sub", "sub", "sub", "", 0i64, 1i64, "C", 222i64),
+            ("D:/目录/文件.log", "文件.log", "文件.log", "log", 7i64, 0i64, "D", 333i64),
+        ];
+        for (path, name, name_lower, ext, size, is_dir, drive, mtime) in rows {
+            conn.execute(
+                "INSERT INTO global_index
+                 (path, name, name_lower, ext, size, is_dir, drive, mtime, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 4000)",
+                params![path, name, name_lower, ext, size, is_dir, drive, mtime],
+            )
+            .unwrap();
+        }
+    }
+
+    /// **改造核心 1**：老库（9 列）上 `DiskCache::open()` 不做任何迁移、不碰表。
+    ///
+    /// 断言口径刻意**不依赖计时**：42s 那种量级要靠 310 万行才复现，单测造不出来。
+    /// 这里证明的是"表根本被动过没有"：
+    /// - 列集合仍是 9 列（不是收拢后的 4 列）；
+    /// - `sqlite_master` 里 `global_index` 的建表 SQL 与打开前**逐字节相同**；
+    /// - b-tree 根页不变（重建表必然换根页）；
+    /// - 老列的数据原样还在（`name`/`drive` 等派生列未被清空）；
+    /// - 没落 `schema_v2` 标记、没有 `global_index_v2` 残留。
+    ///
+    /// 最后再附一个宽松的耗时上限，作为"启动路径上没有秒级任务"的烟测
+    /// （真实量级见 `bench_legacy_startup_and_rebuild_real_db_copy`）。
+    #[test]
+    fn legacy_db_open_keeps_legacy_schema_untouched() {
+        let db = temp_db_path("open-nomigrate");
+        let (sql_before, rootpage_before);
+        {
+            let conn = Connection::open(&db).unwrap();
+            create_legacy_global_index(&conn);
+            sql_before = master_sql(&conn, "global_index");
+            rootpage_before = table_rootpage(&conn, "global_index");
+            assert_eq!(global_index_columns(&conn).unwrap().len(), 9, "前置条件：老库 9 列");
+        }
+
+        let t = std::time::Instant::now();
+        let cache = DiskCache::open(db.clone()).expect("打开老库必须成功（且不迁移）");
+        let open_cost = t.elapsed();
+
+        let cols = cache_columns(&cache);
+        assert_eq!(cols.len(), 9, "open() 不得改变 schema: {cols:?}");
+        assert!(!is_new_global_index_schema(&cols), "老库不得在启动路径被收拢");
+        assert_eq!(
+            with_index_conn(&cache, |c| master_sql(c, "global_index")),
+            sql_before,
+            "建表 SQL 必须与打开前逐字节一致（表没被重建）"
+        );
+        assert_eq!(
+            cache_rootpage(&cache),
+            rootpage_before,
+            "重建表必然换 b-tree 根页；根页不变才说明没重建"
+        );
+        assert!(!schema_marked(&cache), "启动路径不得落 schema_v2 标记");
+        assert_eq!(
+            with_index_conn(&cache, |c| master_count(c, "global_index_v2")),
+            0,
+            "不得留下半迁移的新表"
+        );
+        // 老列里的真实值仍在（不是被清成空串）
+        let (name, drive): (String, String) = with_index_conn(&cache, |c| {
+            c.query_row(
+                "SELECT name, drive FROM global_index WHERE path = 'C:/dir/a.TXT'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        });
+        assert_eq!((name.as_str(), drive.as_str()), ("a.TXT", "C"));
+        // 读取路径照旧可用
+        assert_eq!(cache.load_global_index().unwrap().len(), 3);
+
+        assert!(
+            open_cost < std::time::Duration::from_secs(5),
+            "启动路径不该有秒级任务（老实现会在这里重建 34s + VACUUM 8s）: {open_cost:?}"
+        );
+
+        drop(cache);
+        remove_db_files(&db);
+    }
+
+    /// **改造核心 2**：老库（9 列）上 `upsert_global_index_entries` / `repair_corrupt_paths`
+    /// 必须照老列写齐（NOT NULL 一列都不能漏），写入结果能被正常读回。
+    #[test]
+    fn legacy_schema_writes_fill_old_columns() {
+        let db = temp_db_path("legacy-write");
+        {
+            let conn = Connection::open(&db).unwrap();
+            create_legacy_global_index(&conn);
+            // 脏行：早期版本拼接路径留下的 `C:\root/C:/dir/bad.log`
+            conn.execute(
+                "INSERT INTO global_index
+                 (path, name, name_lower, ext, size, is_dir, drive, mtime, created_at)
+                 VALUES ('C:\\root/C:/dir/bad.log', 'bad.log', 'bad.log', 'log', 7, 0, 'C', 123, 4000)",
+                [],
+            )
+            .unwrap();
+        }
+        let cache = DiskCache::open(db.clone()).expect("打开老库");
+
+        // ── upsert：一条新 path + 一条已存在 path 的覆盖 ──
+        cache
+            .upsert_global_index_entries(&[
+                IndexEntry::new("C:/dir/new.txt".into(), "new.txt".into(), 42, false, 777),
+                IndexEntry::new("C:/dir/a.TXT".into(), "a.txt".into(), 999, false, 555),
+            ])
+            .expect("老 schema 下 upsert 必须成功");
+
+        assert_eq!(cache_columns(&cache).len(), 9, "老库 upsert 不得顺手改 schema");
+        let (name, name_lower, ext, drive, created_at, size, mtime, is_dir): (
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = with_index_conn(&cache, |c| {
+            c.query_row(
+                "SELECT name, name_lower, ext, drive, created_at, size, mtime, is_dir
+                 FROM global_index WHERE path = 'C:/dir/new.txt'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .unwrap()
+        });
+        assert_eq!(name, "", "老实现里 name 恒写空串");
+        assert_eq!(name_lower, "new.txt", "name_lower 必须写入（NOT NULL）");
+        assert_eq!(ext, "", "老实现里 ext 恒写空串");
+        assert_eq!(drive, "C", "drive 必须由盘符派生（NOT NULL）");
+        assert!(created_at > 0, "created_at 必须是当前时间戳: {created_at}");
+        assert_eq!((size, mtime, is_dir), (42, 777, 0));
+
+        // 覆盖语义不变：path 是主键，不新增行
+        let after = cache.load_global_index().unwrap();
+        assert_eq!(after.len(), 5, "老库 4 行（3 正常 + 1 脏行）+ 1 条新增");
+        let replaced = after.iter().find(|e| e.path == "C:/dir/a.TXT").unwrap();
+        assert_eq!((replaced.size, replaced.mtime), (999, 555));
+
+        // ── repair_corrupt_paths：脏行 → 真实路径，新行同样补齐老列 ──
+        let (merged, written) = cache
+            .repair_corrupt_paths()
+            .expect("老 schema 下 repair 必须成功");
+        assert_eq!((merged, written), (0, 1), "脏行应被改写成 C:/dir/bad.log");
+        let (path, name, name_lower, ext, drive): (String, String, String, String, String) =
+            with_index_conn(&cache, |c| {
+                c.query_row(
+                    "SELECT path, name, name_lower, ext, drive FROM global_index
+                     WHERE path = 'C:/dir/bad.log'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap()
+            });
+        assert_eq!(path, "C:/dir/bad.log");
+        assert_eq!(name, "", "老实现里 repair 写入的 name 也是空串");
+        assert_eq!(name_lower, "bad.log", "repair 写入的 name_lower 是修正后路径的末段小写");
+        assert_eq!(ext, "log");
+        assert_eq!(drive, "C");
+        assert_eq!(
+            with_index_conn(&cache, |c| c
+                .query_row(
+                    "SELECT COUNT(*) FROM global_index WHERE path LIKE '%/%:/%'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap()),
+            0,
+            "脏行必须已被删除"
+        );
+        let repaired = cache.load_global_index().unwrap();
+        assert_eq!(repaired.len(), 5, "repair 不得改变行数（改路径 + 删脏行）");
+        assert!(repaired.iter().any(|e| e.path == "C:/dir/bad.log"));
+
+        drop(cache);
+        remove_db_files(&db);
+    }
+
+    /// **改造核心 3**：老库上走一次 `save_global_index_stream`（= 用户主动重建索引那条重路径）
+    /// 就地把 schema 收拢成 4 列，写入的条目能被 `load_global_index` 原样读回，
+    /// 且随后的 upsert 自动切到新列。
+    #[test]
+    fn legacy_db_stream_save_trims_schema_and_roundtrips() {
+        let db = temp_db_path("legacy-save");
+        {
+            let conn = Connection::open(&db).unwrap();
+            create_legacy_global_index(&conn);
+            // 老库上的索引，必须随 DROP TABLE 一起消失
+            conn.execute(
+                "CREATE INDEX idx_global_index_name_lower ON global_index(name_lower)",
+                [],
+            )
+            .unwrap();
+        }
+        let cache = DiskCache::open(db.clone()).expect("打开老库");
+        assert_eq!(cache_columns(&cache).len(), 9, "前置条件：打开后仍是 9 列");
+
+        // 300 条，分块发送（模拟生产的 5000/块）
+        let entries: Vec<IndexEntry> = (0..300)
+            .map(|i| {
+                IndexEntry::new(
+                    format!("C:/bulk/dir{}/file{i}.dat", i % 13),
+                    format!("file{i}.dat"),
+                    i as i64 * 3,
+                    i % 7 == 0,
+                    1_700_000_000 + i as i64,
+                )
+            })
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for chunk in entries.chunks(64) {
+            tx.send(chunk.to_vec()).unwrap();
+        }
+        drop(tx);
+        cache
+            .save_global_index_stream(rx)
+            .expect("老库上流式重建必须成功");
+
+        let cols = cache_columns(&cache);
+        assert!(is_new_global_index_schema(&cols), "重建后必须收拢为 4 列: {cols:?}");
+        assert_eq!(cols.len(), 4);
+        assert!(schema_marked(&cache), "收拢后必须落 schema_v2 标记");
+        with_index_conn(&cache, |c| {
+            for old in ["name", "name_lower", "ext", "drive", "created_at"] {
+                let err = c
+                    .prepare(&format!("SELECT {old} FROM global_index"))
+                    .expect_err(&format!("{old} 列必须已消失"));
+                assert!(
+                    err.to_string().contains("no such column"),
+                    "{old} 应报 no such column: {err}"
+                );
+            }
+            assert_eq!(master_count(c, "idx_global_index_name_lower"), 0, "老索引随表一起 DROP");
+            assert_eq!(master_count(c, "global_index_v2"), 0, "不得留下中间表");
+        });
+
+        let loaded = cache.load_global_index().expect("载入");
+        assert_eq!(loaded.len(), entries.len(), "老库 3 行被全量替换，而不是叠加");
+        for (got, want) in loaded.iter().zip(entries.iter()) {
+            assert_eq!(got.path, want.path);
+            assert_eq!(got.name_lower, want.name_lower, "name_lower 由 path 派生后必须一致");
+            assert_eq!(got.size, want.size);
+            assert_eq!(got.is_dir, want.is_dir);
+            assert_eq!(got.mtime, want.mtime);
+        }
+
+        // 收拢后同一实例的写入必须自动切到 4 列（实例内探测缓存已刷新）
+        cache
+            .upsert_global_index_entries(&[IndexEntry::new(
+                "C:/bulk/new.bin".into(),
+                "new.bin".into(),
+                5,
+                false,
+                9,
+            )])
+            .expect("新 schema 下 upsert");
+        assert_eq!(cache.load_global_index().unwrap().len(), 301);
+
+        // 模拟重启：仍是 4 列、条目数一致
+        drop(cache);
+        let cache2 = DiskCache::open(db.clone()).expect("重启后打开");
+        assert!(is_new_global_index_schema(&cache_columns(&cache2)));
+        assert_eq!(cache2.load_global_index().unwrap().len(), 301);
+        drop(cache2);
+        remove_db_files(&db);
+    }
+
+    /// 老库上重建中途失败必须**连 `DROP TABLE` 一起回滚**：老表 9 列与全部数据原样，
+    /// 不会出现"表被删了但数据没写进去"。
+    ///
+    /// 失败点用 `index_meta` 上的触发器精确地推到**最坏位置**：`DROP` 已生效、新表已建、
+    /// 300 行已全部灌完、只差最后落标记 + 提交。`index_meta` 不是被 DROP 的表，
+    /// 所以触发器能活到那一刻（用 `global_index` 自己的 CHECK 做不到：约束会随 DROP 一起消失，
+    /// 那样插入反而会成功）。
+    #[test]
+    fn legacy_stream_save_failure_rolls_back_drop() {
+        let db = temp_db_path("legacy-save-rollback");
+        {
+            let conn = Connection::open(&db).unwrap();
+            create_legacy_global_index(&conn);
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS index_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "CREATE TRIGGER block_schema_mark BEFORE INSERT ON index_meta
+                 BEGIN SELECT RAISE(ABORT, 'blocked by test'); END",
+                [],
+            )
+            .unwrap();
+        }
+        let cache = DiskCache::open(db.clone()).expect("打开老库");
+
+        let entries: Vec<IndexEntry> = (0..300)
+            .map(|i| {
+                IndexEntry::new(
+                    format!("C:/x/f{i}.bin"),
+                    format!("f{i}.bin"),
+                    i as i64,
+                    false,
+                    i as i64,
+                )
+            })
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(entries).unwrap();
+        drop(tx);
+        let err = cache
+            .save_global_index_stream(rx)
+            .expect_err("触发器必须让提交前的最后一步失败");
+        eprintln!("[test] 预期的重建失败: {err:#}");
+
+        // 完整回滚：老表 9 列、老行数与内容不变、没有残留新表
+        let cols = cache_columns(&cache);
+        assert_eq!(cols.len(), 9, "失败后必须还是老 schema: {cols:?}");
+        with_index_conn(&cache, |c| {
+            assert_eq!(master_count(c, "global_index_v2"), 0, "不得留下半成品新表");
+            let n: i64 = c
+                .query_row("SELECT COUNT(*) FROM global_index", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 3, "DROP 必须被回滚：失败后行数不得变化");
+            let name: String = c
+                .query_row(
+                    "SELECT name FROM global_index WHERE path = 'C:/dir/a.TXT'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(name, "a.TXT", "老列数据必须完好");
+        });
+
+        // 拆掉触发器后重跑必须成功：失败不得留下不可恢复的状态
+        with_index_conn(&cache, |c| {
+            c.execute("DROP TRIGGER block_schema_mark", []).unwrap()
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![IndexEntry::new(
+            "C:/only.bin".into(),
+            "only.bin".into(),
+            1,
+            false,
+            2,
+        )])
+        .unwrap();
+        drop(tx);
+        cache
+            .save_global_index_stream(rx)
+            .expect("拆掉触发器后必须能重建成功");
+        assert!(is_new_global_index_schema(&cache_columns(&cache)));
+        assert_eq!(cache.load_global_index().unwrap().len(), 1);
+
+        drop(cache);
+        remove_db_files(&db);
+    }
+
+    /// 新库 save → load 往返：条目字段与顺序一致，且表就是收拢后的 4 列。
+    #[test]
+    fn global_index_new_schema_roundtrip() {
+        let db = temp_db_path("roundtrip");
+        let cache = DiskCache::open(db.clone()).expect("打开空库");
+
+        let entries = vec![
+            IndexEntry::new("C:/dir/a.TXT".into(), "a.txt".into(), 100, false, 111),
+            IndexEntry::new("C:/dir/sub".into(), "sub".into(), 0, true, 0),
+            IndexEntry::new("D:/目录/文件.log".into(), "文件.log".into(), 7, false, 333),
+        ];
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(entries.clone()).unwrap();
+        drop(tx);
+        cache.save_global_index_stream(rx).expect("流式写入");
+
+        assert!(is_new_global_index_schema(&cache_columns(&cache)), "空库必须直接是新 schema");
+        assert!(schema_marked(&cache), "空库也要落 schema_v2 标记");
+
+        let loaded = cache.load_global_index().expect("载入");
+        assert_eq!(loaded.len(), entries.len());
+        for (got, want) in loaded.iter().zip(entries.iter()) {
+            assert_eq!(got.path, want.path);
+            assert_eq!(got.name_lower, want.name_lower, "name_lower 由 path 派生后必须一致");
+            assert_eq!(got.size, want.size);
+            assert_eq!(got.is_dir, want.is_dir);
+            assert_eq!(got.mtime, want.mtime);
+            assert_eq!(got.path_ascii, want.path_ascii);
+        }
+        // 顺序语义不变：无 ORDER BY 的全表扫描按 rowid（= 写入顺序，`INSERT OR REPLACE` 保序）
+        let paths: Vec<&str> = loaded.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, ["C:/dir/a.TXT", "C:/dir/sub", "D:/目录/文件.log"]);
+
+        // upsert 路径同样只写 4 列，且覆盖语义不变
+        cache
+            .upsert_global_index_entries(&[IndexEntry::new(
+                "C:/dir/a.TXT".into(),
+                "a.txt".into(),
+                555,
+                false,
+                999,
+            )])
+            .expect("upsert");
+        let after = cache.load_global_index().unwrap();
+        assert_eq!(after.len(), 3, "upsert 已存在的 path 不得新增行");
+        // 注意：`INSERT OR REPLACE` 是 DELETE+INSERT，被覆盖的行会换到新的 rowid（= 扫到末尾）。
+        // 这是**既有**语义（迁移前也是同一条 SQL），所以这里按 path 定位而不是按位置。
+        let replaced = after
+            .iter()
+            .find(|e| e.path == "C:/dir/a.TXT")
+            .expect("覆盖后的条目必须还在");
+        assert_eq!(replaced.size, 555);
+        assert_eq!(replaced.mtime, 999);
+        assert!(!replaced.is_dir);
+
+        // 新 schema 下再走一次全量重建：语义是**整表替换**（老行必须消失）
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(vec![IndexEntry::new(
+            "C:/dir/a.TXT".into(),
+            "a.txt".into(),
+            1,
+            false,
+            2,
+        )])
+        .unwrap();
+        drop(tx);
+        cache.save_global_index_stream(rx).expect("第二次流式写入");
+        assert!(is_new_global_index_schema(&cache_columns(&cache)), "重建不得换掉 schema");
+        let only = cache.load_global_index().unwrap();
+        assert_eq!(only.len(), 1, "全量重建必须替换整表: {:?}", only.len());
+        assert_eq!(only[0].path, "C:/dir/a.TXT");
+        assert_eq!((only[0].size, only[0].mtime), (1, 2));
+
+        drop(cache);
+        remove_db_files(&db);
+    }
+
+    /// 老 schema 副本上的迁移（**内部工具** `migrate_global_index_schema`，已不在启动路径上）：
+    /// 列收拢、载入结果不变、可重复执行（第二次 no-op）。
+    ///
+    /// 注意：`DiskCache::open` 现在**不会**迁移（见 `legacy_db_open_keeps_legacy_schema_untouched`），
+    /// 所以这里显式地在索引连接上调用迁移函数本身。
+    #[test]
+    fn legacy_global_index_schema_migrates_once() {
+        let db = temp_db_path("legacy");
+        {
+            let conn = Connection::open(&db).unwrap();
+            create_legacy_global_index(&conn);
+            assert_eq!(global_index_columns(&conn).unwrap().len(), 9, "前置条件：老库是 9 列");
+        }
+
+        let cache = DiskCache::open(db.clone()).expect("打开老库（启动路径不迁移）");
+        assert_eq!(cache_columns(&cache).len(), 9, "前置条件：open() 后仍是 9 列");
+
+        // 显式调用内部迁移工具（这就是被移出启动路径的那段逻辑）
+        {
+            let mut g = cache.index_conn.lock();
+            let conn = g.as_mut().expect("索引连接可用");
+            migrate_global_index_schema(conn).expect("迁移必须成功");
+        }
+        let cols = cache_columns(&cache);
+        assert!(is_new_global_index_schema(&cols), "迁移后列集合必须收拢: {cols:?}");
+        assert_eq!(cols.len(), 4);
+        assert!(schema_marked(&cache), "迁移必须落 schema_v2 标记");
+
+        // 行数与内容正确，`load_global_index` 读出同样的条目
+        let loaded = cache.load_global_index().expect("载入");
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0].path, "C:/dir/a.TXT");
+        assert_eq!(loaded[0].name_lower, "a.txt");
+        assert_eq!(loaded[0].size, 100);
+        assert!(!loaded[0].is_dir);
+        assert_eq!(loaded[0].mtime, 111);
+        assert_eq!(loaded[1].path, "C:/dir/sub");
+        assert!(loaded[1].is_dir);
+        assert_eq!(loaded[2].path, "D:/目录/文件.log");
+        assert_eq!(loaded[2].name_lower, "文件.log");
+        assert_eq!(loaded[2].size, 7);
+
+        // 老列是真的被 DROP 了（不是留空）
+        {
+            let g = cache.index_conn.lock();
+            let conn = g.as_ref().unwrap();
+            for old in ["name", "name_lower", "ext", "drive", "created_at"] {
+                let err = conn
+                    .prepare(&format!("SELECT {old} FROM global_index"))
+                    .expect_err(&format!("{old} 列必须已被 DROP"));
+                assert!(
+                    err.to_string().contains("no such column"),
+                    "{old} 列应报 no such column: {err}"
+                );
+            }
+        }
+
+        // 幂等：第二次迁移必须是 no-op —— 用 b-tree 根页不变来证明"表没有被重建"
+        let root_before = cache_rootpage(&cache);
+        {
+            let mut g = cache.index_conn.lock();
+            let conn = g.as_mut().unwrap();
+            migrate_global_index_schema(conn).expect("第二次迁移必须成功（no-op）");
+        }
+        assert_eq!(
+            cache_rootpage(&cache),
+            root_before,
+            "第二次迁移必须是 no-op：global_index 的 b-tree 根页不得变化"
+        );
+        assert!(schema_marked(&cache));
+        assert_eq!(cache.load_global_index().unwrap().len(), 3, "重复迁移不得丢行");
+
+        // 模拟重启：再开一次库，仍是新 schema、条目一致
+        drop(cache);
+        let cache2 = DiskCache::open(db.clone()).expect("重启后打开");
+        assert!(is_new_global_index_schema(&cache_columns(&cache2)));
+        let reloaded = cache2.load_global_index().unwrap();
+        assert_eq!(reloaded.len(), 3);
+        assert_eq!(reloaded[2].path, "D:/目录/文件.log");
+        drop(cache2);
+        remove_db_files(&db);
+    }
+
+    /// 迁移中途失败必须**完整回滚**：库仍是老 schema、行数不变、不留半迁移残留。
+    ///
+    /// 用外键把失败点精确地推到"新表已建好、数据已拷完"之后（`DROP TABLE global_index`
+    /// 触发隐式 DELETE → 外键冲突），这是最坏位置的失败。
+    #[test]
+    fn failed_migration_rolls_back_completely() {
+        let db = temp_db_path("rollback");
+        {
+            let conn = Connection::open(&db).unwrap();
+            create_legacy_global_index(&conn);
+            conn.execute(
+                "CREATE TABLE ref_guard (
+                    id INTEGER PRIMARY KEY,
+                    p TEXT REFERENCES global_index(path)
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO ref_guard (id, p) VALUES (1, 'C:/dir/a.TXT')", [])
+                .unwrap();
+        }
+
+        let mut conn = Connection::open(&db).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let err = migrate_global_index_schema(&mut conn).expect_err("外键挡住 DROP，迁移必须失败");
+        eprintln!("[test] 预期的迁移失败: {err:#}");
+
+        // 老表原样：9 列、3 行、内容可读
+        assert_eq!(global_index_columns(&conn).unwrap().len(), 9, "失败后必须还是老 schema");
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM global_index", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 3, "失败后行数不得变化");
+        let name: String = conn
+            .query_row("SELECT name FROM global_index WHERE path = 'C:/dir/a.TXT'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "a.TXT", "失败后老列数据必须完好");
+
+        // 事务内建的新表必须随回滚消失，且不得落下"已完成"的标记
+        let leftover: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'global_index_v2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftover, 0, "半迁移残留表必须随事务回滚");
+        let marked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM index_meta WHERE key = ?1",
+                params![GLOBAL_INDEX_SCHEMA_KEY],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marked, 0, "迁移失败不得落 schema_v2 标记");
+        drop(conn);
+        remove_db_files(&db);
     }
 
     /// 建一张旧库结构的 scan_meta（没有 last_access 列）并插一行。
@@ -1695,11 +2753,20 @@ mod tests {
     }
 
     /// 变体载入：`derive_name=true` 时只读 4 列，name_lower 由路径末段派生。
-    fn load_variant(conn: &Connection, derive_name: bool, with_capacity: bool) -> Vec<IndexEntry> {
+    ///
+    /// schema 收拢后 `name_lower` 列已不存在，`has_name_lower=false` 时"读列"这一档
+    /// 自动退化成派生档 —— 老形态的 A/B 只能跑在仍是老 schema 的库上。
+    fn load_variant(
+        conn: &Connection,
+        derive_name: bool,
+        with_capacity: bool,
+        has_name_lower: bool,
+    ) -> Vec<IndexEntry> {
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM global_index", [], |r| r.get(0))
             .unwrap_or(0);
-        let sql = if derive_name {
+        let derive = derive_name || !has_name_lower;
+        let sql = if derive {
             "SELECT path, size, is_dir, mtime FROM global_index"
         } else {
             "SELECT path, name_lower, size, is_dir, mtime FROM global_index"
@@ -1713,7 +2780,7 @@ mod tests {
         let mut rows = stmt.query([]).unwrap();
         while let Some(row) = rows.next().unwrap() {
             let path: String = row.get(0).unwrap();
-            let (name_lower, size, is_dir, mtime) = if derive_name {
+            let (name_lower, size, is_dir, mtime) = if derive {
                 (
                     last_segment_lower(&path),
                     row.get::<_, i64>(1).unwrap(),
@@ -1746,6 +2813,15 @@ mod tests {
         let db = DiskCache::get_cache_path().expect("cache path");
         let cache = DiskCache::instance();
 
+        // 本库当前 schema：schema 收拢后 name_lower / name / ext / drive / created_at 已不存在，
+        // 依赖这些列的档位（A/C/E、p2/p4、一致性校验）自动退化或跳过。
+        let cols = {
+            let c = probe_conn(&db, 0, 2048);
+            global_index_columns(&c).unwrap_or_default()
+        };
+        let has_name_lower = cols.iter().any(|c| c == "name_lower");
+        eprintln!("[bench] global_index 列: {cols:?}");
+
         // 预热页缓存
         let _ = cache.load_global_index();
 
@@ -1770,7 +2846,7 @@ mod tests {
                     len
                 } else {
                     let conn = probe_conn(&db, mmap_mb, cache_kb);
-                    let v = load_variant(&conn, derive, cap);
+                    let v = load_variant(&conn, derive, cap, has_name_lower);
                     let len = v.len();
                     drop(v);
                     drop(conn);
@@ -1791,21 +2867,27 @@ mod tests {
         {
             let mut g = cache.index_conn.lock();
             if let Some(conn) = g.as_mut() {
-                for round in 0..2 {
-                    let t = Instant::now();
-                    let v = load_variant(conn, false, false);
-                    let old_s = t.elapsed().as_secs_f64();
-                    drop(v);
-                    let t = Instant::now();
-                    let v = load_variant(conn, true, false);
-                    let new_s = t.elapsed().as_secs_f64();
-                    drop(v);
+                if has_name_lower {
+                    for round in 0..2 {
+                        let t = Instant::now();
+                        let v = load_variant(conn, false, false, has_name_lower);
+                        let old_s = t.elapsed().as_secs_f64();
+                        drop(v);
+                        let t = Instant::now();
+                        let v = load_variant(conn, true, false, has_name_lower);
+                        let new_s = t.elapsed().as_secs_f64();
+                        drop(v);
+                        eprintln!(
+                            "[bench] 同一连接 A/B round{}: 旧(读 name_lower) {:.3}s vs 新(派生 name_lower) {:.3}s ({:+.1}%)",
+                            round,
+                            old_s,
+                            new_s,
+                            (new_s - old_s) * 100.0 / old_s
+                        );
+                    }
+                } else {
                     eprintln!(
-                        "[bench] 同一连接 A/B round{}: 旧(读 name_lower) {:.3}s vs 新(派生 name_lower) {:.3}s ({:+.1}%)",
-                        round,
-                        old_s,
-                        new_s,
-                        (new_s - old_s) * 100.0 / old_s
+                        "[bench] 本库已收拢为新 schema（无 name_lower 列），跳过'读列 vs 派生' A/B"
                     );
                 }
             }
@@ -1829,7 +2911,7 @@ mod tests {
             }
             eprintln!("[bench] p1 纯行遍历(不读列) {} 行: {:.3}s", c, t.elapsed().as_secs_f64());
         }
-        {
+        if has_name_lower {
             let t = Instant::now();
             let mut stmt = conn.prepare("SELECT path, name_lower FROM global_index").unwrap();
             let mut rows = stmt.query([]).unwrap();
@@ -1847,6 +2929,8 @@ mod tests {
                 bytes / 1024 / 1024,
                 t.elapsed().as_secs_f64()
             );
+        } else {
+            eprintln!("[bench] p2 跳过（无 name_lower 列）");
         }
         {
             let t = Instant::now();
@@ -1868,7 +2952,7 @@ mod tests {
             );
             drop(v);
         }
-        {
+        if has_name_lower {
             let t = Instant::now();
             let mut stmt = conn.prepare("SELECT path, name_lower FROM global_index").unwrap();
             let mut rows = stmt.query([]).unwrap();
@@ -1882,6 +2966,8 @@ mod tests {
                 t.elapsed().as_secs_f64()
             );
             drop(v);
+        } else {
+            eprintln!("[bench] p4 跳过（无 name_lower 列）");
         }
         {
             let t = Instant::now();
@@ -1891,51 +2977,64 @@ mod tests {
             eprintln!("[bench] p5 COUNT(*) {}: {:.3}s", c, t.elapsed().as_secs_f64());
         }
         {
+            // p6) 行 payload 估算：对**当前实际存在的所有列**求和（+24B 行头），
+            // 老/新 schema 同一口径，可直接对比表体积。列名来自 PRAGMA，不涉及外部输入。
+            let sum_expr: String = cols
+                .iter()
+                .map(|c| format!("length({c})"))
+                .collect::<Vec<_>>()
+                .join(" + ");
             let t = Instant::now();
             let bytes: i64 = conn
                 .query_row(
-                    "SELECT SUM(length(path) + length(name_lower) + length(name) + length(ext) + length(drive) + 24) FROM global_index",
+                    &format!("SELECT SUM({sum_expr} + 24) FROM global_index"),
                     [],
                     |r| r.get(0),
                 )
                 .unwrap_or(0);
             eprintln!(
-                "[bench] p6 行 payload 估算 {:.1} MB (含 name/ext/drive/created_at 等未读列): {:.3}s",
+                "[bench] p6 行 payload 估算 {:.1} MB（当前 {} 列 + 24B 行头）: {:.3}s",
                 bytes as f64 / 1024.0 / 1024.0,
+                cols.len(),
                 t.elapsed().as_secs_f64()
             );
         }
         drop(conn);
 
-        // 一致性：派生 name_lower 是否与库中存储值完全一致（不一致就不能派生）
+        // 一致性：派生 name_lower 是否与库中存储值完全一致（不一致就不能派生）。
+        // 新 schema 已无该列，派生本身就是唯一真值来源，跳过。
         let conn = probe_conn(&db, 0, 2048);
-        let t = Instant::now();
-        let mut mismatches = 0usize;
-        let mut sample: Vec<String> = Vec::new();
-        {
-            let mut stmt = conn
-                .prepare("SELECT path, name_lower FROM global_index")
-                .unwrap();
-            let mut rows = stmt.query([]).unwrap();
-            while let Some(row) = rows.next().unwrap() {
-                let path: String = row.get(0).unwrap();
-                let stored: String = row.get(1).unwrap();
-                let derived = last_segment_lower(&path);
-                if derived != stored {
-                    mismatches += 1;
-                    if sample.len() < 3 {
-                        sample.push(format!("{path} 库={stored:?} 派生={derived:?}"));
+        if has_name_lower {
+            let t = Instant::now();
+            let mut mismatches = 0usize;
+            let mut sample: Vec<String> = Vec::new();
+            {
+                let mut stmt = conn
+                    .prepare("SELECT path, name_lower FROM global_index")
+                    .unwrap();
+                let mut rows = stmt.query([]).unwrap();
+                while let Some(row) = rows.next().unwrap() {
+                    let path: String = row.get(0).unwrap();
+                    let stored: String = row.get(1).unwrap();
+                    let derived = last_segment_lower(&path);
+                    if derived != stored {
+                        mismatches += 1;
+                        if sample.len() < 3 {
+                            sample.push(format!("{path} 库={stored:?} 派生={derived:?}"));
+                        }
                     }
                 }
             }
+            eprintln!(
+                "[bench] name_lower 一致性: 不一致 {} / {} 条, 全量校验耗时 {:?} 例: {:?}",
+                mismatches,
+                n,
+                t.elapsed(),
+                sample
+            );
+        } else {
+            eprintln!("[bench] name_lower 一致性校验跳过（新 schema 已无该列）");
         }
-        eprintln!(
-            "[bench] name_lower 一致性: 不一致 {} / {} 条, 全量校验耗时 {:?} 例: {:?}",
-            mismatches,
-            n,
-            t.elapsed(),
-            sample
-        );
 
         // 流式接口（供 owner 接线）与整份载入的一致性 + 耗时/峰值差异
         let t = Instant::now();
@@ -1966,6 +3065,305 @@ mod tests {
                 f.path,
                 l.path
             );
+        }
+    }
+
+    /// 与（迁移前的）`load_global_index` **完全同构**的探测载入：只读 4 列、不 COUNT(*)、
+    /// 不预分配。前后两次测量用的是同一段代码，差别只有表里的列数/页数。
+    fn probe_load_exact(conn: &Connection) -> Vec<IndexEntry> {
+        let mut stmt = conn
+            .prepare("SELECT path, size, is_dir, mtime FROM global_index")
+            .unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut out: Vec<IndexEntry> = Vec::new();
+        while let Some(row) = rows.next().unwrap() {
+            let path: String = row.get(0).unwrap();
+            let name_lower = last_segment_lower(&path);
+            out.push(IndexEntry::new(
+                path,
+                name_lower,
+                row.get(1).unwrap(),
+                row.get::<_, i64>(2).unwrap() != 0,
+                row.get(3).unwrap(),
+            ));
+        }
+        out
+    }
+
+    fn copy_bench_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM global_index", [], |r| r.get(0))
+            .unwrap_or(0)
+    }
+
+    fn copy_bench_size(db: &std::path::Path) -> u64 {
+        std::fs::metadata(db).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// 用同一个同构探测连跑 `rounds` 轮（第 1 轮预热页缓存，不计入），返回各轮耗时（秒）。
+    ///
+    /// 单次测量抖动可达 ±40%（见 `bench_load_global_index` 的注释），所以报告里用
+    /// **各轮最小值**作为稳定估计。
+    fn bench_load_rounds(db: &std::path::Path, rounds: usize) -> Vec<f64> {
+        use std::time::Instant;
+        let conn = probe_conn(db, 0, 2048);
+        let _ = probe_load_exact(&conn); // 预热
+        let mut out = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let t = Instant::now();
+            let v = probe_load_exact(&conn);
+            let s = t.elapsed().as_secs_f64();
+            drop(v);
+            out.push(s);
+        }
+        out
+    }
+
+    fn min_secs(secs: &[f64]) -> f64 {
+        secs.iter().cloned().fold(f64::INFINITY, f64::min)
+    }
+
+    fn report_rounds(label: &str, secs: &[f64]) {
+        let ms: Vec<u64> = secs.iter().map(|s| (s * 1000.0).round() as u64).collect();
+        eprintln!("[bench] {label}: min {:.3}s | 各轮 {:?} ms", min_secs(secs), ms);
+    }
+
+    /// `global_index` 表自身占的字节数（best-effort：编译时没带 `dbstat` 就返回 None）。
+    fn bench_table_bytes(conn: &Connection, table: &str) -> Option<i64> {
+        conn.query_row(
+            "SELECT SUM(pgsize) FROM dbstat WHERE name = ?1",
+            params![table],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// 真实库**副本**上的 A/B：① 启动路径冻结（改造前 42s → 改造后？）；② 用户主动重建索引
+    /// 这条路径把 schema 收拢成 4 列之后的库大小/列数/载入耗时。
+    ///
+    /// 改造前：`DiskCache::instance()`（main.rs 在**建窗之前**就调用它）会在
+    /// `open_index_conn` → `migrate_global_index_schema` 里同步跑"重建 + VACUUM"；
+    /// 改造后启动只建表，收拢改由 `save_global_index_stream` 承担。
+    ///
+    /// **只碰副本**，且第二份副本由本基准自己从第一份复制出来（绝不打开真实库的写路径）：
+    /// ```text
+    /// copy "$env:USERPROFILE\.flashdir\cache_v2.db*" D:\tmp\fd_ab\
+    /// $env:FLASHDIR_CACHE_DB = 'D:\tmp\fd_ab\cache_v2.db'
+    /// cargo test --release --lib -- --ignored --nocapture bench_legacy_startup_and_rebuild_real_db_copy
+    /// ```
+    #[test]
+    #[ignore = "benchmark: 需要 FLASHDIR_CACHE_DB 指向真实库的副本"]
+    fn bench_legacy_startup_and_rebuild_real_db_copy() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let Some(db) = std::env::var_os(CACHE_DB_ENV).map(PathBuf::from) else {
+            eprintln!("[bench] 未设置 {CACHE_DB_ENV}，跳过（拒绝在真实库上跑）");
+            return;
+        };
+        assert!(db.exists(), "{CACHE_DB_ENV} 指向的文件不存在: {}", db.display());
+
+        let checkpoint = |p: &std::path::Path| {
+            if let Ok(conn) = Connection::open(p) {
+                let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+            }
+        };
+        checkpoint(&db);
+
+        // 第二份副本：用来复现"被移出启动路径的那段工作"（跑完就是 4 列，不能再当老库用）
+        let baseline_db = db.with_file_name(format!(
+            "{}-legacy-baseline.db",
+            db.file_stem().and_then(|s| s.to_str()).unwrap_or("copy")
+        ));
+        for suffix in ["", "-wal", "-shm"] {
+            let from = PathBuf::from(format!("{}{}", db.display(), suffix));
+            if from.exists() {
+                std::fs::copy(&from, PathBuf::from(format!("{}{}", baseline_db.display(), suffix)))
+                    .expect("复制副本");
+            }
+        }
+        checkpoint(&baseline_db);
+        eprintln!(
+            "[bench] 副本: 主 {} | 基线 {}",
+            db.display(),
+            baseline_db.display()
+        );
+
+        let cols_before = global_index_columns(&Connection::open(&db).unwrap()).unwrap();
+        let rows_before = copy_bench_rows(&Connection::open(&db).unwrap());
+        let size_before = copy_bench_size(&db);
+        eprintln!(
+            "[bench] 改造前: 列 {} 个 {:?} | 行 {} | 文件 {:.1} MB",
+            cols_before.len(),
+            cols_before,
+            rows_before,
+            size_before as f64 / 1048576.0
+        );
+        if is_new_global_index_schema(&cols_before) {
+            eprintln!("[bench] 警告：副本已是新 schema，收益对比无意义（请用未收拢的副本）");
+        }
+        if let Some(b) = bench_table_bytes(&Connection::open(&db).unwrap(), "global_index") {
+            eprintln!("[bench] 改造前 global_index 表 {:.1} MB", b as f64 / 1048576.0);
+        }
+
+        const ROUNDS: usize = 4;
+        let before = bench_load_rounds(&db, ROUNDS);
+        report_rounds("改造前 载入(同构 4 列)", &before);
+
+        // ── ①-a 复现"改造前"的启动路径工作：open_index_conn 里的那次迁移（含事务外 VACUUM）──
+        let t = Instant::now();
+        {
+            let mut conn = Connection::open(&baseline_db).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let _ = conn.pragma_update(None, "journal_size_limit", 64 * 1024 * 1024i64);
+            migrate_global_index_schema(&mut conn).expect("基线副本上的迁移");
+        }
+        let old_startup_work = t.elapsed();
+        let base_size = copy_bench_size(&baseline_db);
+        let base_load = bench_load_rounds(&baseline_db, ROUNDS);
+        eprintln!(
+            "[bench] ①-a 改造前启动路径（含迁移 + VACUUM）: {:.1}s | 迁移后文件 {:.1} MB | 列 {}",
+            old_startup_work.as_secs_f64(),
+            base_size as f64 / 1048576.0,
+            global_index_columns(&Connection::open(&baseline_db).unwrap())
+                .unwrap()
+                .len()
+        );
+        report_rounds("①-a 迁移后 载入(同构 4 列)", &base_load);
+
+        // ── ①-b 改造后的启动路径：open_index_conn 只建表，DiskCache::open 全流程 ──
+        let t_index = Instant::now();
+        {
+            let _ic = DiskCache::open_index_conn(&db).expect("索引连接");
+        }
+        let index_conn_cost = t_index.elapsed();
+        let t_open = Instant::now();
+        let cache = Arc::new(DiskCache::open(db.clone()).expect("打开副本"));
+        let open_cost = t_open.elapsed();
+        let cols_after_open = global_index_columns(&Connection::open(&db).unwrap()).unwrap();
+        assert_eq!(
+            cols_after_open.len(),
+            9,
+            "改造后的启动路径不得改变 schema: {cols_after_open:?}"
+        );
+        eprintln!(
+            "[bench] ①-b 改造后 open_index_conn: {:?} | DiskCache::open 全程: {:?} | 列 {}（未被触碰）",
+            index_conn_cost,
+            open_cost,
+            cols_after_open.len()
+        );
+        eprintln!(
+            "[bench] ① 启动路径冻结: {:.1}s → {:.1}ms（{:.0}×，其中索引连接 {:?}）",
+            old_startup_work.as_secs_f64(),
+            open_cost.as_secs_f64() * 1000.0,
+            old_startup_work.as_secs_f64() / open_cost.as_secs_f64().max(1e-6),
+            index_conn_cost
+        );
+
+        // ── ② 用户主动重建索引：save_global_index_stream 顺带把 schema 收拢到 4 列 ──
+        // 生产里这条路径的条目本来就在内存里（`finish_building` 持有整份索引），这里同样先载入。
+        let t = Instant::now();
+        let entries = cache.load_global_index().expect("载入全部条目");
+        let load_before_rebuild = t.elapsed();
+        assert_eq!(entries.len() as i64, rows_before, "载入条数必须与库一致");
+        eprintln!(
+            "[bench] 重建前 生产 load_global_index: {:?}（{} 条，老 schema）",
+            load_before_rebuild,
+            entries.len()
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<IndexEntry>>();
+        let saver = {
+            let c = Arc::clone(&cache);
+            std::thread::spawn(move || c.save_global_index_stream(rx))
+        };
+        let t = Instant::now();
+        for chunk in entries.chunks(5000) {
+            tx.send(chunk.to_vec()).expect("发送分块");
+        }
+        drop(tx);
+        saver.join().unwrap().expect("save_global_index_stream 必须成功");
+        // 计时覆盖：逐块发送 + 写入事务 + 提交 + 事务外 VACUUM（join 之后才停表）
+        let rebuild_cost = t.elapsed();
+        drop(entries); // 释放 ~500MB+，后面的载入计时才不受内存压力干扰
+
+        let cols_after = global_index_columns(&Connection::open(&db).unwrap()).unwrap();
+        let rows_after = copy_bench_rows(&Connection::open(&db).unwrap());
+        let size_after = copy_bench_size(&db);
+        assert_eq!(rows_after, rows_before, "重建不得改变行数");
+        assert!(is_new_global_index_schema(&cols_after), "重建后必须是 4 列: {cols_after:?}");
+        eprintln!(
+            "[bench] ② 重建（save_global_index_stream，含收拢 + VACUUM）: {:.1}s",
+            rebuild_cost.as_secs_f64()
+        );
+        eprintln!(
+            "[bench] ② 重建后: 列 {} 个 {:?} | 行 {} | 文件 {:.1} MB（{:.1} MB → {:.1} MB, {:+.1}%）",
+            cols_after.len(),
+            cols_after,
+            rows_after,
+            size_after as f64 / 1048576.0,
+            size_before as f64 / 1048576.0,
+            size_after as f64 / 1048576.0,
+            (size_after as f64 - size_before as f64) * 100.0 / size_before as f64
+        );
+        eprintln!(
+            "[bench] ② 基线对照（旧迁移路径，①-a）: 文件 {:.1} MB（{:.1} MB → {:.1} MB, {:+.1}%）",
+            base_size as f64 / 1048576.0,
+            size_before as f64 / 1048576.0,
+            base_size as f64 / 1048576.0,
+            (base_size as f64 - size_before as f64) * 100.0 / size_before as f64
+        );
+        if let Some(b) = bench_table_bytes(&Connection::open(&db).unwrap(), "global_index") {
+            eprintln!("[bench] ② 重建后 global_index 表 {:.1} MB", b as f64 / 1048576.0);
+        }
+
+        // ── ③ 重建后的载入（同构 + 生产）──
+        let after = bench_load_rounds(&db, ROUNDS);
+        report_rounds("③ 重建后 载入(同构 4 列)", &after);
+        let mut prod = Vec::with_capacity(ROUNDS);
+        for _ in 0..ROUNDS {
+            let t = Instant::now();
+            let v = cache.load_global_index().expect("生产载入");
+            let s = t.elapsed().as_secs_f64();
+            drop(v);
+            prod.push(s);
+        }
+        report_rounds("③ 重建后 load_global_index(生产)", &prod);
+        eprintln!(
+            "[bench] ③ 载入提速: 同构 {:.3}s → {:.3}s ({:+.1}%)",
+            min_secs(&before),
+            min_secs(&after),
+            (min_secs(&after) - min_secs(&before)) * 100.0 / min_secs(&before)
+        );
+
+        // 收拢后写入必须自动切到 4 列
+        cache
+            .upsert_global_index_entries(&[IndexEntry::new(
+                "C:/__bench__/probe.bin".into(),
+                "probe.bin".into(),
+                1,
+                false,
+                1,
+            )])
+            .expect("新 schema 下 upsert");
+        assert_eq!(copy_bench_rows(&Connection::open(&db).unwrap()), rows_after + 1);
+        cache
+            .remove_global_index_by_paths(&["C:/__bench__/probe.bin".to_string()])
+            .expect("删除探针行");
+
+        drop(cache);
+
+        // ── ④ 复核：重建里那次 VACUUM 是否已经把空间还干净 ──
+        let size_pre_vacuum2 = copy_bench_size(&db);
+        let t = Instant::now();
+        match Connection::open(&db).and_then(|c| c.execute_batch("VACUUM")) {
+            Ok(()) => eprintln!(
+                "[bench] ④ 二次 VACUUM 耗时 {:.3}s, 文件 {:.1} MB → {:.1} MB（重建内 VACUUM 已回收干净）",
+                t.elapsed().as_secs_f64(),
+                size_pre_vacuum2 as f64 / 1048576.0,
+                copy_bench_size(&db) as f64 / 1048576.0
+            ),
+            Err(e) => eprintln!("[bench] ④ 二次 VACUUM 失败: {e:#}"),
         }
     }
 
