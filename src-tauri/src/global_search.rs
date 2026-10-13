@@ -1368,7 +1368,13 @@ fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
     if h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n)) {
         return true;
     }
-    if !has_cased_char(haystack) {
+    // 窗口扫描未命中后，只有在"Unicode 折叠可能创造匹配"时才值得分配小写副本：
+    // - 纯 ASCII haystack：字节窗口比较已是最终结论（ASCII 折叠全覆盖），直接 false。
+    //   这一条曾经被我丢掉，导致 ASCII needle 的每次未命中都要 `to_lowercase()` 分配
+    //   一份路径副本 —— 310 万条上实测 448ms → 829ms 的退化。
+    // - 非 ASCII 但无大小写字符（CJK/数字/标点）：折叠是恒等，同样 false。
+    // `is_ascii()` 是 SIMD 短路检查，比逐字符 `has_cased_char` 便宜得多，故放在前面。
+    if haystack.is_ascii() || !has_cased_char(haystack) {
         return false;
     }
     haystack.to_lowercase().contains(needle_lower)
@@ -3181,6 +3187,37 @@ mod tests {
             );
         }
 
+        // P1-2b 对照：ASCII needle 的"路径包含"匹配（`dir:` / `PathText` 的热点）。
+        // 纯窗口扫描是这条路径的理论下限；完整 contains_ignore_case 若明显更慢，
+        // 说明它在未命中时多做了事（例如分配小写副本）。
+        {
+            let needle = "windows";
+            let n = needle.as_bytes();
+            let entries = idx.entries.read();
+            let t = Instant::now();
+            let floor = entries
+                .iter()
+                .filter(|e| {
+                    e.path
+                        .as_bytes()
+                        .windows(n.len())
+                        .any(|w| w.eq_ignore_ascii_case(n))
+                })
+                .count();
+            let floor_ms = t.elapsed();
+            let t = Instant::now();
+            let full = entries
+                .iter()
+                .filter(|e| contains_ignore_case(&e.path, needle))
+                .count();
+            let full_ms = t.elapsed();
+            assert_eq!(floor, full, "两种实现结果必须一致");
+            eprintln!(
+                "[bench] ASCII 路径包含 纯窗口扫描(下限) 命中{floor} {:?}  →  完整实现 命中{full} {:?}",
+                floor_ms, full_ms
+            );
+        }
+
         // 前端"触底加载更多"的真实模式：连续取 10 页
         let t_all = Instant::now();
         let mut acc = 0usize;
@@ -3241,6 +3278,12 @@ mod tests {
                 "后缀匹配与旧实现不一致: haystack={h:?} needle={n:?}"
             );
         }
+
+        // 纯 ASCII haystack + 未命中：字节窗口比较已是最终结论，直接 false
+        // （这条曾经退化成"每次未命中都 to_lowercase() 分配一份路径副本"）
+        assert!(!contains_ignore_case("C:/foo/bar.txt", "windows"));
+        assert!(!contains_ignore_case("c:/windows", "linux"));
+        assert!(!contains_ignore_case("C:/Windows", "windows7"));
     }
 
     /// 契约：响应是对象且 results 为数组、字段为 camelCase（前端据此渲染列表）
