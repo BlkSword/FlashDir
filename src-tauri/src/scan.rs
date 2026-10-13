@@ -2373,15 +2373,26 @@ mod tests {
             );
         }
 
-        // 1) 当前路径：bincode 反序列化整份 Vec<Item>（path+name+size_formatted）
+        // 1) 当前路径：bincode 反序列化整份 Vec<Item>。
+        //    注意必须先跳过 FDBL 文件头（magic 4 + version 1 + path_len(u16) 2 + path），
+        //    旧实现把整个文件（含头）直接交给 bincode，`unwrap()` 必然 panic ——
+        //    这个基准因此长期失效（`#[ignore]` 掩盖了它）。
+        let path_len = u16::from_le_bytes([blob[5], blob[6]]) as usize;
+        let hdr = 7 + path_len;
         let t = Instant::now();
-        let items: Vec<Item> = bincode::deserialize(&blob).unwrap();
+        let items: Vec<Item> = if blob.len() > hdr {
+            bincode::deserialize(&blob[hdr..]).unwrap()
+        } else {
+            eprintln!("[bench] blob 头长度异常，跳过反序列化");
+            return;
+        };
         let full = t.elapsed();
         eprintln!("[bench] bincode 反序列化 {} 条: {:?}", items.len(), full);
         drop(items);
 
-        // 说明：实测瓶颈在 SQLite 读取 blob（页缓存路径 ~900ms/147MB），
-        // 而非反序列化本身（~350ms/76 万条）。读取已改用增量 Blob API 直读。
+        // 说明：冷页缓存下读取 370MB 单份 blob 是**磁盘带宽**瓶颈（实测约 17s），
+        // 热页缓存下同一次读取约 1s；反序列化本身只占其中一小部分。
+        // 真正的放大来自"每个目录一份 blob"的设计：C:\ 一份就是 370MB / 193 万条。
     }
 
     #[test]

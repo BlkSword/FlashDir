@@ -2908,6 +2908,66 @@ mod tests {
         }
     }
 
+    /// 检索延迟与"翻页"代价基准（依赖本机持久化索引）。
+    ///
+    /// 关注点：offset 分页每次都要**重跑整个 top-K** 并 `clone(limit+offset)` 再丢弃
+    /// 前 offset 条，因此"滚动加载更多"是随页数超线性变贵的。这里把它量化出来，
+    /// 作为后续"缓存有序结果集 / 游标分页"改造的依据。
+    ///
+    /// 运行：cargo test --release --lib -- --ignored --nocapture bench_search_pagination
+    #[test]
+    #[ignore = "benchmark: 依赖本机持久化索引"]
+    fn bench_search_pagination() {
+        use std::time::Instant;
+
+        let entries = match crate::disk_cache::DiskCache::instance().load_global_index() {
+            Ok(e) if !e.is_empty() => e,
+            other => {
+                eprintln!("[bench] 无持久化索引，跳过: {:?}", other.map(|e| e.len()));
+                return;
+            }
+        };
+        eprintln!("[bench] 索引条目: {}", entries.len());
+        let idx = GlobalIndex::new();
+        idx.upsert_batch_internal(entries);
+
+        // 全量扫描的"地板价"：条件永不命中，但仍需遍历并求值全部条目
+        for _ in 0..2 {
+            let t = Instant::now();
+            let r = idx.search_with_filter("size:>1PB", 500);
+            eprintln!("[bench] 全量扫描地板(无命中)      命中{:>5}  {:?}", r.len(), t.elapsed());
+        }
+
+        // 前缀快路径（首字符分桶）vs 包含匹配（全量并行）
+        for q in ["report*", "report", "size:>1GB", "mtime:>7d"] {
+            let t = Instant::now();
+            let r = idx.search_with_filter(q, 500);
+            eprintln!("[bench] 查询 {:<14} 命中{:>6}  {:?}", q, r.len(), t.elapsed());
+        }
+
+        // 单页取数：offset 越大越贵（自身重跑 + clone 丢弃）
+        for off in [0usize, 1_000, 50_000, 200_000] {
+            let t = Instant::now();
+            let (r, total) = idx.search_with_filter_paged("report", 1_000, off);
+            eprintln!(
+                "[bench] 分页 offset={:<7} 返回{:>5} 总命中{:<7} {:?}",
+                off,
+                r.len(),
+                total,
+                t.elapsed()
+            );
+        }
+
+        // 前端"触底加载更多"的真实模式：连续取 10 页
+        let t_all = Instant::now();
+        let mut acc = 0usize;
+        for p in 0..10usize {
+            let (r, _) = idx.search_with_filter_paged("report", 1_000, p * 1_000);
+            acc += r.len();
+        }
+        eprintln!("[bench] 连续加载 10 页(每页1000) 共{acc} 条  {:?}", t_all.elapsed());
+    }
+
     /// 契约：响应是对象且 results 为数组、字段为 camelCase（前端据此渲染列表）
     #[test]
     fn contract_global_search_response_shape() {
