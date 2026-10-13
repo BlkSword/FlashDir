@@ -195,6 +195,13 @@ const scopeLabel = computed(() => (currentDrive.value ? currentDrive.value + ': 
 // 给出矛盾结论（此前这里硬编码 true，检查器永远显示 atime，而文件表会标注"(未启用)"）。
 const accessReliable = computed(() => accessTimeReliable(items.value))
 
+/**
+ * 是否已扫描过。
+ * 没有扫描过时"MFT 直读 / 目录遍历"这两态没有结果可依据，状态栏必须按**能力**显示，
+ * 否则管理员一启动就会被标成"目录遍历"（旧实现只看上次扫描结果，未扫描即 false）。
+ */
+const hasScanned = computed(() => items.value.length > 0 || !!currentPath.value)
+
 async function loadMcpStatus() {
   try {
     mcpStatus.value = await invoke('get_mcp_status')
@@ -594,6 +601,22 @@ const indexProgressText = computed(() => {
   return indexElapsed.value > 0 ? base + ' · 已用 ' + indexElapsed.value + 's' : base
 })
 
+/**
+ * "索引可能不完整"提示可被关闭：记录用户已关闭时对应的盘集合。
+ * 盘集合一旦变化（问题解决后又被标记、或换了一批盘）就会重新提示 —— 既不顽固常驻，
+ * 也不会把真实问题永久藏掉。
+ */
+const staleDismissed = ref('')
+const staleKey = computed(() => indexStaleDrives.value.slice().sort().join(','))
+const showIndexCard = computed(
+  () =>
+    indexBusy.value ||
+    (indexStaleDrives.value.length > 0 && staleKey.value !== staleDismissed.value)
+)
+function dismissIndexCard() {
+  staleDismissed.value = staleKey.value
+}
+
 async function syncIndexNow() {
   if (gs.loading.value) {
     toasts.warn('索引正在构建中，请等当前任务完成')
@@ -944,6 +967,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
       :cache-source="cacheSource"
       :mft-available="mftAvailable"
       :is-admin="isAdmin"
+      :has-scanned="hasScanned"
       :index-count="gs.indexMeta.value ? (gs.indexMeta.value.fileCount || 0) + (gs.indexMeta.value.dirCount || 0) : 0"
       :index-busy="indexBusy"
       :index-busy-label="indexBusyLabel"
@@ -1087,7 +1111,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
     </UiModal>
 
         <!-- 右下角索引进度：构建/载入中显示进度，增量窗口失效时提示重建 -->
-        <div v-if="indexBusy || indexStaleDrives.length" class="idx-card">
+        <div v-if="showIndexCard" class="idx-card">
           <template v-if="indexBusy">
             <div class="idx-row">
               <span class="dot warn" />
@@ -1107,6 +1131,7 @@ watch(loading, (v) => { if (!v) scanPhase.value = { phase: '', message: '' } })
             <div class="idx-actions">
               <button class="btn" @click="indexAction">重建索引</button>
               <button class="btn ghost" @click="syncIndexNow">立即同步</button>
+              <button class="btn ghost" title="暂时关闭本提示；该盘再次出现未纳入索引的变更时会重新提示" @click="dismissIndexCard">关闭</button>
             </div>
           </template>
         </div>

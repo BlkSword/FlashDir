@@ -12,7 +12,10 @@ const props = defineProps({
   scanTime: { type: Number, default: 0 },
   cacheSource: { type: String, default: '' },
   mftAvailable: { type: Boolean, default: false },
+  /** 已提权（MFT 能力），用于"还没扫描过"时不要显示成"目录遍历" */
   isAdmin: { type: Boolean, default: false },
+  /** 是否已扫描过（有结果来源可判断）；false 时 MFT 指示按"能力"而非"上次结果"显示 */
+  hasScanned: { type: Boolean, default: false },
   indexCount: { type: Number, default: 0 },
   /**
    * 索引正在构建/载入。
@@ -30,6 +33,26 @@ const props = defineProps({
   mcp: { type: Object, default: null },
 })
 const emit = defineEmits(['restart-admin', 'index-action', 'diagnostics', 'mcp-config'])
+
+/**
+ * MFT 指示有三态，不能只看"上次扫描结果"：
+ * - 已扫描且走 MFT → 「MFT 直读」
+ * - **尚未扫描**但已提权 → 「MFT 就绪」（旧实现此时 mftAvailable=false，会一直显示
+ *   「目录遍历」，让管理员以为提权没生效）
+ * - 其余（未提权 / 该卷不可用） → 「目录遍历」
+ */
+const mftReady = computed(() => props.mftAvailable || (!props.hasScanned && props.isAdmin))
+const mftLabel = computed(() => {
+  if (props.mftAvailable) return 'MFT 直读'
+  if (!props.hasScanned && props.isAdmin) return 'MFT 就绪'
+  return '目录遍历'
+})
+const mftTitle = computed(() => {
+  if (props.mftAvailable) return '本次结果走 NTFS MFT 直读（管理员）'
+  if (!props.hasScanned && props.isAdmin) return '已提权：扫描时将走 MFT 直读（当前尚未扫描）'
+  if (props.hasScanned) return '本次结果来自目录遍历（非管理员，或该卷不支持 MFT）'
+  return '未以管理员运行，将回退目录遍历'
+})
 
 const cacheLabel = computed(() => ({
   memory: '内存命中',
@@ -50,9 +73,9 @@ const indexLabel = computed(() => {
 
 <template>
   <div class="statusbar">
-    <span class="st" :title="mftAvailable ? '扫描走 NTFS MFT 直读（管理员）' : '未以管理员运行，回退目录遍历'">
-      <span class="dot" :class="mftAvailable ? '' : 'warn'" />
-      {{ mftAvailable ? 'MFT 直读' : '目录遍历' }}
+    <span class="st" :title="mftTitle">
+      <span class="dot" :class="mftReady ? '' : 'warn'" />
+      {{ mftLabel }}
     </span>
     <span class="st click" :title="usnVerified ? '该目录的已校验 USN 已生效，刷新走增量快路径' : '尚无已校验 USN，刷新依赖 mtime 判断'" @click="emit('diagnostics')">
       <span class="dot" :class="usnVerified ? '' : 'idle'" />
