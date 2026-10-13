@@ -9,7 +9,8 @@
 //! `#![cfg(test)]`（重复的 cfg 属性会触发 clippy 的 duplicated attribute 警告）。
 
 use crate::global_search::{
-    empty_instance_for_test, item_matches_filters_at, parse_search_filter, GlobalIndex, IndexEntry,
+    empty_instance_for_test, item_matches_filters_at, parse_search_filter, FilterOp, GlobalIndex,
+    IndexEntry, SearchFilter, SearchFilterKind,
 };
 
 fn entry(path: &str, size: i64) -> IndexEntry {
@@ -725,4 +726,565 @@ fn dir_query_equivalence_under_random_mutations() {
             assert_dir_query_matches_model(&fresh, &model, needle, "parallel-build");
         }
     }
+}
+
+// ─────────────────── 索引内存布局（目录前缀驻留）的等价性判据 ───────────────────
+//
+// 目标：把"每条一份完整路径字符串"（`IndexEntry.path`，占索引堆内存一半以上）改成
+// 「目录表 + (目录 id, 文件名)」。存档布局改动**不允许**改变任何一条查询语义，
+// 因为它同时被过滤（`dir:` / 粘贴完整路径）、排序（同分同名的 path 次序）、
+// 删除（`swap_remove` 搬移末位条目）、前缀子树操作消费。
+//
+// 判据与 `dir_query_equivalence_under_random_mutations` 同构，但覆盖面扩大到**全部**
+// 过滤种类与排序结果：建索引 → 随机变异（upsert 新增/替换、`remove_by_path`、
+// `remove_paths_batch`、`upsert_batch`（批内含重复）、前缀子树删除、清空）→ 每一步
+// 与**独立暴力参考模型**对拍：每类查询的（排序后命中路径列表 + 命中总数 + `entries_len`）。
+//
+// 参考模型只保留过滤语义真正读到的字段，匹配逻辑按"文档语义"独立重写
+// （路径类条件一律 `path.to_lowercase().contains(needle)`，与旧实现同义），
+// 不调用被改造模块里的任何匹配函数。
+
+/// 参考模型里的一条：过滤语义只会读这 4 个字段（name / name_lower / ext 都能派生）。
+#[derive(Clone)]
+struct ModelEntry {
+    path: String,
+    size: i64,
+    is_dir: bool,
+    mtime: i64,
+}
+
+impl ModelEntry {
+    /// 与写入侧同义：小写文件名（末段）。
+    fn name_lower(&self) -> String {
+        self.path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.path)
+            .to_lowercase()
+    }
+}
+
+fn cmp_op(a: i64, op: FilterOp, b: i64) -> bool {
+    match op {
+        FilterOp::Gt => a > b,
+        FilterOp::Gte => a >= b,
+        FilterOp::Lt => a < b,
+        FilterOp::Lte => a <= b,
+        FilterOp::Eq => a == b,
+        FilterOp::Ne => a != b,
+    }
+}
+
+/// 独立实现的过滤求值（文档语义），`now` 由调用方传入。
+fn model_matches(m: &ModelEntry, filters: &[SearchFilter], now: i64) -> bool {
+    let name_lower = m.name_lower();
+    for f in filters {
+        let matched = match &f.kind {
+            SearchFilterKind::Text(t) | SearchFilterKind::Name(t) => {
+                name_lower.contains(t.as_str())
+            }
+            // 路径类条件：整条路径做大小写不敏感包含（旧实现 = 文档语义）
+            SearchFilterKind::PathText(p) | SearchFilterKind::Dir(p) => {
+                m.path.to_lowercase().contains(p.as_str())
+            }
+            SearchFilterKind::Prefix(p) => name_lower.starts_with(p.as_str()),
+            SearchFilterKind::Suffix(s) => name_lower.ends_with(s.as_str()),
+            SearchFilterKind::Ext(e) => {
+                !m.is_dir
+                    && name_lower
+                        .rsplit_once('.')
+                        .map(|(_, ext)| ext == e.as_str())
+                        .unwrap_or(false)
+            }
+            SearchFilterKind::Type { is_dir } => m.is_dir == *is_dir,
+            SearchFilterKind::Size { op, bytes } => cmp_op(m.size, *op, *bytes),
+            SearchFilterKind::Mtime { op, seconds } => cmp_op(now - m.mtime, *op, *seconds),
+        };
+        if matched == f.negate {
+            return false;
+        }
+    }
+    true
+}
+
+/// 暴力参考：排序后的命中路径列表。
+fn model_hits(model: &[ModelEntry], query: &str, now: i64) -> Vec<String> {
+    let filters = parse_search_filter(query);
+    // 条件为空（例如只有 `AND`，或 `type:xyz` 这类被忽略的值）→ 实现返回空结果，
+    // 绝不退化成"全量按体积取前 N"（见 search_internal 的注释）。
+    if filters.is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<String> = model
+        .iter()
+        .filter(|m| model_matches(m, &filters, now))
+        .map(|m| m.path.clone())
+        .collect();
+    hits.sort();
+    hits
+}
+
+fn model_upsert_mixed(model: &mut Vec<ModelEntry>, e: &ModelEntry) {
+    match model.iter_mut().find(|m| m.path == e.path) {
+        Some(slot) => *slot = e.clone(),
+        None => model.push(e.clone()),
+    }
+}
+
+/// 一次完整对拍：命中集合逐条一致 + 命中总数一致 + arena 条目数与模型一致。
+fn assert_query_matches_model(
+    idx: &GlobalIndex,
+    model: &[ModelEntry],
+    query: &str,
+    now: i64,
+    ctx: &str,
+) {
+    assert_eq!(
+        idx.entries_len(),
+        model.len(),
+        "{ctx}: entry 数与独立模型不一致（重复条目或丢失条目）"
+    );
+    let (hits, total) = idx.search_with_filter_paged(query, 100_000, 0);
+    let mut got: Vec<String> = hits.into_iter().map(|e| e.path).collect();
+    got.sort();
+    let want = model_hits(model, query, now);
+    assert_eq!(
+        got, want,
+        "{ctx}: 查询 {query:?} 命中集合与暴力参考实现不一致（漏结果 / 多结果 / 顺序外内容不同）"
+    );
+    assert_eq!(
+        total,
+        want.len(),
+        "{ctx}: 查询 {query:?} 命中总数不一致（total 由另一条分支统计）"
+    );
+}
+
+/// 参考模型的相关性分数（文档语义：相关性降序 → name_lower 升序 → 完整路径升序）。
+///
+/// `q_lower` = 第一个**非否定**文本条件的值（没有则空串 → 分数就是体积）。
+fn model_q_lower(query: &str) -> String {
+    parse_search_filter(query)
+        .iter()
+        .find_map(|f| match &f.kind {
+            SearchFilterKind::Text(t) if !f.negate => Some(t.to_lowercase()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn model_score(m: &ModelEntry, q_lower: &str) -> i64 {
+    if q_lower.is_empty() {
+        return m.size;
+    }
+    let name_lower = m.name_lower();
+    let base = if name_lower == q_lower {
+        3i64 << 60
+    } else if name_lower.starts_with(q_lower) {
+        2i64 << 60
+    } else {
+        1i64 << 60
+    };
+    base + m.size
+}
+
+/// 参考模型的命中按文档次序排好：(路径, 分数, name_lower)。
+fn model_ranked(model: &[ModelEntry], query: &str, now: i64) -> Vec<(String, i64, String)> {
+    let filters = parse_search_filter(query);
+    if filters.is_empty() {
+        return Vec::new();
+    }
+    let q_lower = model_q_lower(query);
+    let mut ordered: Vec<(String, i64, String)> = model
+        .iter()
+        .filter(|m| model_matches(m, &filters, now))
+        .map(|m| (m.path.clone(), model_score(m, &q_lower), m.name_lower()))
+        .collect();
+    ordered.sort_by(|(pa, sa, na), (pb, sb, nb)| {
+        sb.cmp(sa).then_with(|| na.cmp(nb)).then_with(|| pa.cmp(pb))
+    });
+    ordered
+}
+
+/// 小 limit 对拍：**取到的候选集**与**展示次序**都必须符合文档契约。
+///
+/// 契约：
+/// 1. **候选集**：取到的就是"按相关性 / `name_lower` 排序的前 K 名" —— `(score, name_lower)`
+///    主键序列必须逐项等于参考模型的前 K 名（内存布局改造不允许改变"哪些条目进结果集"）；
+/// 2. **展示次序**：每个主键相同的连续段内，路径必须升序（排序定义的第三关键字）；
+/// 3. 每条命中都必须属于参考模型的命中集合。
+///
+/// 不断言"同分同名候选里具体是哪几条"：这些候选在文档排序下等价（相关性判据里没有路径
+/// 这一维），任何实现都只需保证"主键序列 + 组内路径升序"。
+fn assert_topk_matches_model(
+    idx: &GlobalIndex,
+    model: &[ModelEntry],
+    query: &str,
+    now: i64,
+    k: usize,
+    ctx: &str,
+) {
+    let ranked = model_ranked(model, query, now);
+    let want: Vec<(String, i64, String)> = ranked.iter().take(k).cloned().collect();
+    let (hits, _total) = idx.search_with_filter_paged(query, k, 0);
+    let got: Vec<String> = hits.into_iter().map(|e| e.path).collect();
+    assert_eq!(
+        got.len(),
+        want.len(),
+        "{ctx}: 查询 {query:?} 前 {k} 名条数不一致（截断位置错了）"
+    );
+
+    let q_lower = model_q_lower(query);
+    let key_of = |p: &String| -> (i64, String) {
+        let e = model
+            .iter()
+            .find(|m| &m.path == p)
+            .unwrap_or_else(|| panic!("{ctx}: 查询 {query:?} 返回了参考模型里没有的路径 {p:?}"));
+        (model_score(e, &q_lower), e.name_lower())
+    };
+    let got_keys: Vec<(i64, String)> = got.iter().map(key_of).collect();
+    let want_keys: Vec<(i64, String)> = want.iter().map(|(_, s, n)| (*s, n.clone())).collect();
+    assert_eq!(
+        got_keys, want_keys,
+        "{ctx}: 查询 {query:?} 前 {k} 名的相关性主键序列与参考模型不一致（选错了候选或次序）"
+    );
+
+    // 同主键段内必须按完整路径升序（`into_entries` 的最终重排）
+    for i in 1..got.len() {
+        if got_keys[i] == got_keys[i - 1] {
+            assert!(
+                got[i - 1] < got[i],
+                "{ctx}: 查询 {query:?} 同分同名的候选未按完整路径升序: {:?} → {:?}",
+                got[i - 1],
+                got[i]
+            );
+        }
+    }
+}
+
+/// 构造一条合成条目：路径来自 `gen_path`，体积/目录标志/时间随机。
+fn mixed_entry(path: &str, is_dir: bool, size: i64, mtime: i64) -> (IndexEntry, ModelEntry) {
+    let name_lower = path
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .to_lowercase()
+        .into();
+    (
+        IndexEntry::new(path.to_string(), name_lower, size, is_dir, mtime),
+        ModelEntry {
+            path: path.to_string(),
+            size,
+            is_dir,
+            mtime,
+        },
+    )
+}
+
+/// 生成一条"贴近真实文件系统"的路径：60% 复用模型里已有目录（真实索引平均每目录约 7 条，
+/// 目录前缀就是这么被共享出来的），其余走 `gen_path` 造新目录树。
+/// 共享率直接决定"目录前缀驻留"能省多少内存，也决定这个判据是否有区分度。
+fn gen_shared_path(rng: &mut Rng, model: &[ModelEntry]) -> String {
+    if !model.is_empty() && rng.below(10) < 6 {
+        let base = &model[rng.below(model.len())].path;
+        let dir = match base.rsplit_once('/') {
+            Some((d, _)) => d,
+            None => base.as_str(),
+        };
+        if rng.below(3) == 0 {
+            format!("{}/{}/{}", dir, rng.pick(DIR_POOL), rng.pick(FILE_POOL))
+        } else {
+            format!("{}/{}", dir, rng.pick(FILE_POOL))
+        }
+    } else {
+        gen_path(rng)
+    }
+}
+
+#[test]
+fn search_semantics_equivalence_under_random_mutations() {
+    let mut rng = Rng::new(0xD12E_C70A_5EED_2026);
+    let idx = empty_instance_for_test();
+    let mut model: Vec<ModelEntry> = Vec::new();
+
+    // mtime 取值必须远离查询阈值（1d / 7d）：全部相对测试开始时刻，留出 ≥23 天的余量，
+    // 否则跨秒边界会让"参考模型"与"实现各取一次 now"出现假失败。
+    let now0 = chrono::Utc::now().timestamp();
+    const DAY: i64 = 24 * 60 * 60;
+    let mtimes = [0i64, now0 - 30 * DAY, now0 - 60, now0 - 2 * DAY];
+    let sizes = [0i64, 100, 4096, 1024 * 1024, 3 * 1024 * 1024 * 1024];
+
+    let mut batch: Vec<IndexEntry> = Vec::with_capacity(2000);
+    for i in 0..2000 {
+        let path = gen_shared_path(&mut rng, &model);
+        let (e, m) = mixed_entry(
+            &path,
+            i % 5 == 0,
+            sizes[rng.below(sizes.len())],
+            mtimes[rng.below(mtimes.len())],
+        );
+        model_upsert_mixed(&mut model, &m);
+        batch.push(e);
+    }
+    idx.upsert_batch(batch);
+    assert_eq!(idx.entries_len(), model.len(), "初始批量载入后条目数应与模型一致");
+
+    // 数据集自检：必须真的存在"多条路径共享同一个目录前缀"，否则这个对拍证明不了什么
+    {
+        let mut per_dir: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut cross_slash = 0usize;
+        for m in &model {
+            let dir = m.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+            *per_dir.entry(dir).or_insert(0) += 1;
+            cross_slash += m.path.matches('/').count();
+        }
+        let shared = model
+            .iter()
+            .filter(|m| {
+                per_dir[m.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("")] > 1
+            })
+            .count();
+        assert!(
+            shared * 2 > model.len(),
+            "数据集必须大量共享目录前缀（目录前缀驻留的收益来源）: {shared}/{}",
+            model.len()
+        );
+        assert!(cross_slash > model.len(), "路径必须有多层目录");
+        assert!(per_dir.len() < model.len(), "目录数应少于条目数: {} 个目录", per_dir.len());
+        assert!(model.iter().filter(|m| !m.path.is_ascii()).count() >= 5, "必须覆盖非 ASCII 路径");
+    }
+
+    let paste_targets = |rng: &mut Rng, model: &[ModelEntry]| -> Vec<String> {
+        let mut v = Vec::new();
+        for _ in 0..2 {
+            if !model.is_empty() {
+                v.push(model[rng.below(model.len())].path.clone());
+            }
+        }
+        v
+    };
+
+    let mut checks = 0usize;
+    let mut nonempty_hits = 0usize;
+    let mut empty_hits = 0usize;
+
+    for round in 0..60 {
+        match rng.below(8) {
+            // 新增：upsert 新路径（文件 + 目录混排）
+            0 | 1 => {
+                for _ in 0..1 + rng.below(3) {
+                    let path = gen_shared_path(&mut rng, &model);
+                    let (e, m) = mixed_entry(
+                        &path,
+                        rng.below(3) == 0,
+                        sizes[rng.below(sizes.len())],
+                        mtimes[rng.below(mtimes.len())],
+                    );
+                    idx.upsert(e);
+                    model_upsert_mixed(&mut model, &m);
+                }
+            }
+            // 替换：upsert 已存在路径（换体积/换目录标志，走"替换已有条目"分支）
+            2 => {
+                if !model.is_empty() {
+                    for _ in 0..1 + rng.below(3) {
+                        let path = model[rng.below(model.len())].path.clone();
+                        let (e, m) = mixed_entry(
+                            &path,
+                            rng.below(2) == 0,
+                            sizes[rng.below(sizes.len())],
+                            mtimes[rng.below(mtimes.len())],
+                        );
+                        idx.upsert(e);
+                        model_upsert_mixed(&mut model, &m);
+                    }
+                }
+            }
+            // 删除：remove_by_path（含 30% 不存在的路径）
+            3 => {
+                let path = if !model.is_empty() && rng.below(10) < 7 {
+                    model[rng.below(model.len())].path.clone()
+                } else {
+                    gen_path(&mut rng)
+                };
+                idx.remove_by_path(&path);
+                model.retain(|m| m.path != path);
+            }
+            // 批量删除：每条一次 swap_remove（最容易踩"末位条目搬移"的不变式）
+            4 => {
+                let mut paths = Vec::new();
+                for _ in 0..1 + rng.below(4) {
+                    if model.is_empty() {
+                        break;
+                    }
+                    paths.push(model[rng.below(model.len())].path.clone());
+                }
+                idx.remove_paths_batch(&paths);
+                for p in &paths {
+                    model.retain(|m| &m.path != p);
+                }
+            }
+            // 批量 upsert：批内故意混入重复路径，逼走"替换"分支
+            5 => {
+                let mut batch = Vec::new();
+                for _ in 0..1 + rng.below(5) {
+                    let path = if !model.is_empty() && rng.below(10) < 4 {
+                        model[rng.below(model.len())].path.clone()
+                    } else {
+                        gen_shared_path(&mut rng, &model)
+                    };
+                    let (e, m) = mixed_entry(
+                        &path,
+                        rng.below(3) == 0,
+                        sizes[rng.below(sizes.len())],
+                        mtimes[rng.below(mtimes.len())],
+                    );
+                    batch.push(e);
+                    model_upsert_mixed(&mut model, &m);
+                }
+                if !batch.is_empty() && rng.below(2) == 0 {
+                    let dup = batch[rng.below(batch.len())].clone();
+                    batch.push(dup);
+                }
+                idx.upsert_batch(batch);
+            }
+            // 前缀子树删除 / 整体清空
+            6 => {
+                if rng.below(8) == 0 || model.is_empty() {
+                    idx.set_loading();
+                    model.clear();
+                } else {
+                    let base = model[rng.below(model.len())].path.clone();
+                    let mut cuts = vec![2usize.min(base.len())];
+                    for (i, c) in base.char_indices() {
+                        if c == '/' {
+                            cuts.push(i);
+                        }
+                    }
+                    let cut = cuts[rng.below(cuts.len())];
+                    let mut prefix = base[..cut].to_string();
+                    if rng.below(3) == 0 {
+                        prefix = prefix.to_uppercase();
+                    }
+                    if rng.below(3) == 0 {
+                        prefix.push('/');
+                    }
+                    idx.remove_prefix_for_test(&prefix);
+                    model.retain(|m| !is_same_or_child_mirror(&prefix, &m.path));
+                }
+            }
+            // 整批重新载入（覆盖并行构建分支）
+            _ => {
+                let reload: Vec<IndexEntry> = model
+                    .iter()
+                    .map(|m| mixed_entry(&m.path, m.is_dir, m.size, m.mtime).0)
+                    .collect();
+                idx.set_loading();
+                idx.upsert_batch(reload);
+            }
+        }
+
+        // ── 查询集：固定覆盖面 + 从模型里切出的随机词（保证既有多命中也有 0 命中）
+        let mut queries: Vec<String> = [
+            "dir:projects",
+            "dir:Windows",
+            "dir:n",
+            "dir:s/p",
+            "dir:文档",
+            "dir:ПАПКА",
+            "dir:node_modules",
+            "ext:md",
+            "ext:txt",
+            "*.pdf",
+            ".rs",
+            "size:>1MB",
+            "size:<100",
+            "mtime:>7d",
+            "mtime:<1d",
+            "*",
+            "report*",
+            "*report*",
+            "NOT *.tmp",
+            "!report",
+            "NOT dir:windows",
+            "report",
+            "a",
+            "MAIN.RS",
+            "type:dir size:>0",
+            "type:xyz",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // 粘贴完整路径（最吃"整条路径包含"的一条）
+        queries.extend(paste_targets(&mut rng, &model));
+        // 横跨 '/' 的窗口：直接打"目录段末尾 + '/' + 文件名开头"这个拼接点
+        for _ in 0..3 {
+            if model.is_empty() {
+                break;
+            }
+            let lower = model[rng.below(model.len())].path.to_lowercase();
+            let slashes: Vec<usize> = lower.match_indices('/').map(|(i, _)| i).collect();
+            if slashes.is_empty() {
+                continue;
+            }
+            let i = slashes[rng.below(slashes.len())];
+            let start = i.saturating_sub(rng.below(4));
+            let end = (i + 1 + rng.below(5)).min(lower.len());
+            if start >= i || end <= i + 1 || !lower.is_char_boundary(start) || !lower.is_char_boundary(end)
+            {
+                continue;
+            }
+            let needle: String = lower[start..end]
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '"' && *c != '!')
+                .collect();
+            if !needle.is_empty() {
+                queries.push(needle.clone());
+                queries.push(format!("dir:{needle}"));
+            }
+        }
+        // 纯文本随机子串（含 CJK / 大小写混排）
+        for _ in 0..3 {
+            if model.is_empty() {
+                break;
+            }
+            let lower = model[rng.below(model.len())].path.to_lowercase();
+            let start = rng.below(lower.len());
+            let end = (start + 1 + rng.below(7)).min(lower.len());
+            if !lower.is_char_boundary(start) || !lower.is_char_boundary(end) {
+                continue;
+            }
+            let mut needle: String = lower[start..end]
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '"' && *c != '!')
+                .collect();
+            while needle.ends_with('/') {
+                needle.pop();
+            }
+            if !needle.is_empty() {
+                queries.push(needle);
+            }
+        }
+
+        for (qi, q) in queries.iter().enumerate() {
+            assert_query_matches_model(&idx, &model, q, now0, &format!("round {round}"));
+            // 小 limit 对拍（候选集与次序）：抽样即可，模型侧排序是 O(n log n)
+            if qi % 5 == 0 {
+                assert_topk_matches_model(&idx, &model, q, now0, 7, &format!("round {round} topk"));
+            }
+            checks += 1;
+            if model_hits(&model, q, now0).is_empty() {
+                empty_hits += 1;
+            } else {
+                nonempty_hits += 1;
+            }
+        }
+    }
+
+    // 防假对拍：必须真的跑到过量、必须同时出现"命中"与"不命中"
+    assert!(checks >= 1500, "对拍次数过少: {checks}");
+    assert!(
+        nonempty_hits > 100 && empty_hits > 100,
+        "对拍必须同时覆盖命中与不命中: {nonempty_hits}/{empty_hits}"
+    );
 }
