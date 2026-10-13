@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, GENERIC_READ, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, GENERIC_READ, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, SetFilePointerEx, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -240,12 +240,24 @@ impl MftScanner {
             );
 
             if handle == INVALID_HANDLE_VALUE {
+                // 旧实现把**所有**失败都说成"需要管理员权限"，丢掉了真实的 GetLastError：
+                // 于是在已是管理员、却因别的原因（卷被独占、BitLocker 未解锁、ReFS/网络盘、
+                // 权限被 ACL 拒绝等）打开失败时，日志和界面都在误导用户去提权。
+                // 这里区分 ERROR_ACCESS_DENIED(5) 与其它错误，并把错误码带进文案。
+                let code = GetLastError();
+                let kind = if code == ERROR_ACCESS_DENIED {
+                    io::ErrorKind::PermissionDenied
+                } else {
+                    io::ErrorKind::Other
+                };
+                let hint = if code == ERROR_ACCESS_DENIED {
+                    "（拒绝访问：可能需要以管理员身份运行，或该卷被安全策略/ACL 限制）"
+                } else {
+                    "（不是权限问题，请对照错误码排查：卷被独占/未解锁/BitLocker/非本地卷等）"
+                };
                 return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "无法打开卷 {}（需要管理员权限）",
-                        volume_path
-                    ),
+                    kind,
+                    format!("无法打开卷 {}：错误码 {}{}", volume_path, code, hint),
                 ));
             }
 

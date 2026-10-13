@@ -707,6 +707,29 @@ pub async fn scan_directory(
         .into_scan_result())
 }
 
+/// 当前进程是否具备 MFT 直读能力（Windows + 进程已提权 + 该卷可读）。
+///
+/// 所有"缓存来自目录遍历、能否升级到 MFT"的判断都必须走这里：只要缓存结果是遍历
+/// 得来的（`mft_available == false`）而当前已具备 MFT 能力，就要放弃缓存重新扫描，
+/// 否则会一直沿用遍历结果。**直接命中、内存推导、磁盘推导四条分支一个都不能漏**
+/// ——漏掉推导分支就会表现为"给了管理员权限仍然是目录遍历模式"。
+/// 调用方都应先用 `!x.mft_available` 短路，避免给"缓存本来就是 MFT 结果"的常见情形
+/// 增加开卷探测开销。
+fn mft_capable_for(root_dir: &str) -> bool {
+    cfg!(target_os = "windows")
+        && crate::fs::is_admin()
+        && crate::fs::check_mft_available(root_dir)
+}
+
+/// 判定"是否应放弃这份缓存、重新扫描以升级到 MFT"。
+///
+/// 抽成纯函数是为了让真值表可被单测覆盖（四个调用点一个都不能漏 —— 漏掉推导分支
+/// 就是"给了管理员权限仍是目录遍历模式"）。
+/// `mft_capable` 用闭包传入以保持**惰性**：缓存本来就来自 MFT 时不要去开卷探测。
+fn should_upgrade_cache_to_mft(cached_mft_available: bool, mft_capable: impl FnOnce() -> bool) -> bool {
+    !cached_mft_available && mft_capable()
+}
+
 /// 主扫描函数（零拷贝视图版）。
 ///
 /// 返回 `ScanView`：命中内存缓存 / USN 校验通过时直接共享 `Arc<Vec<Item>>`。
@@ -863,10 +886,8 @@ pub async fn scan_directory_view(
         if let Some(cached) = scan_cache().get(&root_dir) {
             // 如果缓存来自目录遍历，但当前进程是管理员且 MFT 可用，
             // 则放弃缓存并重新扫描，以升级到 MFT 快速路径。
-            let can_upgrade_to_mft = !cached.result.mft_available
-                && cfg!(target_os = "windows")
-                && crate::fs::is_admin()
-                && crate::fs::check_mft_available(&root_dir);
+            let can_upgrade_to_mft =
+                should_upgrade_cache_to_mft(cached.result.mft_available, || mft_capable_for(&root_dir));
 
             if cached.dir_mtime >= mtime_datetime && !can_upgrade_to_mft {
                 emit_scan_phase(&app_handle, "cache-hit-memory", "内存缓存命中", None);
@@ -885,38 +906,53 @@ pub async fn scan_directory_view(
 
         // 1.5 从上层目录缓存推导子目录结果（要求父缓存写入时间 >= 子目录 mtime）
         if let Some((derived, derived_usn)) = scan_cache().get_derived(&root_dir, mtime_datetime) {
-            emit_scan_phase(&app_handle, "cache-hit-derived", "从上层缓存推导", None);
-            let cache_read_time = cache_check_start.elapsed().as_millis() as u64;
-            perf_monitor.record_cache_hit(cache_read_time);
+            // 与直接命中同样要判"能否升级到 MFT"：推导结果继承父缓存的 mft_available，
+            // 若父缓存来自目录遍历而当前已是管理员，继续推导就会一直沿用遍历结果
+            // ——旧实现漏了这两条推导分支，导致"给了管理员权限仍是目录遍历模式"。
+            if !should_upgrade_cache_to_mft(derived.mft_available, || mft_capable_for(&root_dir)) {
+                emit_scan_phase(&app_handle, "cache-hit-derived", "从上层缓存推导", None);
+                let cache_read_time = cache_check_start.elapsed().as_millis() as u64;
+                perf_monitor.record_cache_hit(cache_read_time);
 
-            // 把推导结果写入内存缓存，后续再次扫描该子目录可直接命中
-            scan_cache().insert_with_usn(root_dir.clone(), derived.clone(), derived_usn);
+                // 把推导结果写入内存缓存，后续再次扫描该子目录可直接命中
+                scan_cache().insert_with_usn(root_dir.clone(), derived.clone(), derived_usn);
 
-            perf_monitor.end_scan();
-            return Ok(ScanView::from_result(derived, "memory-derived"));
+                perf_monitor.end_scan();
+                return Ok(ScanView::from_result(derived, "memory-derived"));
+            }
+            eprintln!(
+                "[Scan] 管理员+MFT 可用，跳过上层推导以启用 MFT: {}",
+                root_dir
+            );
         }
 
         // 1.8 从磁盘上层缓存推导子目录结果（条目级 SQL 前缀查询，无需反序列化整个父目录）
         let disk_cache = DiskCache::instance();
         if let Some((derived, derived_usn)) = disk_cache.get_derived(&root_dir, mtime_timestamp) {
-            emit_scan_phase(&app_handle, "cache-hit-disk-derived", "磁盘上层缓存推导", None);
-            let cache_read_time = cache_check_start.elapsed().as_millis() as u64;
-            perf_monitor.record_cache_hit(cache_read_time);
+            if !should_upgrade_cache_to_mft(derived.mft_available, || mft_capable_for(&root_dir)) {
+                emit_scan_phase(&app_handle, "cache-hit-disk-derived", "磁盘上层缓存推导", None);
+                let cache_read_time = cache_check_start.elapsed().as_millis() as u64;
+                perf_monitor.record_cache_hit(cache_read_time);
 
-            scan_cache().insert_with_usn(root_dir.clone(), derived.clone(), derived_usn);
+                scan_cache().insert_with_usn(root_dir.clone(), derived.clone(), derived_usn);
 
-            perf_monitor.end_scan();
-            return Ok(ScanView::from_result(derived, "disk-derived"));
+                perf_monitor.end_scan();
+                return Ok(ScanView::from_result(derived, "disk-derived"));
+            }
+            eprintln!(
+                "[Scan] 管理员+MFT 可用，跳过磁盘上层推导以启用 MFT: {}",
+                root_dir
+            );
         }
 
         // 2. 检查磁盘缓存
         if let Some((cached_result, cached_usn)) =
             disk_cache.get_with_usn(&root_dir, mtime_timestamp)
         {
-            let can_upgrade_to_mft = !cached_result.mft_available
-                && cfg!(target_os = "windows")
-                && crate::fs::is_admin()
-                && crate::fs::check_mft_available(&root_dir);
+            let can_upgrade_to_mft = should_upgrade_cache_to_mft(
+                cached_result.mft_available,
+                || mft_capable_for(&root_dir),
+            );
 
             if !can_upgrade_to_mft {
                 emit_scan_phase(&app_handle, "cache-hit-disk", "磁盘缓存命中", None);
@@ -2276,6 +2312,33 @@ fn normalize_path_separator_compact(path: &std::ffi::OsStr) -> CompactString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归：四条缓存分支（内存命中 / 内存推导 / 磁盘推导 / 磁盘命中）必须共用同一个
+    /// "是否放弃缓存以升级到 MFT"的判定，并且保持惰性。
+    ///
+    /// 旧实现只在"直接命中"的两条分支做了这层判断，漏掉了**两条上层推导分支**，于是：
+    /// 非管理员时扫过某个父目录（缓存里 mft_available=false）→ 之后以管理员运行 →
+    /// 进入它的子目录会命中推导分支直接返回 → 界面一直显示"目录遍历"、数据也仍是遍历来的。
+    /// 推导命中极其常见（打开任意已扫过的子目录都会走），这就是"给了管理员权限仍然是
+    /// 目录遍历模式"的成因。
+    #[test]
+    fn mft_upgrade_decision_truth_table_and_laziness() {
+        assert!(
+            should_upgrade_cache_to_mft(false, || true),
+            "缓存来自遍历 + 当前有 MFT 能力 → 必须放弃缓存重扫"
+        );
+        assert!(
+            !should_upgrade_cache_to_mft(false, || false),
+            "缓存来自遍历但当前没有 MFT 能力 → 只能沿用"
+        );
+        assert!(
+            !should_upgrade_cache_to_mft(true, || true),
+            "缓存本来就来自 MFT → 无需升级"
+        );
+        assert!(!should_upgrade_cache_to_mft(true, || false));
+        // 惰性：缓存已是 MFT 结果时不得去开卷探测，否则每次内存命中都多一次开卷
+        let _ = should_upgrade_cache_to_mft(true, || panic!("缓存已是 MFT 结果时不应探测卷"));
+    }
 
     #[test]
     fn test_drive_and_vol_prefix() {
