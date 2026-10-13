@@ -146,6 +146,56 @@ fn mtime_filter_uses_supplied_now() {
     assert!(!item_matches_filters_at("a", "C:/a", 1, false, now - 3_600, &f, now));
 }
 
+/// 启动提速：`upsert_batch` 的并行批量构建（批量 ≥ PARALLEL_BUILD_MIN）必须与串行
+/// 逐条插入语义**完全等价**。两条路径都要覆盖：
+/// 1) 全部路径唯一 → 走并行构建：条目数、`name_index`（前缀快路径）、
+///    `by_path`（按路径删除）都必须正确；
+/// 2) 批内存在重复路径 → 并行构建检测到哈希不唯一后必须回退串行"替换"语义，
+///    不能产生重复条目。
+#[test]
+fn bulk_build_matches_sequential_semantics() {
+    const N: usize = 12_000;
+
+    let idx = empty_instance_for_test();
+    let batch: Vec<IndexEntry> = (0..N)
+        .map(|i| entry(&format!("C:/bulk/dir_{:05}/file_{:05}.txt", i % 97, i), 100 + i as i64))
+        .collect();
+    idx.upsert_batch(batch);
+    assert_eq!(idx.entries_len(), N, "唯一路径批量载入后条目数必须等于批量大小");
+
+    // name_index（并行构建）与全量扫描必须给出同样多的命中
+    let fast = idx.search_with_filter("file_00*", 10_000);
+    let full = idx.search_with_filter("file_00", 10_000);
+    assert!(!fast.is_empty());
+    assert_eq!(
+        fast.len(),
+        full.len(),
+        "并行构建的 name_index 与全量扫描结果不一致"
+    );
+
+    // by_path（并行构建）必须可用：按路径删除要真的删掉
+    idx.remove_by_path("C:/bulk/dir_00000/file_00000.txt");
+    assert_eq!(idx.entries_len(), N - 1);
+    assert!(
+        !idx.search_with_filter("file_00000", 10)
+            .iter()
+            .any(|e| e.path.ends_with("file_00000.txt")),
+        "并行构建的 by_path 不可用，删除未生效"
+    );
+
+    // 批内重复路径：必须回退串行替换语义
+    let dup = empty_instance_for_test();
+    let mut batch: Vec<IndexEntry> = (0..N)
+        .map(|i| entry(&format!("C:/dup/f_{:05}.txt", i), 1))
+        .collect();
+    batch[N - 1] = entry("C:/dup/f_00000.txt", 999);
+    dup.upsert_batch(batch);
+    assert_eq!(dup.entries_len(), N - 1, "重复路径必须只保留一个条目");
+    let hit = dup.search_with_filter("f_00000", 10);
+    assert_eq!(hit.len(), 1);
+    assert_eq!(hit[0].size, 999, "重复路径应保留最后一次写入的数据");
+}
+
 /// offset 分页结果缓存（P1-1）的正确性：
 /// 缓存只能"少扫几次"，绝不能改变结果本身。这里覆盖三种最容易出错的场景 ——
 /// 分页拼接与一次性取数是否逐条一致、缓存窗口小于请求量时是否会少给结果、

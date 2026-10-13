@@ -129,6 +129,10 @@ pub struct GlobalIndex {
 /// 后续翻页全部免扫描。
 const QUERY_CACHE_CAP: usize = 50_000;
 
+/// 触发"并行构建索引表"的最小批量。首次全量载入才会到这个量级；
+/// 小批量（测试、增量同步）保持原串行语义，避免 rayon 调度开销。
+const PARALLEL_BUILD_MIN: usize = 10_000;
+
 /// 单条查询的结果缓存。只保留一份：搜索是"一个查询连续翻很多页"的访问模式，
 /// 多查询 LRU 的收益远小于它带来的内存与失效复杂度。
 struct QueryCache {
@@ -377,16 +381,73 @@ impl GlobalIndex {
     }
 
     /// 批量 upsert：整批在同一个锁临界区内完成（按值消费，避免逐条 clone）
+    ///
+    /// 首次全量载入（索引为空 + 大批量）走并行构建：310 万条时旧实现是纯串行
+    /// （逐条 `path_hash`、逐条 HashMap 插入、逐条 push 触发多次 arena 整块搬迁），
+    /// 实测 2.27s，直接决定"启动后多久能搜索"。这里做三件事：
+    /// 1. 路径规范化与 128 位路径哈希并行计算（纯字符串扫描，可完全并行）；
+    /// 2. `entries` 预分配，避免 310 万条约 200MB 的反复整块拷贝；
+    /// 3. `by_path` / `name_index` 并行构建。
+    ///
+    /// **安全条件**：只有所有路径哈希两两不同（`by_path.len() == batch.len()`）时才采用
+    /// 并行结果 —— 此时"逐条插入"必然全走"新增"分支，与批量构建完全等价。
+    /// 一旦出现重复路径或哈希冲突，逐条实现会走"替换已有条目"分支，必须回退串行，
+    /// 否则会产生重复条目（此时 entries 尚未被改动，回退是干净的）。
     fn upsert_batch_internal(&self, batch: Vec<IndexEntry>) {
         self.bump_generation();
         let mut entries = self.entries.write();
         let mut by_path = self.by_path.write();
         let mut name_index = self.name_index.write();
 
-        for entry in batch {
-            let entry = repair_entry_path(entry);
+        let parallel = batch.len() >= PARALLEL_BUILD_MIN;
+        let batch: Vec<IndexEntry> = if parallel {
+            batch.into_par_iter().map(repair_entry_path).collect()
+        } else {
+            batch.into_iter().map(repair_entry_path).collect()
+        };
+        let hashes: Vec<u128> = if parallel {
+            batch.par_iter().map(|e| path_hash(&e.path)).collect()
+        } else {
+            batch.iter().map(|e| path_hash(&e.path)).collect()
+        };
+        entries.reserve(batch.len());
+
+        if parallel && entries.is_empty() && by_path.is_empty() && name_index.is_empty() {
+            let new_by_path: HashMap<u128, u32> = hashes
+                .par_iter()
+                .enumerate()
+                .map(|(i, h)| (*h, i as u32))
+                .collect();
+            if new_by_path.len() == batch.len() {
+                let new_name_index: HashMap<char, Vec<u32>> = batch
+                    .par_iter()
+                    .enumerate()
+                    .fold(HashMap::<char, Vec<u32>>::new, |mut acc, (i, e)| {
+                        acc.entry(bucket_char(&e.name_lower))
+                            .or_default()
+                            .push(i as u32);
+                        acc
+                    })
+                    .reduce(HashMap::<char, Vec<u32>>::new, |mut a, b| {
+                        for (k, mut v) in b {
+                            a.entry(k).or_default().append(&mut v);
+                        }
+                        a
+                    });
+                let files = batch.par_iter().filter(|e| !e.is_dir).count();
+                self.file_count.fetch_add(files, Ordering::Relaxed);
+                self.dir_count
+                    .fetch_add(batch.len() - files, Ordering::Relaxed);
+                *by_path = new_by_path;
+                *name_index = new_name_index;
+                entries.extend(batch);
+                return;
+            }
+            // 有重复路径 / 哈希冲突 → 丢弃并行结果，走下面的串行插入
+        }
+
+        for (entry, hash) in batch.into_iter().zip(hashes) {
             let first_char = bucket_char(&entry.name_lower);
-            let hash = path_hash(&entry.path);
             let is_dir = entry.is_dir;
 
             let existing = by_path.get(&hash).copied().filter(|&idx| {
